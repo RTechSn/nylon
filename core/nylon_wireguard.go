@@ -70,6 +70,27 @@ func (n *Nylon) obfDeviceIPC() string {
 	return obfDeviceIPC(n.Obf, n.GetNode(n.LocalCfg.Id).Obf)
 }
 
+// hopDeviceIPC renders the device-level port-hopping UAPI knobs. The listen
+// range is the server half (bind extra ports); the budget/recent knobs are the
+// client half (destination-port rotation policy for range endpoints).
+func (n *Nylon) hopDeviceIPC() string {
+	var b strings.Builder
+	if n.LocalCfg.ListenPorts != "" {
+		if _, err := state.ParsePortRange(n.LocalCfg.ListenPorts); err == nil {
+			fmt.Fprintf(&b, "listen_ports=%s\n", n.LocalCfg.ListenPorts)
+		}
+	}
+	if n.LocalCfg.PortHopping != nil {
+		if n.LocalCfg.PortHopping.BudgetPackets != nil {
+			fmt.Fprintf(&b, "hop_budget_packets=%d\n", *n.LocalCfg.PortHopping.BudgetPackets)
+		}
+		if n.LocalCfg.PortHopping.RecentPorts != nil {
+			fmt.Fprintf(&b, "hop_recent_ports=%d\n", *n.LocalCfg.PortHopping.RecentPorts)
+		}
+	}
+	return b.String()
+}
+
 func (n *Nylon) initWireGuard() error {
 	dev, tdev, itfName, err := NewWireGuardDevice(n)
 	if err != nil {
@@ -100,7 +121,7 @@ listen_port=%d
 `,
 			hex.EncodeToString(n.Key[:]),
 			n.Port,
-		) + n.obfDeviceIPC(),
+		) + n.obfDeviceIPC() + n.hopDeviceIPC(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure wg device: %v", err)

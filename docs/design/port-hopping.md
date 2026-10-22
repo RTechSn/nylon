@@ -1,6 +1,7 @@
 # Port Hopping & Multi-Flow Transport — Design Document
 
-Status: **draft for review** · Branch: `main` · Scope: Stages 1–3 (+ Stage 4 outlook)
+Status: **stage 1 implemented** (ranges + rotation + range listening; see
+`integration/port_hopping_test.go` for the verification gate) · Branch: `main` · Scope: Stages 1–3 (+ Stage 4 outlook)
 
 ## 1. Background & Threat Model
 

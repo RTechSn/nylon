@@ -41,8 +41,25 @@ func NewWireGuardDevice(n *Nylon) (dev *device.Device, tunDevice tun.Device, rea
 
 	wgLog := n.Log.With("module", log.ScopePolyamide)
 
+	// Port hopping: compose the transport bind.
+	// - MultiBind: listens on the primary port plus, when listen_ports is
+	//   configured, every port of that range (server half).
+	// - PortHopBind: destination-port rotation for peers configured with
+	//   port ranges (client half). With no ranges in play the composition is
+	//   behaviourally identical to a plain StdNetBind.
+	hopCfg := conn.DefaultHopConfig()
+	if n.LocalCfg.PortHopping != nil {
+		if n.LocalCfg.PortHopping.BudgetPackets != nil {
+			hopCfg.Budget = *n.LocalCfg.PortHopping.BudgetPackets
+		}
+		if n.LocalCfg.PortHopping.RecentPorts != nil {
+			hopCfg.Recent = *n.LocalCfg.PortHopping.RecentPorts
+		}
+	}
+	bind := conn.NewPortHopBind(conn.NewMultiBind(), hopCfg)
+
 	// setup WireGuard
-	dev = device.NewDevice(tdev, conn.NewDefaultBind(), &device.Logger{
+	dev = device.NewDevice(tdev, bind, &device.Logger{
 		// Verbosef only fires when DBG_log_wireguard is set; emitting at Info
 		// makes the flag the single gate, visible at the default log level.
 		Verbosef: func(format string, args ...any) {

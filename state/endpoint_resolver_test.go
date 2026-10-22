@@ -18,7 +18,7 @@ func TestEndpointResolverSharesResolutionByAddress(t *testing.T) {
 
 	const workers = 8
 	type resolveResult struct {
-		addr netip.AddrPort
+		addr AddrPortRange
 		err  error
 	}
 	results := make(chan resolveResult, workers)
@@ -34,7 +34,7 @@ func TestEndpointResolverSharesResolutionByAddress(t *testing.T) {
 	wg.Wait()
 	close(results)
 
-	expected := netip.MustParseAddrPort("192.0.2.1:1234")
+	expected := AddrPortRange{Addr: netip.MustParseAddr("192.0.2.1"), Ports: PortRange{First: 1234, Last: 1234}}
 	for result := range results {
 		require.NoError(t, result.err)
 		assert.Equal(t, expected, result.addr)
@@ -52,7 +52,7 @@ func TestEndpointResolverDoesNotCacheLiteralAddrPort(t *testing.T) {
 	dns := &countingDNSResolver{}
 	resolver := newEndpointResolver(dns)
 
-	expected := netip.MustParseAddrPort("[2001:db8::1]:57175")
+	expected := AddrPortRange{Addr: netip.MustParseAddr("2001:db8::1"), Ports: PortRange{First: 57175, Last: 57175}}
 	result, err := resolver.Resolve(expected.String(), time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, expected, result)
@@ -103,7 +103,7 @@ func TestEndpointResolverGetDoesNotWaitForRefresh(t *testing.T) {
 	<-dns.started
 
 	type getResult struct {
-		addr netip.AddrPort
+		addr AddrPortRange
 		err  error
 	}
 	getDone := make(chan getResult, 1)

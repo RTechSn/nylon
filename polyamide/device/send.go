@@ -185,6 +185,15 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	selEp := peer.endpoints.val[peer.endpoints.lastInitIndex]
 	peer.endpoints.Unlock()
 
+	// Port hopping: a range endpoint draws a fresh port for every
+	// handshake attempt, so retries land on different destination ports
+	// (defeats per-port bans while connecting). The returned fixed-port
+	// endpoint keeps junk + I-packets + initiation on one port and counts
+	// them against the rotation budget.
+	if hp, ok := selEp.(conn.FreshPorter); ok {
+		selEp = hp.FreshPort()
+	}
+
 	eps := make([]conn.Endpoint, len(sendBuffer))
 	for i := range eps {
 		eps[i] = selEp

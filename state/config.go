@@ -120,12 +120,21 @@ type TunablesOverrides struct {
 	HopCost                    *uint32        `yaml:"hop_cost,omitempty"`
 }
 
+// PortHoppingCfg is the client-side port rotation policy for endpoints
+// configured with port ranges. Nil values keep the built-in defaults.
+type PortHoppingCfg struct {
+	BudgetPackets *uint32 `yaml:"budget_packets,omitempty"` // rotate dst port after N packets on one port
+	RecentPorts   *uint32 `yaml:"recent_ports,omitempty"`   // avoid reusing the last N chosen ports
+}
+
 // LocalCfg represents local node-level configuration
 type LocalCfg struct {
 	// Node Private Key
 	Key                NyPrivateKey
 	Id                 NodeId                // unique id for this node
 	Port               uint16                // Address that the data plane can be accessed by
+	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
+	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface
 	NoTun              bool                  `yaml:"no_tun,omitempty"`               // relay-only mode; requires no advertised addresses or prefixes

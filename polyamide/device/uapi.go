@@ -25,6 +25,26 @@ import (
 
 var ErrIPCStatusHandled = errors.New("ipc status handled by custom handler")
 
+// applyHopConfig mutates the client-side port hopping policy of the device's
+// bind, when the bind supports it. Knobs are startup-time: they apply to
+// range endpoints parsed after the change.
+func applyHopConfig(device *Device, mutate func(conn.HopConfig) conn.HopConfig) {
+	device.net.RLock()
+	bind := device.net.bind
+	device.net.RUnlock()
+	setter, ok := bind.(conn.HopConfigSetter)
+	if !ok {
+		return
+	}
+	var cur conn.HopConfig
+	if getter, ok := bind.(conn.HopConfigGetter); ok {
+		cur = getter.HopConfig()
+	} else {
+		cur = conn.DefaultHopConfig()
+	}
+	setter.SetHopConfig(mutate(cur))
+}
+
 type IPCError struct {
 	code int64 // error code
 	err  error // underlying/wrapped error
@@ -95,6 +115,10 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 
 		if device.net.port != 0 {
 			sendf("listen_port=%d", device.net.port)
+		}
+
+		if device.net.portRange.Valid() {
+			sendf("listen_ports=%s", device.net.portRange.String())
 		}
 
 		if device.net.fwmark != 0 {
@@ -287,6 +311,44 @@ func (device *Device) handleDeviceLine(ipcDev *ipcSetDevice, key, value string) 
 		if err := device.BindUpdate(); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_port: %w", err)
 		}
+
+	case "listen_ports":
+		// optional additional listen range for port hopping (server side)
+		pr, err := conn.ParsePortRange(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse listen_ports: %w", err)
+		}
+		device.Log.Verbosef("UAPI: Updating listen range")
+
+		device.net.Lock()
+		device.net.portRange = pr
+		device.net.Unlock()
+
+		if err := device.BindUpdate(); err != nil {
+			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_ports: %w", err)
+		}
+
+	case "hop_budget_packets":
+		budget, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse hop_budget_packets: %w", err)
+		}
+		device.Log.Verbosef("UAPI: Updating hop budget")
+		applyHopConfig(device, func(c conn.HopConfig) conn.HopConfig {
+			c.Budget = uint32(budget)
+			return c
+		})
+
+	case "hop_recent_ports":
+		recent, err := strconv.ParseUint(value, 10, 32)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse hop_recent_ports: %w", err)
+		}
+		device.Log.Verbosef("UAPI: Updating hop recent ports")
+		applyHopConfig(device, func(c conn.HopConfig) conn.HopConfig {
+			c.Recent = uint32(recent)
+			return c
+		})
 
 	case "fwmark":
 		mark, err := strconv.ParseUint(value, 10, 32)

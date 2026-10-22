@@ -43,19 +43,34 @@ func (ep *NylonEndpoint) AsNylonEndpoint() *NylonEndpoint {
 }
 
 func (ep *NylonEndpoint) GetWgEndpoint(device *device.Device, resolver *EndpointResolver) (conn.Endpoint, error) {
-	ap, err := resolver.Get(ep.Address)
+	apr, err := resolver.Get(ep.Address)
 	if err != nil {
 		return nil, err
 	}
 
-	if ep.WgEndpoint == nil || ep.WgEndpoint.DstIPPort() != ap {
-		wgEp, err := device.Bind().ParseEndpoint(ap.String())
+	if ep.WgEndpoint == nil || !endpointMatchesRange(ep.WgEndpoint, apr) {
+		wgEp, err := device.Bind().ParseEndpoint(apr.String())
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse endpoint: %s, %v", ap.String(), err)
+			return nil, fmt.Errorf("failed to parse endpoint: %s, %v", apr.String(), err)
 		}
 		ep.WgEndpoint = wgEp
 	}
 	return ep.WgEndpoint, nil
+}
+
+// endpointMatchesRange reports whether the cached wireguard endpoint still
+// addresses the same destination as the given resolution. Range endpoints
+// match by (addr, range) so that periodic re-syncs preserve the hop
+// controller state embedded in the endpoint; single-port endpoints match by
+// exact addr:port.
+func endpointMatchesRange(ep conn.Endpoint, r AddrPortRange) bool {
+	switch e := ep.(type) {
+	case *conn.RangeEndpoint:
+		addr, lo, hi := e.RangeInfo()
+		return r.Addr == addr && r.Ports.First == lo && r.Ports.Last == hi
+	default:
+		return ep.DstIPPort() == r.AddrPort()
+	}
 }
 
 func (n *Neighbour) BestEndpoint() Endpoint {

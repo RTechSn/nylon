@@ -164,12 +164,12 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 	for _, neigh := range n.RouterState.Neighbours {
 		for _, dep := range neigh.Eps {
 			dep := dep.AsNylonEndpoint()
-			ap, err := n.EndpointResolver.Get(dep.Address)
-			if err == nil && ap == wgEndpoint.DstIPPort() && neigh.Id == node {
+			apr, err := n.EndpointResolver.Get(dep.Address)
+			if err == nil && apr.Contains(wgEndpoint.DstIPPort()) && neigh.Id == node {
 				// we have a link
 
 				// refresh wireguard ep
-				dep.WgEndpoint = wgEndpoint
+				updateLinkWgEndpoint(dep, wgEndpoint)
 
 				wasInactive := !dep.IsActive()
 				dep.Renew()
@@ -179,7 +179,7 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 				}
 
 				if n.DBG_log_probe {
-					n.Log.Debug("probe from", "addr", ap.String())
+					n.Log.Debug("probe from", "addr", apr.String())
 				}
 				return
 			}
@@ -197,6 +197,18 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 			return
 		}
 	}
+}
+
+// updateLinkWgEndpoint refreshes a link's cached wireguard endpoint with a
+// packet source address (endpoint roaming), unless the link addresses a
+// destination port range: the hop controller embedded in the RangeEndpoint
+// owns rotation state that must survive, and a received packet's source port
+// is just the flow port of that exchange - not a roaming event.
+func updateLinkWgEndpoint(link *state.NylonEndpoint, ep conn.Endpoint) {
+	if _, isRange := link.WgEndpoint.(*conn.RangeEndpoint); isRange {
+		return
+	}
+	link.WgEndpoint = ep
 }
 
 func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint) {
@@ -217,8 +229,8 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 	for _, neigh := range n.RouterState.Neighbours {
 		for _, dep := range neigh.Eps {
 			dpLink := dep.AsNylonEndpoint()
-			ap, err := n.EndpointResolver.Get(dpLink.Address)
-			if err == nil && ap == ep.DstIPPort() && neigh.Id == node {
+			apr, err := n.EndpointResolver.Get(dpLink.Address)
+			if err == nil && apr.Contains(ep.DstIPPort()) && neigh.Id == node {
 				// we have a link
 				if n.DBG_log_probe {
 					n.Log.Debug("probe back", "peer", node, "ping", latency)
@@ -230,7 +242,7 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 				}
 
 				// update wireguard endpoint
-				dpLink.WgEndpoint = ep
+				updateLinkWgEndpoint(dpLink, ep)
 
 				ComputeRoutes(n.RouterState, n)
 				return

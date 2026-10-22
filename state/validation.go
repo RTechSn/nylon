@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"slices"
 	"time"
+
+	"github.com/encodeous/nylon/polyamide/conn"
 )
 
 var namePattern, _ = regexp.Compile("^[0-9a-z._/-]+$")
@@ -29,6 +31,23 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	}
 	if node.Port == 0 {
 		return fmt.Errorf("port must be greater than 0")
+	}
+	if node.ListenPorts != "" {
+		pr, err := ParsePortRange(node.ListenPorts)
+		if err != nil {
+			return fmt.Errorf("listen_ports: %w", err)
+		}
+		if pr.Size() > conn.MaxListenRangePorts {
+			return fmt.Errorf("listen_ports %s exceeds the %d-port ceiling of the in-daemon range listener; deploy a narrower range or use the netfilter DNAT mode", pr, conn.MaxListenRangePorts)
+		}
+	}
+	if node.PortHopping != nil {
+		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
+			return fmt.Errorf("port_hopping.budget_packets must be greater than 0 (or omitted for the default)")
+		}
+		if node.PortHopping.RecentPorts != nil && *node.PortHopping.RecentPorts > 65535 {
+			return fmt.Errorf("port_hopping.recent_ports must be at most 65535")
+		}
 	}
 	if node.Key == [32]byte{} {
 		return fmt.Errorf("private key must not be empty")

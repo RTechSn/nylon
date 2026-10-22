@@ -15,39 +15,39 @@ type DataSource struct {
 }
 
 //func generateMultiLinePlot(dataSources []DataSource, title string) (*plot.Plot, error) {
-//	p := plot.New()
+//      p := plot.New()
 //
-//	p.Title.Text = title
-//	p.X.Label.Text = "Sample #"
-//	p.Y.Label.Text = "Duration (ms)"
+//      p.Title.Text = title
+//      p.X.Label.Text = "Sample #"
+//      p.Y.Label.Text = "Duration (ms)"
 //
-//	// Define a color palette for the lines
-//	colors := []color.Color{
-//		color.RGBA{R: 255, G: 0, B: 0, A: 255},   // Red
-//		color.RGBA{R: 0, G: 0, B: 255, A: 255},   // Blue
-//		color.RGBA{R: 0, G: 255, B: 0, A: 255},   // Green
-//		color.RGBA{R: 255, G: 0, B: 255, A: 255}, // Magenta
-//		color.RGBA{R: 0, G: 255, B: 255, A: 255}, // Cyan
-//	}
+//      // Define a color palette for the lines
+//      colors := []color.Color{
+//              color.RGBA{R: 255, G: 0, B: 0, A: 255},   // Red
+//              color.RGBA{R: 0, G: 0, B: 255, A: 255},   // Blue
+//              color.RGBA{R: 0, G: 255, B: 0, A: 255},   // Green
+//              color.RGBA{R: 255, G: 0, B: 255, A: 255}, // Magenta
+//              color.RGBA{R: 0, G: 255, B: 255, A: 255}, // Cyan
+//      }
 //
-//	for i, ds := range dataSources {
-//		points := make(plotter.XYs, len(ds.Data))
-//		for j, d := range ds.Data {
-//			points[j].X = float64(j)
-//			points[j].Y = float64(d.Milliseconds())
-//		}
+//      for i, ds := range dataSources {
+//              points := make(plotter.XYs, len(ds.Data))
+//              for j, d := range ds.Data {
+//                      points[j].X = float64(j)
+//                      points[j].Y = float64(d.Milliseconds())
+//              }
 //
-//		line, err := plotter.NewLine(points)
-//		if err != nil {
-//			return nil, fmt.Errorf("failed to create line for %s: %v", ds.Name, err)
-//		}
+//              line, err := plotter.NewLine(points)
+//              if err != nil {
+//                      return nil, fmt.Errorf("failed to create line for %s: %v", ds.Name, err)
+//              }
 //
-//		line.Color = colors[i%len(colors)] // Cycle through colors
-//		p.Add(line)
-//		p.Legend.Add(ds.Name, line)
-//	}
+//              line.Color = colors[i%len(colors)] // Cycle through colors
+//              p.Add(line)
+//              p.Legend.Add(ds.Name, line)
+//      }
 //
-//	return p, nil
+//      return p, nil
 //}
 
 func runTests(t *testing.T, ping func(i int) float64, dura time.Duration, fn string) (DataSource, DataSource) {
@@ -97,10 +97,10 @@ func runTests(t *testing.T, ping func(i int) float64, dura time.Duration, fn str
 
 	//p, err := generateMultiLinePlot(dataSources, "Comparison of ping and stabilized ping")
 	//if err != nil {
-	//	t.Fatal(err)
+	//      t.Fatal(err)
 	//}
 	//if err := p.Save(8*vg.Inch, 6*vg.Inch, spew.Sprintf("method_comparison_%s.png", fn)); err != nil {
-	//	t.Fatalf("Failed to save plot: %v", err)
+	//      t.Fatalf("Failed to save plot: %v", err)
 	//}
 
 	return truth, stabilized
@@ -259,13 +259,14 @@ func TestParseEndpoint(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			host, port, err := parseEndpoint(tt.input)
+			host, ports, err := parseEndpoint(tt.input)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
 				assert.Equal(t, tt.expectedHost, host)
-				assert.Equal(t, tt.expectedPort, port)
+				assert.Equal(t, tt.expectedPort, ports.First)
+				assert.Equal(t, tt.expectedPort, ports.Last)
 			}
 		})
 	}

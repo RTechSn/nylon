@@ -16,6 +16,14 @@ port: 57175 # UDP port nylon listens on
 
 # --- Optional fields below ---
 
+# Port hopping (TSPU resistance): bind an additional range of ports that
+# peers configured with a range endpoint can address. See the
+# "Port Hopping" section below.
+listen_ports: "" # e.g. "30000-40000"; empty = primary port only
+port_hopping: # client-side rotation policy for range endpoints
+  budget_packets: 12 # rotate the destination port after N packets on one port
+  recent_ports: 64 # avoid reusing the last N chosen ports
+
 use_system_routing: false # if true, all peer packets exit via the TUN interface
 no_tun: false # if true, run as a userspace-only relay without a TUN (requires use_system_routing: false and no addresses/prefixes for this node in central.yaml)
 no_net_configure: false # if true, nylon won't touch system routes or interfaces
@@ -124,6 +132,15 @@ routers:
       - "123.123.123.123:57175" # multiple endpoints; nylon picks the best one dynamically
       - "123.123.123.124:57175"
 
+  - id: hopper
+    pubkey: 5Fg3x2XyV0xEjRzVMPqjr0z0WvCw1t6jdB4Nvo1W1mY=
+    addresses: [10.0.0.5]
+    endpoints:
+      # Port range endpoint: peers pick a random port from the range on every
+      # new connection and rotate it proactively. The node itself must bind the
+      # range (listen_ports in its node.yaml) or forward it (e.g. via DNAT).
+      - "198.51.100.9:30000-39999"
+
 # --- Clients ---
 # Passive WireGuard clients that don't run nylon. Only static prefixes allowed.
 clients:
@@ -210,6 +227,41 @@ timestamp: 1740832962209309000
 A `metric` override behaves differently per check type. On a `ping` entry the value is advertised unconditionally from startup and suppresses failure retraction, so the prefix stays announced even when the probe target is down; leave it unset if you want health-driven withdrawal. On an `http` entry the override replaces only the healthy request-duration metric, and failures still retract. See [Dynamic Prefixes](/reference/dynamic-prefixes) for the full behavior.
 
 The `obf` profile and the per-node `i1`-`i5` specs are normally produced by `nylon genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
+
+---
+
+## Port Hopping
+
+Volume-based UDP blocking (as deployed by TSPU-class middleboxes) throttles a
+flow identified by its 5-tuple after a small packet budget, and bans
+individual destination ports for minutes at a time. Port hopping defeats both
+by never staying on one destination port:
+
+- An endpoint may be configured as `host:portA-portB` (inclusive range) in
+  `central.yaml`. Single-port endpoints keep working unchanged, and a range
+  may be combined with multiple endpoint entries as usual.
+- On every new connection (handshake) a port is drawn uniformly at random from
+  the range, excluding the most recently used ports (`recent_ports`).
+- While sending, the destination port rotates after `budget_packets` packets
+  (all packet types count: data, keepalives, probes, AWG junk and I-packets).
+  Rotation happens mid-batch, so a large burst is split across ports.
+- The node that owns the range endpoint must receive on the whole range: set
+  `listen_ports: "portA-portB"` in its `node.yaml` (the daemon binds every
+  port, up to 4096) — or redirect the range to the primary port with a
+  netfilter rule such as
+  `iptables -t nat -A PREROUTING -p udp --dport 30000:40000 -j REDIRECT --to-ports 57175`
+  for wider ranges.
+- Everything rides the existing WireGuard/AWG data path: no new packet types
+  are introduced, obfuscation profiles are unaffected, and a session survives
+  every rotation (no re-handshake, no key change).
+- Compatibility: stock single-port peers interoperate with a range-listening
+  node, and a range client degrades to the single port against a stock node.
+
+Tuning guidance: keep `budget_packets` below the observed per-flow budget of
+the middlebox (empirically ~16-20 packets); remember the budget is consumed in
+both directions. Port burn rate is roughly `tx rate / budget_packets`; a
+10 Mbps stream at a 12-packet budget burns ~67 ports/s, so prefer wide ranges
+(thousands of ports) for sustained transfers.
 
 ---
 
