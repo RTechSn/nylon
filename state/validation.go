@@ -30,6 +30,32 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	if node.Port == 0 {
 		return fmt.Errorf("port must be greater than 0")
 	}
+	if node.ListenPorts != "" {
+		pr, err := ParsePortRange(node.ListenPorts)
+		if err != nil {
+			return fmt.Errorf("listen_ports: %w", err)
+		}
+		if !pr.Contains(node.Port) {
+			return fmt.Errorf("listen_ports %s must contain the primary port %d", pr, node.Port)
+		}
+		if pr.Size() > MaxInDaemonListenPorts {
+			return fmt.Errorf("listen_ports %s exceeds the %d-port ceiling of the in-daemon range listener; use a narrower range or the netfilter DNAT deployment mode (docs/guides/port-hopping.mdx)", pr, MaxInDaemonListenPorts)
+		}
+	}
+	if node.PortHopping != nil {
+		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
+			return fmt.Errorf("port_hopping.budget_packets must be greater than 0 (or omitted for the default)")
+		}
+		if node.PortHopping.RecentPorts != nil && *node.PortHopping.RecentPorts > 65535 {
+			return fmt.Errorf("port_hopping.recent_ports must be at most 65535")
+		}
+		if node.PortHopping.CooldownSeconds != nil && *node.PortHopping.CooldownSeconds == 0 {
+			return fmt.Errorf("port_hopping.cooldown_seconds must be greater than 0 (or omitted for the default)")
+		}
+		if node.PortHopping.CandidateSamples != nil && *node.PortHopping.CandidateSamples == 0 {
+			return fmt.Errorf("port_hopping.candidate_samples must be greater than 0 (or omitted for the default)")
+		}
+	}
 	if node.Key == [32]byte{} {
 		return fmt.Errorf("private key must not be empty")
 	}
@@ -164,7 +190,7 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			return fmt.Errorf("duplicate router id %s", node.Id)
 		}
 		for _, endpoint := range node.Endpoints {
-			if _, _, err := parseEndpoint(endpoint); err != nil {
+			if _, err := ParseEndpointSpec(endpoint); err != nil {
 				return fmt.Errorf("router %s has invalid endpoint: %w", node.Id, err)
 			}
 		}

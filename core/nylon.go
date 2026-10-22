@@ -41,6 +41,15 @@ type Nylon struct {
 	dynamicPrefixes    []state.PrefixHealthWrapper
 	centralCfgPristine *state.CentralCfg
 
+	// port hopping (client half): one dynamic endpoint factory per peer whose
+	// configured endpoints contain port ranges. The factories draw carrying
+	// endpoints from the port pool and materialise them as regular nylon
+	// links, so runtime state stays O(active window) instead of O(range).
+	portHopping struct {
+		mu        sync.Mutex
+		factories map[state.NodeId]*portFactory
+	}
+
 	router struct {
 		LastStarvationRequest time.Time
 		IO                    map[state.NodeId]*IOPending
@@ -225,6 +234,20 @@ func (n *Nylon) Init() error {
 					}
 				}()
 			}
+		}
+		// port hopping: keep DNS warm for configured range specs
+		// (they never appear as links, so the loop above skips them)
+		for _, target := range n.hopSpecResolveTargets() {
+			if _, ok := seen[target]; ok {
+				continue
+			}
+			seen[target] = struct{}{}
+			go func() {
+				_, err := n.EndpointResolver.Resolve(target, n.EndpointResolveExpiry)
+				if err != nil {
+					n.Log.Debug("failed to resolve endpoint", "ep", target, "err", err.Error())
+				}
+			}()
 		}
 		return nil
 	}, n.EndpointResolveDelay)

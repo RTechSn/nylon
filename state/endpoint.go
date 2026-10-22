@@ -18,6 +18,7 @@ type Endpoint interface {
 	Metric() uint32
 	IsRemote() bool
 	IsActive() bool
+	IsExhausted() bool
 	AsNylonEndpoint() *NylonEndpoint
 }
 
@@ -34,6 +35,7 @@ type NylonEndpoint struct {
 	probeTimeouts uint64
 	expRTT        float64
 	remoteInit    bool
+	exhausted     bool // port-hopping: budget burned on this endpoint; keep it for late pongs, but stop probing it
 	WgEndpoint    conn.Endpoint
 	Address       string
 }
@@ -196,8 +198,9 @@ func (u *NylonEndpoint) Metric() uint32 {
 	u.RLock()
 	lossDead := u.lossDeadUnlocked()
 	samples, success := u.probeSamples, u.probeSuccess
+	exhausted := u.exhausted
 	u.RUnlock()
-	if !u.IsActive() || lossDead {
+	if exhausted || !u.IsActive() || lossDead {
 		return INF
 	}
 	base := DurationToMetric(u.StabilizedPing())
@@ -222,6 +225,21 @@ func (u *NylonEndpoint) ProbeTimeouts() uint64 {
 
 func (u *NylonEndpoint) IsRemote() bool {
 	return u.remoteInit
+}
+
+// MarkExhausted flags the endpoint as burned through its port budget. The
+// link is kept around briefly so late probe pongs still match, but the probe
+// loops stop spending packets on it and it never becomes the best endpoint.
+func (u *NylonEndpoint) MarkExhausted() {
+	u.Lock()
+	defer u.Unlock()
+	u.exhausted = true
+}
+
+func (u *NylonEndpoint) IsExhausted() bool {
+	u.RLock()
+	defer u.RUnlock()
+	return u.exhausted
 }
 
 func DurationToMetric(d time.Duration) uint32 {

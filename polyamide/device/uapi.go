@@ -97,6 +97,10 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("listen_port=%d", device.net.port)
 		}
 
+		if device.net.portRange.Valid() {
+			sendf("listen_ports=%s", device.net.portRange.String())
+		}
+
 		if device.net.fwmark != 0 {
 			sendf("fwmark=%d", device.net.fwmark)
 		}
@@ -163,6 +167,15 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 				sendf("endpoint=%s", peer.endpoints.val[0].DstToString())
 			}
 			peer.endpoints.Unlock()
+
+			// port hopping state (absent when hopping is inactive)
+			if hs, ok := peer.HopStatus(); ok {
+				sendf("hop_budget=%d", hs.Budget)
+				if hs.Carrying != "" {
+					sendf("hop_endpoint=%s", hs.Carrying)
+					sendf("hop_budget_left=%d", hs.BudgetLeft)
+				}
+			}
 
 			nano := peer.lastHandshakeNano.Load()
 			secs := nano / time.Second.Nanoseconds()
@@ -286,6 +299,22 @@ func (device *Device) handleDeviceLine(ipcDev *ipcSetDevice, key, value string) 
 
 		if err := device.BindUpdate(); err != nil {
 			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_port: %w", err)
+		}
+
+	case "listen_ports":
+		// optional additional listen range for port hopping (server side)
+		pr, err := conn.ParsePortRange(value)
+		if err != nil {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse listen_ports: %w", err)
+		}
+		device.Log.Verbosef("UAPI: Updating listen range")
+
+		device.net.Lock()
+		device.net.portRange = pr
+		device.net.Unlock()
+
+		if err := device.BindUpdate(); err != nil {
+			return ipcErrorf(ipc.IpcErrorPortInUse, "failed to set listen_ports: %w", err)
 		}
 
 	case "fwmark":

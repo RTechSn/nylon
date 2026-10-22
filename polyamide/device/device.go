@@ -7,6 +7,7 @@ package device
 
 import (
 	"bufio"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -43,8 +44,9 @@ type Device struct {
 		sync.RWMutex
 		bind          conn.Bind // bind interface
 		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
+		port          uint16         // listening port
+		portRange     conn.PortRange // optional additional listen range (port hopping, server side)
+		fwmark        uint32         // mark value (0 = disabled)
 		brokenRoaming bool
 	}
 
@@ -590,6 +592,24 @@ func (device *Device) BindUpdate() error {
 	if err != nil {
 		netc.port = 0
 		return err
+	}
+
+	// open the additional listen range, if configured (port hopping)
+	if netc.portRange.Valid() {
+		ro, ok := netc.bind.(conn.RangeOpener)
+		if !ok {
+			netc.bind.Close()
+			netc.port = 0
+			return fmt.Errorf("listen range %s configured but the bind does not support ranges", netc.portRange)
+		}
+		extraFns, err := ro.OpenRange(netc.port, netc.portRange)
+		if err != nil {
+			netc.bind.Close()
+			netc.port = 0
+			return err
+		}
+		recvFns = append(recvFns, extraFns...)
+		device.Log.Verbosef("Listening on port range %s", netc.portRange)
 	}
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)

@@ -31,6 +31,11 @@ func (n *Nylon) sendEndpointProbes(peer state.NodeId, timeout time.Duration) ([]
 	})
 	probes := make([]Future[*protocol.EndpointProbeResult], 0, len(eps))
 	for _, ep := range eps {
+		// port hopping: skip burned carrying ports (quarantined; probing them
+		// would only spend packets on a port that is about to be abandoned)
+		if ep.IsExhausted() {
+			continue
+		}
 		result, _ := n.sendEndpointProbe(neigh.Id, ep.AsNylonEndpoint(), timeout)
 		probes = append(probes, result)
 	}
@@ -244,7 +249,18 @@ func (n *Nylon) probeLinks(active bool) error {
 	// probe links
 	for _, neigh := range n.RouterState.Neighbours {
 		for _, ep := range neigh.Eps {
+			// port hopping: never spend packets on a carrying port that already
+			// burned its budget (it is quarantined and only kept for late pongs)
+			if ep.IsExhausted() {
+				continue
+			}
 			if ep.IsActive() == active {
+				// port hopping: factory-managed carrying links probe at a relaxed
+				// cadence (see portFactory.probeReady) so idle probing does not burn
+				// the port budget; stock links keep the stock cadence
+				if !n.hopProbeReady(neigh.Id, ep.AsNylonEndpoint().Address) {
+					continue
+				}
 				_, err := n.sendEndpointProbe(neigh.Id, ep.AsNylonEndpoint(), n.ProbeTimeout)
 				if err != nil {
 					n.Log.Debug("probe failed", "error", err)
@@ -267,6 +283,12 @@ func (n *Nylon) probeNew() error {
 		}
 		cfg := n.GetRouter(peer)
 		for _, address := range cfg.Endpoints {
+			// port hopping: range-form endpoints (e.g. "1.2.3.4:30000-40000")
+			// are owned by the port factory, which materialises concrete
+			// addr:port links as they are drawn; they are never probed as-is
+			if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
+				continue
+			}
 			idx := slices.IndexFunc(neigh.Eps, func(link state.Endpoint) bool {
 				return !link.IsRemote() && link.AsNylonEndpoint().Address == address
 			})

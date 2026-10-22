@@ -120,12 +120,67 @@ type TunablesOverrides struct {
 	HopCost                    *uint32        `yaml:"hop_cost,omitempty"`
 }
 
+// PortHoppingCfg is the client-side port rotation policy for peers whose
+// endpoints are configured with port ranges. Nil values keep the built-in
+// defaults (see DefaultPortHoppingPolicy).
+type PortHoppingCfg struct {
+	BudgetPackets    *uint32 `yaml:"budget_packets,omitempty"`    // rotate the carrying port after N wire packets (worst-case per-flow budget)
+	RecentPorts      *uint32 `yaml:"recent_ports,omitempty"`      // avoid reusing the last N selected endpoints
+	CooldownSeconds  *uint32 `yaml:"cooldown_seconds,omitempty"`  // quarantine a retired port for this long
+	CandidateSamples *uint32 `yaml:"candidate_samples,omitempty"` // candidates sampled per selection for diversity scoring
+}
+
+// PortHoppingPolicy is the resolved, always-set form of PortHoppingCfg.
+type PortHoppingPolicy struct {
+	Budget           uint32
+	Recent           uint32
+	Cooldown         time.Duration
+	CandidateSamples uint32
+}
+
+// DefaultPortHoppingPolicy returns the worst-case defaults: the budget stays
+// under empirically observed per-flow volume bans (16-20 packets), retired
+// ports are quarantined for several minutes (typical middlebox recovery),
+// and selection samples enough candidates to express the diversity
+// preference across IPs and subnets.
+func DefaultPortHoppingPolicy() PortHoppingPolicy {
+	return PortHoppingPolicy{
+		Budget:           12,
+		Recent:           512,
+		Cooldown:         3 * time.Minute,
+		CandidateSamples: 32,
+	}
+}
+
+// Resolve fills unset fields with the defaults.
+func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
+	p := DefaultPortHoppingPolicy()
+	if c == nil {
+		return p
+	}
+	if c.BudgetPackets != nil && *c.BudgetPackets > 0 {
+		p.Budget = *c.BudgetPackets
+	}
+	if c.RecentPorts != nil && *c.RecentPorts > 0 {
+		p.Recent = *c.RecentPorts
+	}
+	if c.CooldownSeconds != nil && *c.CooldownSeconds > 0 {
+		p.Cooldown = time.Duration(*c.CooldownSeconds) * time.Second
+	}
+	if c.CandidateSamples != nil && *c.CandidateSamples > 0 {
+		p.CandidateSamples = *c.CandidateSamples
+	}
+	return p
+}
+
 // LocalCfg represents local node-level configuration
 type LocalCfg struct {
 	// Node Private Key
 	Key                NyPrivateKey
 	Id                 NodeId                // unique id for this node
 	Port               uint16                // Address that the data plane can be accessed by
+	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
+	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface
 	NoTun              bool                  `yaml:"no_tun,omitempty"`               // relay-only mode; requires no advertised addresses or prefixes

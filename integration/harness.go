@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -14,6 +15,7 @@ import (
 	"net/netip"
 	"runtime/pprof"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +60,88 @@ type VirtualLink struct {
 	Jitter  time.Duration
 
 	packetLoss atomic.Uint64
+
+	// Port-hopping (range) links: instead of an exact Edge.V2 match, any
+	// destination addr:port with port in DstPorts is delivered to DstNode.
+	dstNode  state.NodeId
+	dstAddr  netip.Addr
+	dstPorts conn.PortRange
+	// Reverse range links: any source port from srcAddrMatch to Edge.V2.
+	srcAddrMatch netip.Addr
+
+	// TSPU emulation: when > 0, at most FlowBudget packets are delivered per
+	// (source, destination) flow before the flow is dropped for the rest of
+	// the link's life. Applies to the Edge.V1 -> Edge.V2 direction (the
+	// reverse direction of a range link is a separate exact link).
+	flowBudget int
+	flowMu     sync.Mutex
+	flowCounts map[flowKey]int
+
+	// distinct destination ports seen on this link (range links only); used
+	// by tests to assert that port rotation actually happened
+	portsMu   sync.Mutex
+	portsSeen map[uint16]struct{}
+}
+
+type flowKey struct {
+	src netip.AddrPort
+	dst netip.AddrPort
+}
+
+// IsRangeLink reports whether this link matches a destination port range.
+func (v *VirtualLink) IsRangeLink() bool {
+	return v.dstPorts.Valid()
+}
+
+// Matches reports whether a packet from -> to is routable over this link.
+func (v *VirtualLink) Matches(from, to bindtest.ChannelEndpoint2) bool {
+	if v.IsRangeLink() {
+		return bindtest.ChannelEndpoint2(v.Edge.V1) == from &&
+			netip.AddrPort(to).Addr() == v.dstAddr &&
+			v.dstPorts.Contains(netip.AddrPort(to).Port())
+	}
+	if v.srcAddrMatch.IsValid() {
+		return netip.AddrPort(from).Addr() == v.srcAddrMatch && v.Edge.V2 == to
+	}
+	return v.Edge.V1 == from && v.Edge.V2 == to
+}
+
+// WithFlowBudget arms the per-flow packet budget (TSPU volume-ban emulation).
+func (v *VirtualLink) WithFlowBudget(n int) *VirtualLink {
+	v.flowBudget = n
+	return v
+}
+
+func (v *VirtualLink) flowAllows(from, to bindtest.ChannelEndpoint2) bool {
+	if v.flowBudget <= 0 {
+		return true
+	}
+	v.flowMu.Lock()
+	defer v.flowMu.Unlock()
+	if v.flowCounts == nil {
+		v.flowCounts = make(map[flowKey]int)
+	}
+	k := flowKey{src: netip.AddrPort(from), dst: netip.AddrPort(to)}
+	v.flowCounts[k]++
+	return v.flowCounts[k] <= v.flowBudget
+}
+
+// DistinctDstPorts reports how many distinct destination ports have carried
+// packets over this link (range links only).
+func (v *VirtualLink) DistinctDstPorts() int {
+	v.portsMu.Lock()
+	defer v.portsMu.Unlock()
+	return len(v.portsSeen)
+}
+
+// observePort records a destination port on a range link.
+func (v *VirtualLink) observePort(port uint16) {
+	v.portsMu.Lock()
+	if v.portsSeen == nil {
+		v.portsSeen = make(map[uint16]struct{})
+	}
+	v.portsSeen[port] = struct{}{}
+	v.portsMu.Unlock()
 }
 
 func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEndpoint2, i *InMemoryNetwork) {
@@ -67,7 +151,23 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 		return
 	}
 
-	toIdx := i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
+	var toIdx int
+	if v.IsRangeLink() {
+		toIdx = i.cfg.IndexOf(v.dstNode)
+		// record the reply source for the flow so the destination node's
+		// replies carry the same server-side port the client targeted (this
+		// mirrors a real range listener answering from the receiving port)
+		i.setFlowSrc(v.dstNode, from, to)
+		v.observePort(netip.AddrPort(to).Port())
+	} else if v.srcAddrMatch.IsValid() {
+		toIdx = i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
+	} else {
+		toIdx = i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
+	}
+	// TSPU emulation: enforce the per-flow budget
+	if !v.flowAllows(from, to) {
+		return
+	}
 	if v.Latency != 0 {
 		simJitter := rand.Float64() * float64(v.Jitter.Nanoseconds())
 		simLat := v.Latency + time.Duration(simJitter)
@@ -171,6 +271,41 @@ func (v *VirtualHarness) AddLink(from, to string) *VirtualLink {
 	return link
 }
 
+// AddLinkRange adds a port-hopping link: packets from `from` (an exact
+// addr:port) to dstAddr:any-port-in-ports are delivered to dstNode. The
+// reverse direction must be added separately (usually an exact AddLink).
+func (v *VirtualHarness) AddLinkRange(from, dstNode, dstAddr string, ports conn.PortRange) *VirtualLink {
+	link := &VirtualLink{
+		dstNode:  state.NodeId(dstNode),
+		dstAddr:  netip.MustParseAddr(dstAddr),
+		dstPorts: ports,
+	}
+	link.Edge = state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]{
+		V1: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(from)),
+	}
+	v.linksMu.Lock()
+	v.Links = append(v.Links, link)
+	v.linksMu.Unlock()
+	return link
+}
+
+// AddLinkFromAddr adds a reverse port-hopping link: packets from any source
+// port of fromAddr to the exact `to` endpoint are delivered to the node that
+// owns `to` (the normal exact endpoint mapping). Used for the server -> client
+// direction, where the reply source port follows the flow.
+func (v *VirtualHarness) AddLinkFromAddr(fromAddr, to string) *VirtualLink {
+	link := &VirtualLink{
+		srcAddrMatch: netip.MustParseAddr(fromAddr),
+	}
+	link.Edge = state.Pair[bindtest.ChannelEndpoint2, bindtest.ChannelEndpoint2]{
+		V2: bindtest.ChannelEndpoint2(netip.MustParseAddrPort(to)),
+	}
+	v.linksMu.Lock()
+	v.Links = append(v.Links, link)
+	v.linksMu.Unlock()
+	return link
+}
+
 func (v *VirtualHarness) Start() chan error {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	v.Context = ctx
@@ -186,6 +321,13 @@ func (v *VirtualHarness) Start() chan error {
 	vn.readyCond = sync.NewCond(&sync.Mutex{})
 	// pick the first endpoint specified for each node
 	vn.EpOutMapping = func(curNode state.NodeId, to bindtest.ChannelEndpoint2) bindtest.ChannelEndpoint2 {
+		// port-hopping flow tracking: when this node has received traffic on a
+		// range link, its replies to that source must carry the server-side
+		// port the flow targeted (mirrors a range listener replying from the
+		// receiving port)
+		if src, ok := vn.flowSrc(curNode, to); ok {
+			return src
+		}
 		for k, x := range v.Endpoints {
 			if x == curNode {
 				return bindtest.ChannelEndpoint2(netip.MustParseAddrPort(k))
@@ -279,6 +421,40 @@ type InMemoryNetwork struct {
 	EpOutMapping   OutMapping
 	ready          atomic.Bool
 	readyCond      *sync.Cond
+
+	flowMu   sync.Mutex
+	flowSrcs map[flowKey]bindtest.ChannelEndpoint2 // (node, dst) -> synthesized reply source
+}
+
+// setFlowSrc records that replies from node `n` to `dst` should be sourced
+// from `src` (used by range links to mirror port-preserving replies).
+func (i *InMemoryNetwork) setFlowSrc(n state.NodeId, dst, src bindtest.ChannelEndpoint2) {
+	i.flowMu.Lock()
+	defer i.flowMu.Unlock()
+	if i.flowSrcs == nil {
+		i.flowSrcs = make(map[flowKey]bindtest.ChannelEndpoint2)
+	}
+	i.flowSrcs[flowKeyFor(n, dst)] = src
+}
+
+func (i *InMemoryNetwork) flowSrc(n state.NodeId, dst bindtest.ChannelEndpoint2) (bindtest.ChannelEndpoint2, bool) {
+	i.flowMu.Lock()
+	defer i.flowMu.Unlock()
+	src, ok := i.flowSrcs[flowKeyFor(n, dst)]
+	return src, ok
+}
+
+func flowKeyFor(n state.NodeId, dst bindtest.ChannelEndpoint2) flowKey {
+	return flowKey{src: netip.MustParseAddrPort("0.0.0.0:" + strconv.Itoa(int(numericNodeId(n)))), dst: netip.AddrPort(dst)}
+}
+
+func numericNodeId(n state.NodeId) uint16 {
+	// node ids are arbitrary strings; use a stable numeric hash for the
+	// synthetic flow-source key. Collisions are impossible in practice for
+	// test-sized meshes because the key also carries the dst.
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(n))
+	return uint16(h.Sum32())
 }
 
 func (i *InMemoryNetwork) WaitForReady() {
@@ -340,7 +516,7 @@ func (i *InMemoryNetwork) virtualInternet(pkt []byte, len int, from, to bindtest
 	// simulate network conditions
 	i.cfg.linksMu.RLock()
 	idx := slices.IndexFunc(i.cfg.Links, func(link *VirtualLink) bool {
-		return link.Edge.V1 == from && link.Edge.V2 == to
+		return link.Matches(from, to)
 	})
 	var link *VirtualLink
 	if idx != -1 {
@@ -396,6 +572,9 @@ func (i *InMemoryNetwork) Bind(node state.NodeId) conn.Bind {
 			}
 		}
 	}()
+	// The device side is returned as-is: in the port-as-endpoint design the
+	// hop accounting lives in the device peer send path (peer.SetHop), wired
+	// from the nylon core, and works on any bind — including this channel bind.
 	return bp[1]
 }
 

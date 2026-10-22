@@ -70,6 +70,19 @@ func (n *Nylon) obfDeviceIPC() string {
 	return obfDeviceIPC(n.Obf, n.GetNode(n.LocalCfg.Id).Obf)
 }
 
+// hopDeviceIPC renders the device-level port-hopping UAPI knob: the listen
+// range (server half). The client half (rotation budget) is applied per-peer
+// through the hop controller, not through device UAPI.
+func (n *Nylon) hopDeviceIPC() string {
+	var b strings.Builder
+	if n.LocalCfg.ListenPorts != "" {
+		if _, err := state.ParsePortRange(n.LocalCfg.ListenPorts); err == nil {
+			fmt.Fprintf(&b, "listen_ports=%s\n", n.LocalCfg.ListenPorts)
+		}
+	}
+	return b.String()
+}
+
 func (n *Nylon) initWireGuard() error {
 	dev, tdev, itfName, err := NewWireGuardDevice(n)
 	if err != nil {
@@ -100,7 +113,7 @@ listen_port=%d
 `,
 			hex.EncodeToString(n.Key[:]),
 			n.Port,
-		) + n.obfDeviceIPC(),
+		) + n.obfDeviceIPC() + n.hopDeviceIPC(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure wg device: %v", err)

@@ -54,6 +54,10 @@ func (m MockEndpoint) IsActive() bool {
 	return m.active
 }
 
+func (m MockEndpoint) IsExhausted() bool {
+	return false
+}
+
 func (m MockEndpoint) AsNylonEndpoint() *state.NylonEndpoint {
 	return nil
 }

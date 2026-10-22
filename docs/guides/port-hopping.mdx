@@ -1,0 +1,121 @@
+---
+title: Port Hopping
+description: Rotate destination ports to survive per-flow volume bans (TSPU).
+sidebar:
+  order: 6
+---
+
+Port hopping makes a nylon tunnel survive middleboxes that block UDP traffic by flow volume rather than by port alone. Typical behaviour (empirically observed on networks with TSPU-style DPI):
+
+- every UDP **flow** — a 5-tuple of src ip:port and dst ip:port — is permanently banned after a small number of packets (on the order of 16–20, roughly 20–24 KB at a 1200-byte safe MTU);
+- individual ports are periodically banned outright, but the bans are much slower and recover after minutes.
+
+A tunnel pinned to a single `ip:port` cannot survive the first behaviour at all: the flow is banned after seconds of traffic. Port hopping answers it by treating the destination port as a consumable resource: traffic rides one port until its packet budget is nearly spent, then rotates, without interrupting the WireGuard session.
+
+## Design in one paragraph
+
+Nylon already supports multiple endpoints per peer with probe-based ranking. Port hopping reuses that machinery: a peer configured with a **port range** (`203.0.113.7:30000-40000`) is *not* expanded into thousands of links at startup. Instead a **port factory** keeps exactly one *carrying endpoint* alive at a time, draws new ports from a **port pool** as the old ones burn out, and materialises each drawn port as a regular nylon link that the existing probe/metric/ranking code can see. Runtime state is O(active window), not O(range), which is what makes production-sized ranges (tens of thousands of ports) viable.
+
+The rotation itself lives in the device send path (a per-peer packet budget enforced on every outgoing batch — data, retransmits, keepalives, probe packets and AmneziaWG junk all count), so the switch to a fresh port is immediate and never waits for the nylon control loop. The WireGuard session is port-agnostic (transport data is decrypted by receiver index), so rotation needs no new handshake and nothing is injected into the encrypted stream — AmneziaWG compatibility is preserved by construction.
+
+## Server side
+
+The server must accept packets on **every** port of its advertised range and — crucially — answer each peer from exactly the port that peer's last packet targeted. There are two modes:
+
+### In-daemon range listener (up to 4096 ports)
+
+Set `listen_ports` in the server's `node.yaml`. The daemon binds one extra UDP socket per port and tags received packets with the receiving port, so replies leave through the same socket (NAT path symmetry):
+
+```yaml title="node.yaml (server)"
+port: 57175
+listen_ports: 57175-57575 # must contain the primary port; max 4096 ports wide
+```
+
+This mode is the simplest and works everywhere without root firewall changes, but every port costs file descriptors and one receive goroutine, hence the ceiling.
+
+### Netfilter DNAT (arbitrarily wide ranges)
+
+For wide ranges, redirect the whole range to the single real listen port and let conntrack mirror the reverse direction:
+
+```bash title="nftables"
+table ip nylon {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport 30000-65535 redirect to :57175
+  }
+}
+```
+
+With DNAT, the kernel rewrites inbound packets destined to any port of the range to the real listen port, and conntrack automatically rewrites the *source* of the replies back to the original destination port — the program never needs to know which port the peer targeted. The server only binds its normal `port: 57175`.
+
+Notes:
+
+- DNAT needs `conntrack` to keep state for each flow; idle UDP flows time out from the conntrack table, which is harmless — the next packet from the peer creates a new mapping.
+- Pick ranges that do not overlap other services on the host.
+- Both modes satisfy the same contract (accept range, reply from the receiving port), so the client cannot tell them apart.
+
+## Client side
+
+Two config entries enable hopping on the client:
+
+1. The server's entry in `central.yaml` advertises a **range endpoint**:
+
+```yaml title="central.yaml (excerpt)"
+routers:
+  - id: server
+    # ...
+    endpoints:
+      - "203.0.113.7:30000-40000"   # port range: any port in [30000, 40000]
+      # additional concrete endpoints (e.g. a LAN IP) may be listed and are
+      # used by the stock failover machinery as usual
+```
+
+2. The client's `node.yaml` opts in with a `port_hopping` policy:
+
+```yaml title="node.yaml (client)"
+port_hopping:
+  budget_packets: 12   # rotate the carrying port after N wire packets (default 12)
+  recent_ports: 512    # never redraw the last N selected ports (default 512)
+  cooldown_seconds: 180 # quarantine a retired port for this long (default 180)
+  candidate_samples: 32 # candidates scored per draw for diversity (default 32)
+```
+
+All fields are optional; omit `port_hopping` entirely to keep stock single-endpoint behaviour. A peer whose endpoints contain no range is never managed by a factory, even when the policy is set — enabling the policy globally is safe.
+
+### Tuning notes
+
+- `budget_packets` must stay **below** the middlebox's per-flow budget. The default 12 leaves headroom under the worst observed 16–20 for handshake junk and in-flight packets at rotation time. Overshooting a few packets is harmless in practice: the port is retired immediately after, and a ban on an abandoned port costs nothing.
+- `cooldown_seconds` should be at least the observed middlebox recovery time. Range longevity is bounded by `sustained ≈ (ports / cooldown) × budget × ~1200 B`: 40 000 ports with a 180 s cooldown sustain roughly 35 Mbit/s indefinitely; a 100-port test range with the default policy sustains idle probing comfortably (a few ports per minute) but not heavy traffic.
+- The carrying link is probed at a relaxed cadence (a fraction of `link_dead_threshold`) so idle probing does not burn the budget; active traffic rotates the port naturally.
+
+## Multi-IP diversity
+
+Range endpoints may list **different IPs** (the natural Stage-2 extension):
+
+```yaml
+endpoints:
+  - "203.0.113.7:30000-40000"
+  - "198.51.100.9:30000-40000"
+```
+
+When drawing a new carrying port, the pool scores candidates by dissimilarity to the currently active window and prefers, in order: a **different IP subnet** → a **different IP in the same subnet** → the same IP on a different port. Ties break randomly, so port usage stays unpredictable. If TSPU ever bans one path or prefix wholesale, the next rotation moves the tunnel to another address family of your endpoint set.
+
+## Observability
+
+Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO. The device UAPI (`nylon show` dump) reports per-peer:
+
+```
+hop_budget=12
+hop_endpoint=203.0.113.7:30142
+hop_budget_left=7
+```
+
+The rotation counters in the logs are the quickest way to verify hopping is active: a new endpoint line every few seconds under load is the expected pattern.
+
+## Threat model and limits
+
+- **Per-flow volume bans** are neutralised as long as the range is large enough for the cooldown arithmetic above.
+- **Per-port bans** are sidestepped for the same reason: each port is used only briefly and then rests for the cooldown.
+- **Full IP/prefix bans** are out of scope for a single-address range; use multi-IP endpoints for path diversity.
+- The reverse direction (server → client) rides the same ports (the server replies from the port the client targeted), so its budget burns in lockstep with the client's rotations — no separate server-side rotation is needed.
+- Vanilla WireGuard peers and non-hopping nylon peers are unaffected: no protocol bytes changed, and nodes without range endpoints behave exactly as before.
