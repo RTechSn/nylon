@@ -119,6 +119,25 @@ listen_port=%d
 		return fmt.Errorf("failed to configure wg device: %v", err)
 	}
 
+	// Surface the range-listener state at the default log level. A hopping
+	// server that silently lost its range (a binary built before this feature,
+	// an overwritten node.yaml) is otherwise indistinguishable from a healthy
+	// single-port node: the daemon starts fine and the client just rotates
+	// through dead ports forever.
+	if n.LocalCfg.ListenPorts != "" {
+		if pr, perr := state.ParsePortRange(n.LocalCfg.ListenPorts); perr == nil {
+			n.Log.Info("port hopping range listener active",
+				"listen_ports", pr.String(),
+				"ports", pr.Size(),
+				"primary_port", n.Port,
+			)
+		} else {
+			// unreachable via Bootstrap (the config validator rejects a
+			// malformed range), kept as a tripwire for embedders
+			n.Log.Warn("listen_ports is configured but unparseable; the range listener is NOT active", "listen_ports", n.LocalCfg.ListenPorts, "err", perr)
+		}
+	}
+
 	// add peers
 	err = n.SyncWireGuard()
 	if err != nil {

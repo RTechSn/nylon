@@ -593,6 +593,9 @@ func (device *Device) BindUpdate() error {
 		netc.port = 0
 		return err
 	}
+	// receive funcs beyond this index belong to range-listener sockets and
+	// are started with a capped batch (see ExtraPortReceiveBatchSize)
+	primaryRecvFns := len(recvFns)
 
 	// open the additional listen range, if configured (port hopping)
 	if netc.portRange.Valid() {
@@ -639,8 +642,15 @@ func (device *Device) BindUpdate() error {
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
-	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+	for i, fn := range recvFns {
+		bs := batchSize
+		if i >= primaryRecvFns {
+			// range-listener socket: budget-bounded bursts only, keep the
+			// lifetime-held receive buffers small (memory, not throughput,
+			// is the constraint on wide ranges)
+			bs = min(bs, ExtraPortReceiveBatchSize)
+		}
+		go device.RoutineReceiveIncoming(bs, fn)
 	}
 
 	device.Log.Verbosef("UDP bind has been updated")

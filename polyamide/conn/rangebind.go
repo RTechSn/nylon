@@ -101,6 +101,13 @@ func (b *MultiBind) OpenRange(port uint16, r PortRange) ([]ReceiveFunc, error) {
 			return nil, fmt.Errorf("port %d: already bound in this MultiBind", p)
 		}
 		sb := NewStdNetBind().(*StdNetBind)
+		// Range-listener sockets run without UDP GRO/GSO: their receive funcs
+		// are driven with a capped batch (device.ExtraPortReceiveBatchSize)
+		// to keep per-port receive buffers small, and the offload receive
+		// path requires full IdealBatchSize batches (GRO split). A hopping
+		// port only carries budget-bounded bursts, so aggregation is wasted
+		// there anyway. Must be set before Open.
+		sb.DisableHardwareOffload()
 		sbfns, _, err := sb.Open(p)
 		if err != nil {
 			// roll back the ports opened by this call

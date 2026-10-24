@@ -208,6 +208,92 @@ func TestMultiBindPrimaryStillWorks(t *testing.T) {
 	}
 }
 
+// TestMultiBindExtraCappedBatchReceive reproduces the production shape of the
+// range listener: extra receive funcs are driven with a capped batch
+// (device.ExtraPortReceiveBatchSize) while a burst larger than the batch is in
+// flight. The pre-fix receive path read into the full IdealBatchSize-sized
+// pooled array and indexed sizes/eps by the number of messages read, panicking
+// with index-out-of-range as soon as a burst exceeded the caller's batch.
+func TestMultiBindExtraCappedBatchReceive(t *testing.T) {
+	mb := NewMultiBind()
+	resolver, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	probe, err := net.ListenUDP("udp", resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryPort := uint16(probe.LocalAddr().(*net.UDPAddr).Port)
+	probe.Close()
+
+	fns, _, err := mb.Open(primaryPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lo := primaryPort + 100
+	if lo > 65000 {
+		lo = primaryPort - 100 - 4
+	}
+	extraFns, err := mb.OpenRange(primaryPort, PortRange{First: lo, Last: lo + 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mb.Close() })
+	_ = fns
+
+	// drive every extra receive func with a SMALL batch, exactly like
+	// BindUpdate does for range-listener sockets
+	const batch = 4
+	rx := make(chan struct{}, 64)
+	for _, fn := range extraFns {
+		fn := fn
+		go func() {
+			bufs := make([][]byte, batch)
+			for i := range bufs {
+				bufs[i] = make([]byte, 128)
+			}
+			sizes := make([]int, batch)
+			eps := make([]Endpoint, batch)
+			for {
+				n, err := fn(bufs, sizes, eps)
+				if err != nil {
+					return
+				}
+				for i := 0; i < n; i++ {
+					if sizes[i] > 0 {
+						rx <- struct{}{}
+					}
+				}
+			}
+		}()
+	}
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	// burst 3x the batch at one range port
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(lo + 1)}
+	const burst = 3 * batch
+	for i := 0; i < burst; i++ {
+		if _, err := client.WriteToUDP([]byte("burst"), target); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	got := 0
+	for got < burst {
+		timeout := time.After(time.Until(deadline))
+		select {
+		case <-rx:
+			got++
+		case <-timeout:
+			t.Fatalf("received %d of %d burst packets through the capped batch", got, burst)
+		}
+	}
+}
+
 // TestMultiBindRangeCeiling verifies the range-size guard.
 func TestMultiBindRangeCeiling(t *testing.T) {
 	mb := NewMultiBind()

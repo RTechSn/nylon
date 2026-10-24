@@ -31,7 +31,7 @@ port: 57175
 listen_ports: 57175-57575 # must contain the primary port; max 4096 ports wide
 ```
 
-This mode is the simplest and works everywhere without root firewall changes, but every port costs file descriptors and one receive goroutine, hence the ceiling.
+This mode is the simplest and works everywhere without root firewall changes, but every port costs file descriptors and one receive goroutine per address family, hence the ceiling. Budget roughly `0.6 MB` of resident memory per range port (receive buffers plus socket overhead): a 500-port range sits around 300 MB above the daemon baseline, and the full 4096-port ceiling around 2.5 GB. Plan file descriptors accordingly — the range needs about `2 × ports` descriptors (IPv4+IPv6) plus headroom; `LimitNOFILE=8192` (as shipped in `nylon.service`) covers ranges up to a few thousand ports. A bind failure is fatal at startup by design — the daemon refuses to run with a half-open range — so a *running* daemon either has the full range or none of it.
 
 ### Netfilter DNAT (arbitrarily wide ranges)
 
@@ -102,7 +102,7 @@ When drawing a new carrying port, the pool scores candidates by dissimilarity to
 
 ## Observability
 
-Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO. The device UAPI (`nylon show` dump) reports per-peer:
+Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO. The device UAPI (`wg show nylon dump`) reports per-peer:
 
 ```
 hop_budget=12
@@ -111,6 +111,28 @@ hop_budget_left=7
 ```
 
 The rotation counters in the logs are the quickest way to verify hopping is active: a new endpoint line every few seconds under load is the expected pattern.
+
+### Verifying the server side
+
+On the server, the startup log confirms the range listener:
+
+```
+INFO port hopping range listener active listen_ports=57175-57575 ports=401 primary_port=57175
+```
+
+Two checks are definitive:
+
+```bash
+# 1. the UAPI dump carries the range (absent => old binary or missing listen_ports)
+wg show nylon dump | grep listen_ports
+#    listen_ports=57175-57575
+
+# 2. the sockets exist (UDP has no LISTEN state — netstat -aon | grep LISTEN
+#    shows only TCP/unix and never lists a UDP range)
+ss -ulnp | grep -c 57175 # ~2 per port: one v4 + one v6 line
+```
+
+A hopping client that logs endless `carrying endpoint rotated` lines while the tunnel passes no traffic is rotating through dead ports: on the server, confirm the log line above, the `listen_ports` dump entry and the sockets, then check the firewall (`nft list ruleset`, `ufw status`) allows the whole UDP range — a rule for the primary port alone is not enough.
 
 ## Threat model and limits
 
