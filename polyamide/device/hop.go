@@ -24,7 +24,11 @@ const hopRetryDelay = time.Second
 // for probing and ranking.
 //
 // Implementations MUST be safe for concurrent use and fast (no I/O): they are
-// called from the packet send path.
+// called from the packet send path. In particular, NextHopEndpoint runs while
+// the caller (Peer.SendBuffers) holds the device net lock in READ mode, so
+// implementations MUST NOT acquire Device.Bind() (or anything else that takes
+// the device net WRITE lock) — doing so self-deadlocks: the write lock can
+// never be granted while the caller's own read lock is still held.
 type HopSource interface {
 	// NextHopEndpoint returns the endpoint that should carry traffic after
 	// the given endpoint was exhausted. exhausted is nil when the first
