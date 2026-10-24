@@ -173,6 +173,14 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 			if err == nil && ap == wgEndpoint.DstIPPort() && neigh.Id == node {
 				// we have a link
 
+				// port hopping tombstone (burned port): the ping still matched
+				// so the pong above went out symmetrically, but never
+				// resurrect the quarantined link — renewing it would keep a
+				// dead port ranked active until the tombstone grace removes it
+				if dep.IsExhausted() {
+					return
+				}
+
 				// refresh wireguard ep
 				dep.WgEndpoint = wgEndpoint
 
@@ -228,14 +236,33 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 				if n.DBG_log_probe {
 					n.Log.Debug("probe back", "peer", node, "ping", latency)
 				}
+
+				// port hopping tombstone (burned port): the in-flight probe
+				// measurement was already completed above, but the quarantined
+				// link must not be renewed — late pongs are exactly what the
+				// grace window exists for
+				if dpLink.IsExhausted() {
+					return
+				}
+
 				dpLink.Renew()
 				dpLink.UpdatePing(latency)
 				if nep := dpLink.AsNylonEndpoint(); nep != nil {
 					nep.RecordProbe(true)
 				}
 
-				// update wireguard endpoint
-				dpLink.WgEndpoint = ep
+				// NOTE: do NOT adopt the pong's endpoint into dpLink.WgEndpoint.
+				// The address is identical to the link's by the match condition
+				// above, so the only new information a pong can carry is the
+				// local port our own probe ping happened to leave from —
+				// re-adopting it is zero-information self-reinforcement that
+				// pins this link's outbound socket to one port indefinitely
+				// (measured: 94-96% of a peer's probe traffic locked onto a
+				// single stale port across many rotations, a static flow TSPU
+				// volume-bans within seconds). Inbound pings already track
+				// genuine endpoint migrations (handleProbePing), and
+				// GetWgEndpoint re-resolves whenever the resolver's answer
+				// changes.
 
 				ComputeRoutes(n.RouterState, n)
 				return

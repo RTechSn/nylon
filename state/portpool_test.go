@@ -74,6 +74,37 @@ func TestPortPoolCooldownQuarantine(t *testing.T) {
 	}
 }
 
+// TestPortPoolIsCooling pins the quarantine query the port factory relies on
+// to detect ports retired between their draw and their link materialisation.
+func TestPortPoolIsCooling(t *testing.T) {
+	pool := NewPortPool([]PortGroup{testGroup("10.0.0.1", 30000, 30009)},
+		PortPoolConfig{Recent: 1, Cooldown: time.Hour, Samples: 4})
+
+	ap, err := pool.Select(nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if pool.IsCooling(ap) {
+		t.Fatal("a freshly drawn port must not be cooling")
+	}
+	other := netip.MustParseAddrPort("10.0.0.1:30009")
+	if pool.IsCooling(other) {
+		t.Fatal("a never-retired port must not be cooling")
+	}
+
+	pool.Retire(ap)
+	if !pool.IsCooling(ap) {
+		t.Fatal("a retired port must report cooling inside its cooldown window")
+	}
+
+	// past the cooldown the quarantine lifts (lazily pruned, like Select)
+	base := time.Now()
+	pool.nowFn = func() time.Time { return base.Add(2 * time.Hour) }
+	if pool.IsCooling(ap) {
+		t.Fatal("a port past its cooldown must no longer report cooling")
+	}
+}
+
 func TestPortPoolRecentRingAvoidsRepeats(t *testing.T) {
 	// one group, small range, ring covering half of it
 	pool := NewPortPool([]PortGroup{testGroup("10.0.0.1", 30000, 30007)},

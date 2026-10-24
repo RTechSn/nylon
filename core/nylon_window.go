@@ -254,6 +254,35 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 		ap := exhausted.DstIPPort()
 		f.pool.Retire(ap)
 		f.retireLink(ap)
+	} else {
+		// The device's hop state has no endpoint yet (first send after SetHop,
+		// or a fresh peer). If the factory already drew one — the eager
+		// bootstrap beat the first send, or the hop source was re-wired after a
+		// config re-apply — ADOPT it instead of drawing a second port.
+		// Drawing here would strand the already-materialised link as a healthy
+		// ghost on a port the device never carries: nothing ever exhausts it,
+		// the probe loops keep it on the full 1s cadence forever, and the peer's
+		// symmetric pongs keep renewing it (measured: ghosts stayed "best link"
+		// for minutes while the carrying endpoint had long rotated away).
+		f.mu.Lock()
+		cur := f.current
+		f.mu.Unlock()
+		if cur.IsValid() && !f.pool.IsCooling(cur) {
+			// CAUTION: send path — use the cached bind (see the field comment).
+			bind := f.bindIfReady()
+			if bind == nil {
+				return nil, errors.New("port hop: device bind not wired yet")
+			}
+			ep, err := bind.ParseEndpoint(cur.String())
+			if err != nil {
+				return nil, err
+			}
+			f.mu.Lock()
+			f.lastProbeAt = time.Now()
+			f.mu.Unlock()
+			f.n.Log.Debug("port hop: adopting already-drawn carrying endpoint", "peer", f.node, "endpoint", cur.String())
+			return ep, nil
+		}
 	}
 
 	f.mu.Lock()
@@ -292,6 +321,14 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 // materializeLink registers the drawn endpoint as a regular nylon link and
 // probes it once so it becomes active for routing and ranking.
+//
+// If the port has been retired by the time the dispatched closure runs (the
+// send path rotated away between the draw and this materialisation, or a
+// bootstrap draw was superseded), the link is born as a tombstone instead:
+// exhausted and scheduled for removal. Materialising it unexhausted would
+// recreate the retirement race the other direction — retireLink's
+// MarkExhausted dispatch may already have run against a link list that did
+// not contain this port yet, and an unexhausted orphan never stops probing.
 func (f *portFactory) materializeLink(ap netip.AddrPort) {
 	addr := ap.String()
 	f.n.Dispatch(func() error {
@@ -315,6 +352,16 @@ func (f *portFactory) materializeLink(ap netip.AddrPort) {
 			return nil
 		}
 		link := state.NewEndpoint(addr, false, wgEp, &f.n.RouterTunables)
+		if f.pool.IsCooling(ap) {
+			// retired between draw and materialisation: keep the tombstone so
+			// late pongs still match, but never let it become a healthy ghost
+			link.MarkExhausted()
+			neigh.Eps = append(neigh.Eps, link)
+			f.n.UpdateNeighbour(f.node)
+			f.scheduleTombstoneRemoval(addr)
+			f.n.Log.Debug("port hop: materialised retired endpoint as tombstone", "peer", f.node, "endpoint", addr)
+			return nil
+		}
 		neigh.Eps = append(neigh.Eps, link)
 		f.n.UpdateNeighbour(f.node)
 		// on-demand probe: validates the port and marks the link active so
@@ -344,6 +391,13 @@ func (f *portFactory) retireLink(ap netip.AddrPort) {
 		}
 		return nil
 	})
+	f.scheduleTombstoneRemoval(addr)
+}
+
+// scheduleTombstoneRemoval removes the exhausted link for addr after the
+// tombstone grace period (late pongs still match it until then). Safe to call
+// more than once for the same address: extra runs find nothing to delete.
+func (f *portFactory) scheduleTombstoneRemoval(addr string) {
 	time.AfterFunc(hopTombstoneGrace, func() {
 		if f.n.Context.Err() != nil {
 			return

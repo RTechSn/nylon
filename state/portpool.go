@@ -106,6 +106,18 @@ func (p *PortPool) Retire(ap netip.AddrPort) {
 	}
 }
 
+// IsCooling reports whether the endpoint is still quarantined: retired and
+// inside its cooldown window. It answers "would Select refuse this endpoint
+// right now", which the port factory uses to detect ports that were retired
+// after being drawn but before their link was materialised.
+func (p *PortPool) IsCooling(ap netip.AddrPort) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pruneExpiredLocked(p.nowFn())
+	_, cooling := p.cooldown[ap]
+	return cooling
+}
+
 // Stats reports the number of groups, endpoints in the recent ring, endpoints
 // cooling down, and total retirements (for observability).
 func (p *PortPool) Stats() (groups, recent, cooling, retired int) {
