@@ -31,6 +31,11 @@ func (n *Nylon) sendEndpointProbes(peer state.NodeId, timeout time.Duration) ([]
 	})
 	probes := make([]Future[*protocol.EndpointProbeResult], 0, len(eps))
 	for _, ep := range eps {
+		// port hopping: skip burned carrying ports (quarantined; probing them
+		// would only spend packets on a port that is about to be abandoned)
+		if ep.IsExhausted() {
+			continue
+		}
 		result, _ := n.sendEndpointProbe(neigh.Id, ep.AsNylonEndpoint(), timeout)
 		probes = append(probes, result)
 	}
@@ -168,6 +173,14 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 			if err == nil && ap == wgEndpoint.DstIPPort() && neigh.Id == node {
 				// we have a link
 
+				// port hopping tombstone (burned port): the ping still matched
+				// so the pong above went out symmetrically, but never
+				// resurrect the quarantined link — renewing it would keep a
+				// dead port ranked active until the tombstone grace removes it
+				if dep.IsExhausted() {
+					return
+				}
+
 				// refresh wireguard ep
 				dep.WgEndpoint = wgEndpoint
 
@@ -223,14 +236,33 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 				if n.DBG_log_probe {
 					n.Log.Debug("probe back", "peer", node, "ping", latency)
 				}
+
+				// port hopping tombstone (burned port): the in-flight probe
+				// measurement was already completed above, but the quarantined
+				// link must not be renewed — late pongs are exactly what the
+				// grace window exists for
+				if dpLink.IsExhausted() {
+					return
+				}
+
 				dpLink.Renew()
 				dpLink.UpdatePing(latency)
 				if nep := dpLink.AsNylonEndpoint(); nep != nil {
 					nep.RecordProbe(true)
 				}
 
-				// update wireguard endpoint
-				dpLink.WgEndpoint = ep
+				// NOTE: do NOT adopt the pong's endpoint into dpLink.WgEndpoint.
+				// The address is identical to the link's by the match condition
+				// above, so the only new information a pong can carry is the
+				// local port our own probe ping happened to leave from —
+				// re-adopting it is zero-information self-reinforcement that
+				// pins this link's outbound socket to one port indefinitely
+				// (measured: 94-96% of a peer's probe traffic locked onto a
+				// single stale port across many rotations, a static flow TSPU
+				// volume-bans within seconds). Inbound pings already track
+				// genuine endpoint migrations (handleProbePing), and
+				// GetWgEndpoint re-resolves whenever the resolver's answer
+				// changes.
 
 				ComputeRoutes(n.RouterState, n)
 				return
@@ -244,7 +276,18 @@ func (n *Nylon) probeLinks(active bool) error {
 	// probe links
 	for _, neigh := range n.RouterState.Neighbours {
 		for _, ep := range neigh.Eps {
+			// port hopping: never spend packets on a carrying port that already
+			// burned its budget (it is quarantined and only kept for late pongs)
+			if ep.IsExhausted() {
+				continue
+			}
 			if ep.IsActive() == active {
+				// port hopping: factory-managed carrying links probe at a relaxed
+				// cadence (see portFactory.probeReady) so idle probing does not burn
+				// the port budget; stock links keep the stock cadence
+				if !n.hopProbeReady(neigh.Id, ep.AsNylonEndpoint().Address) {
+					continue
+				}
 				_, err := n.sendEndpointProbe(neigh.Id, ep.AsNylonEndpoint(), n.ProbeTimeout)
 				if err != nil {
 					n.Log.Debug("probe failed", "error", err)
@@ -267,6 +310,12 @@ func (n *Nylon) probeNew() error {
 		}
 		cfg := n.GetRouter(peer)
 		for _, address := range cfg.Endpoints {
+			// port hopping: range-form endpoints (e.g. "1.2.3.4:30000-40000")
+			// are owned by the port factory, which materialises concrete
+			// addr:port links as they are drawn; they are never probed as-is
+			if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
+				continue
+			}
 			idx := slices.IndexFunc(neigh.Eps, func(link state.Endpoint) bool {
 				return !link.IsRemote() && link.AsNylonEndpoint().Address == address
 			})

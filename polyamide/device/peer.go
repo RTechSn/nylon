@@ -22,10 +22,11 @@ type Peer struct {
 	keypairs          Keypairs
 	handshake         Handshake
 	device            *Device
-	stopping          sync.WaitGroup // routines pending stop
-	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
-	rxBytes           atomic.Uint64  // bytes received from peer
-	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+	stopping          sync.WaitGroup           // routines pending stop
+	txBytes           atomic.Uint64            // bytes send to peer (endpoint)
+	rxBytes           atomic.Uint64            // bytes received from peer
+	lastHandshakeNano atomic.Int64             // nano seconds since epoch
+	hop               atomic.Pointer[hopState] // port hopping state (nil = stock endpoint behaviour)
 
 	endpoints struct {
 		sync.Mutex
@@ -139,7 +140,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 
 	peer.endpoints.Lock()
 	endpoints := peer.endpoints.val
-	if len(endpoints) == 0 {
+	if len(endpoints) == 0 && !peer.hopHasCurrent() {
 		peer.endpoints.Unlock()
 		return errors.New("no known endpoints for peer")
 	}
@@ -156,6 +157,11 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 	}
 	peer.endpoints.Unlock()
 
+	// port hopping: enforce the per-port packet budget on this batch,
+	// rotating the carrying endpoint (and re-addressing the remainder of the
+	// batch) when the budget is spent
+	peer.hopAccountSend(eps)
+
 	// optimization, if multiple contiguous buffers share the same endpoint, send them in a single batch
 	prevIdx := 0
 	prevEp := eps[0]
@@ -165,7 +171,20 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 		if i == len(buffers) || eps[i] != prevEp {
 			// send batch from prevIdx to i-1
 			if prevEp == nil {
+				prevEp = peer.hopCarrying()
+			}
+			if prevEp == nil && len(endpoints) > 0 {
 				prevEp = endpoints[0] // default endpoint
+			}
+			if prevEp == nil {
+				// no endpoint is known at all (hop source degraded and
+				// no configured endpoints): drop the batch rather than
+				// risk a panic on an empty endpoint list
+				prevIdx = i
+				if i < len(buffers) {
+					prevEp = eps[i]
+				}
+				continue
 			}
 			err := peer.device.net.bind.Send(buffers[prevIdx:i], prevEp)
 			if err != nil {

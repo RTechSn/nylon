@@ -176,13 +176,20 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	// try a different index every time
 	peer.endpoints.Lock()
-	if len(peer.endpoints.val) == 0 {
-		peer.device.Log.Verbosef("%v - Cannot send handshake initiation, no endpoints available", peer)
-		peer.endpoints.Unlock()
-		return nil
+	var selEp conn.Endpoint
+	if hopEp := peer.hopCarrying(); hopEp != nil {
+		// port hopping: rekeys (and their junk/i-packets) ride the carrying
+		// port and count against its budget
+		selEp = hopEp
+	} else {
+		if len(peer.endpoints.val) == 0 {
+			peer.device.Log.Verbosef("%v - Cannot send handshake initiation, no endpoints available", peer)
+			peer.endpoints.Unlock()
+			return nil
+		}
+		peer.endpoints.lastInitIndex = (peer.endpoints.lastInitIndex + 1) % len(peer.endpoints.val)
+		selEp = peer.endpoints.val[peer.endpoints.lastInitIndex]
 	}
-	peer.endpoints.lastInitIndex = (peer.endpoints.lastInitIndex + 1) % len(peer.endpoints.val)
-	selEp := peer.endpoints.val[peer.endpoints.lastInitIndex]
 	peer.endpoints.Unlock()
 
 	eps := make([]conn.Endpoint, len(sendBuffer))
@@ -702,9 +709,14 @@ func partitionBuffersByEndpoint(bufs [][]byte, eps []conn.Endpoint, outBufs *[][
 	// use a naive O(n^2) algorithm since n is expected to be small
 
 	// replace nil endpoints with the first known endpoint
+	hopEp := peer.hopCarrying()
 	peer.endpoints.Lock()
 	for i := 0; i < len(eps); i++ {
 		if eps[i] == nil {
+			if hopEp != nil {
+				eps[i] = hopEp
+				continue
+			}
 			if len(peer.endpoints.val) == 0 {
 				peer.endpoints.Unlock()
 				return errors.New("no known endpoints for peer")

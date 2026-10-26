@@ -7,6 +7,7 @@ package device
 
 import (
 	"bufio"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -43,8 +44,9 @@ type Device struct {
 		sync.RWMutex
 		bind          conn.Bind // bind interface
 		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
+		port          uint16         // listening port
+		portRange     conn.PortRange // optional additional listen range (port hopping, server side)
+		fwmark        uint32         // mark value (0 = disabled)
 		brokenRoaming bool
 	}
 
@@ -591,6 +593,27 @@ func (device *Device) BindUpdate() error {
 		netc.port = 0
 		return err
 	}
+	// receive funcs beyond this index belong to range-listener sockets and
+	// are started with a capped batch (see ExtraPortReceiveBatchSize)
+	primaryRecvFns := len(recvFns)
+
+	// open the additional listen range, if configured (port hopping)
+	if netc.portRange.Valid() {
+		ro, ok := netc.bind.(conn.RangeOpener)
+		if !ok {
+			netc.bind.Close()
+			netc.port = 0
+			return fmt.Errorf("listen range %s configured but the bind does not support ranges", netc.portRange)
+		}
+		extraFns, err := ro.OpenRange(netc.port, netc.portRange)
+		if err != nil {
+			netc.bind.Close()
+			netc.port = 0
+			return err
+		}
+		recvFns = append(recvFns, extraFns...)
+		device.Log.Verbosef("Listening on port range %s", netc.portRange)
+	}
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
 	if err != nil {
@@ -619,8 +642,15 @@ func (device *Device) BindUpdate() error {
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
-	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+	for i, fn := range recvFns {
+		bs := batchSize
+		if i >= primaryRecvFns {
+			// range-listener socket: budget-bounded bursts only, keep the
+			// lifetime-held receive buffers small (memory, not throughput,
+			// is the constraint on wide ranges)
+			bs = min(bs, ExtraPortReceiveBatchSize)
+		}
+		go device.RoutineReceiveIncoming(bs, fn)
 	}
 
 	device.Log.Verbosef("UDP bind has been updated")

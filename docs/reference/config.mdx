@@ -29,6 +29,20 @@ tun_txqueuelen: 10000 # kernel tx queue length per TUN queue (default: 10000; 0 
 tun_backpressure: false # request IFF_BACKPRESSURE (default: false; requires kernel >= 6.15)
 dynamic_prefixes_dir: "" # directory watched for dynamic prefix JSON files, e.g. /etc/nylon/prefixes.d (empty = disabled)
 
+# Port hopping (server side): also listen on every port of this range and
+# answer peers from the port their packets targeted. The range must contain
+# `port` and is limited to 4096 ports; wider ranges belong behind an nftables
+# DNAT redirect (see guides/port-hopping). Default: disabled.
+listen_ports: "" # e.g. "57175-57575"
+
+# Port hopping (client side): rotation policy for peers whose endpoints are
+# configured as port ranges in central.yaml. All fields optional.
+port_hopping:
+  budget_packets: 12    # rotate the carrying port after N wire packets
+  recent_ports: 512     # avoid redrawing the last N selected ports
+  cooldown_seconds: 180 # quarantine a retired port for this long
+  candidate_samples: 32 # candidates scored per draw for IP/subnet diversity
+
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
   url: https://static.example.com/network1.nybundle
@@ -77,6 +91,10 @@ routers:
     endpoints:
       - "alice.example.com:57175" # domain name (re-resolved periodically)
       - "192.168.1.2:57175"       # LAN IP
+      # Port range (port hopping): peers with a port_hopping policy draw
+      # carrying ports from this range instead of pinning one port; the
+      # server must accept the whole range (see guides/port-hopping).
+      # - "203.0.113.7:30000-40000"
     prefixes:
       # Static: always advertised at the given metric
       - type: static

@@ -60,6 +60,9 @@ func (n *Nylon) SyncApplicationState() error {
 	if err := n.SyncWireGuard(); err != nil {
 		return err
 	}
+	if err := n.ensurePortFactories(); err != nil {
+		return err
+	}
 	ComputeRoutes(n.RouterState, n)
 	// OS-level work is handed to the applier goroutine: this function runs on
 	// the dispatch loop, which must never fork/exec `ip`.
@@ -116,6 +119,11 @@ func (n *Nylon) reconcileRouterState(next *state.CentralCfg) error {
 			Eps:    make([]state.Endpoint, 0, len(cfg.Endpoints)),
 		}
 		for _, ep := range cfg.Endpoints {
+			// port hopping: range-form endpoints are owned by the
+			// port factory; only concrete endpoints become links
+			if spec, err := state.ParseEndpointSpec(ep); err == nil && spec.IsRange() {
+				continue
+			}
 			stNeigh.Eps = append(stNeigh.Eps, state.NewEndpoint(ep, false, nil, &n.RouterTunables))
 		}
 		neighs = append(neighs, stNeigh)
@@ -145,8 +153,32 @@ func (n *Nylon) reconcileRouterState(next *state.CentralCfg) error {
 
 func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, t *state.RouterTunables) {
 	desiredAddresses := make(map[string]struct{}, len(desired))
+	var rangeSpecs []state.EndpointSpec
 	for _, address := range desired {
 		desiredAddresses[address] = struct{}{}
+		// port hopping: remember range-form entries so materialised
+		// hop links (addr:port inside a configured range) survive the
+		// reconcile instead of being dropped as unknown
+		if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
+			rangeSpecs = append(rangeSpecs, spec)
+		}
+	}
+	// hopLinkWithinRange reports whether a concrete link address falls
+	// inside one of the configured ranges (i.e. was materialised by a hop
+	// factory for this neighbour)
+	hopLinkWithinRange := func(address string) bool {
+		ap, err := netip.ParseAddrPort(address)
+		if err != nil {
+			return false
+		}
+		for _, spec := range rangeSpecs {
+			if addr, err := netip.ParseAddr(spec.Host); err == nil {
+				if addr.Unmap() == ap.Addr() && spec.Ports.Contains(ap.Port()) {
+					return true
+				}
+			}
+		}
+		return false
 	}
 
 	eps := make([]state.Endpoint, 0, len(neigh.Eps)+len(desired))
@@ -157,14 +189,21 @@ func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, t *s
 			eps = append(eps, ep)
 			continue
 		}
-		// only keep if desired
+		// only keep if desired, or if it is a hop link inside a
+		// configured range (owned by the port factory)
 		if _, ok := desiredAddresses[nep.Address]; ok {
 			eps = append(eps, ep)
 			seen[nep.Address] = struct{}{}
+		} else if hopLinkWithinRange(nep.Address) {
+			eps = append(eps, ep)
 		}
 	}
 	for _, address := range desired {
 		if _, ok := seen[address]; ok {
+			continue
+		}
+		// port hopping: range-form entries are not links
+		if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
 			continue
 		}
 		eps = append(eps, state.NewEndpoint(address, false, nil, t))

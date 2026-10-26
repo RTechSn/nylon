@@ -70,6 +70,19 @@ func (n *Nylon) obfDeviceIPC() string {
 	return obfDeviceIPC(n.Obf, n.GetNode(n.LocalCfg.Id).Obf)
 }
 
+// hopDeviceIPC renders the device-level port-hopping UAPI knob: the listen
+// range (server half). The client half (rotation budget) is applied per-peer
+// through the hop controller, not through device UAPI.
+func (n *Nylon) hopDeviceIPC() string {
+	var b strings.Builder
+	if n.LocalCfg.ListenPorts != "" {
+		if _, err := state.ParsePortRange(n.LocalCfg.ListenPorts); err == nil {
+			fmt.Fprintf(&b, "listen_ports=%s\n", n.LocalCfg.ListenPorts)
+		}
+	}
+	return b.String()
+}
+
 func (n *Nylon) initWireGuard() error {
 	dev, tdev, itfName, err := NewWireGuardDevice(n)
 	if err != nil {
@@ -100,10 +113,29 @@ listen_port=%d
 `,
 			hex.EncodeToString(n.Key[:]),
 			n.Port,
-		) + n.obfDeviceIPC(),
+		) + n.obfDeviceIPC() + n.hopDeviceIPC(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure wg device: %v", err)
+	}
+
+	// Surface the range-listener state at the default log level. A hopping
+	// server that silently lost its range (a binary built before this feature,
+	// an overwritten node.yaml) is otherwise indistinguishable from a healthy
+	// single-port node: the daemon starts fine and the client just rotates
+	// through dead ports forever.
+	if n.LocalCfg.ListenPorts != "" {
+		if pr, perr := state.ParsePortRange(n.LocalCfg.ListenPorts); perr == nil {
+			n.Log.Info("port hopping range listener active",
+				"listen_ports", pr.String(),
+				"ports", pr.Size(),
+				"primary_port", n.Port,
+			)
+		} else {
+			// unreachable via Bootstrap (the config validator rejects a
+			// malformed range), kept as a tripwire for embedders
+			n.Log.Warn("listen_ports is configured but unparseable; the range listener is NOT active", "listen_ports", n.LocalCfg.ListenPorts, "err", perr)
+		}
 	}
 
 	// add peers

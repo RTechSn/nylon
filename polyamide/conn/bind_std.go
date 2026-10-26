@@ -40,6 +40,14 @@ type StdNetBind struct {
 	ipv4RxOffload bool
 	ipv6TxOffload bool
 	ipv6RxOffload bool
+	// disableOffload must be set before Open; it skips the UDP_GRO/UDP_SEGMENT
+	// socket probes so both directions use plain send/receive paths. Used by
+	// MultiBind for range-listener sockets: their receive funcs are driven with
+	// a capped batch (see device.ExtraPortReceiveBatchSize) which is
+	// incompatible with the offload receive path (GRO split requires
+	// IdealBatchSize-sized slices), and a hopping port only ever carries
+	// budget-bounded bursts, so aggregation buys nothing there.
+	disableOffload bool
 
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
@@ -47,6 +55,13 @@ type StdNetBind struct {
 
 	blackhole4 bool
 	blackhole6 bool
+}
+
+// DisableHardwareOffload opts this bind out of UDP GRO/GSO. It must be
+// called before Open and is inherited by nothing (each StdNetBind is
+// configured individually).
+func (s *StdNetBind) DisableHardwareOffload() {
+	s.disableOffload = true
 }
 
 func NewStdNetBind() Bind {
@@ -179,7 +194,9 @@ again:
 	}
 	var fns []ReceiveFunc
 	if v4conn != nil {
-		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
+		if !s.disableOffload {
+			s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
+		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
@@ -188,7 +205,9 @@ again:
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
-		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
+		if !s.disableOffload {
+			s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
+		}
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
@@ -251,6 +270,12 @@ func (s *StdNetBind) receiveIP(
 	var numMsgs int
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		if rxOffload {
+			// Contract: the offload path requires the caller to pass
+			// IdealBatchSize-sized slices — the GRO split fills the whole
+			// pooled array. The device guarantees this for offload-capable
+			// binds (BatchSize() == IdealBatchSize); offload is disabled on
+			// range-listener sockets precisely so they may use capped
+			// batches instead.
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
 			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
 			if err != nil {
@@ -261,7 +286,12 @@ func (s *StdNetBind) receiveIP(
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			// plain recvmmsg: never read more than the caller offered
+			readCount := len(bufs)
+			if readCount > len(*msgs) {
+				readCount = len(*msgs)
+			}
+			numMsgs, err = br.ReadBatch((*msgs)[:readCount], 0)
 			if err != nil {
 				return 0, err
 			}
