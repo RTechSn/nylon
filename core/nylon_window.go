@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"slices"
@@ -26,13 +27,46 @@ const hopTombstoneGrace = 15 * time.Second
 // LinkDeadThreshold so a single lost pong cannot flap the link inactive.
 const hopProbeFraction = 0.8
 
+// hopRotationLogInterval bounds how often the per-rotation Info line is
+// emitted. Under load the carrying port rotates every budget packets, which
+// at iperf rates is hundreds of rotations per second: each rotation is logged
+// at Debug, and at most one Info line per interval summarises them
+// ("rotations" counts the rotations covered by the line).
+const hopRotationLogInterval = time.Second
+
+// hopPoolWarnInterval bounds how often the pool-exhaustion warning fires
+// while rotation is stalled (every candidate port cooling down).
+const hopPoolWarnInterval = time.Minute
+
 // portFactory manages the dynamic endpoint window of one peer whose
 // configured endpoints contain port ranges. It implements device.HopSource:
 // every time the device send path exhausts a carrying port's packet budget,
 // the factory draws a fresh endpoint from the port pool (maximally
 // dissimilar to the current one — different IP/subnet preferred), retires the
-// old port into cooldown, and materializes the new endpoint as a regular
-// nylon link so the existing probe/metric/ranking machinery sees it.
+// old port into cooldown, and records the transition for the next
+// reconciliation pass.
+//
+// Link bookkeeping is deliberately NOT done on the rotation hot path. The
+// budget defaults (12 packets) make sustained load rotate the carrying port
+// hundreds of times per second; dispatching retire/materialise work per
+// rotation would flood the dispatch loop, links would be born as tombstones
+// (the pool retires synchronously, the dispatch lags), and the neighbour
+// would briefly have no healthy endpoint at all. Instead:
+//
+//   - the send path only touches the pool (its own locking) and two factory
+//     fields (under mu): current and prev;
+//   - reconcileLinks, on the dispatch loop every SyncApplicationState pass
+//     (1s), materialises the current carrying port as a link — seeded with
+//     the predecessor's RTT so routes stay feasible across the rotation
+//     without waiting for the first probe pong — and tombstones the
+//     predecessor;
+//   - ports drawn and abandoned between two passes ("intermediate" ports of a
+//     rotation storm) never become links at all: nothing probes them, so
+//     nothing needs to match them.
+//
+// The predecessor link stays healthy (and keeps the neighbour's routes
+// feasible) until the successor is materialised, so routing never flaps on
+// rotation; the seeded metric keeps the route cost continuous.
 //
 // Range endpoints are NEVER expanded into individual links at config time:
 // the pool keeps runtime state O(window) instead of O(range), which is what
@@ -41,12 +75,22 @@ type portFactory struct {
 	n    *Nylon
 	node state.NodeId
 
-	// mu guards current, specs and bind; the pool has its own locking.
-	mu          sync.Mutex
-	specs       []state.EndpointSpec // range-form endpoints from the neighbour's config
-	pool        *state.PortPool
-	current     netip.AddrPort // the endpoint currently carrying traffic
-	lastProbeAt time.Time      // last relaxed-cadence probe of the current link
+	// mu guards current, prev, specs, bind and the log-rate-limit fields; the
+	// pool has its own locking.
+	mu      sync.Mutex
+	specs   []state.EndpointSpec // range-form endpoints from the neighbour's config
+	pool    *state.PortPool
+	current netip.AddrPort // the endpoint currently carrying traffic
+	prev    netip.AddrPort // the endpoint retired by the latest rotation (seed source / tombstone candidate)
+	// lastProbeAt is the last relaxed-cadence probe of the current link.
+	lastProbeAt time.Time
+
+	// rotation log rate limiting
+	lastRotationLog time.Time
+	rotationCount   uint64
+
+	// pool-exhaustion warn rate limiting
+	lastPoolWarn time.Time
 
 	// bind is the device bind, cached on the dispatch loop. Device.Bind()
 	// takes the device net WRITE lock, while the packet send path
@@ -96,6 +140,7 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	f.mu.Unlock()
 	f.refreshGroups()
 	f.bootstrap()
+	f.reconcileLinks()
 	return f
 }
 
@@ -172,7 +217,11 @@ func (f *portFactory) drawAndMaterialize() {
 	f.current = ap
 	f.lastProbeAt = time.Now()
 	f.mu.Unlock()
-	f.materializeLink(ap)
+	neigh := f.n.RouterState.GetNeighbour(f.node)
+	if neigh == nil {
+		return
+	}
+	f.materializeCarrying(neigh, ap, netip.AddrPort{})
 	f.n.Log.Info("port hop: initial carrying endpoint selected", "peer", f.node, "endpoint", ap.String())
 }
 
@@ -221,6 +270,22 @@ func (f *portFactory) resolveSpecAddr(spec state.EndpointSpec) (netip.Addr, bool
 	return ap.Addr().Unmap(), true
 }
 
+// ownsEndpoint reports whether the addr:port lies inside one of the factory's
+// configured ranges, i.e. whether the link was materialised by this factory
+// (as opposed to a stock configured endpoint).
+func (f *portFactory) ownsEndpoint(ap netip.AddrPort) bool {
+	for _, spec := range f.specStrings() {
+		addr, ok := f.resolveSpecAddr(spec)
+		if !ok {
+			continue
+		}
+		if addr.Unmap() == ap.Addr().Unmap() && spec.Ports.Contains(ap.Port()) {
+			return true
+		}
+	}
+	return false
+}
+
 // probeInterval is the relaxed probe interval for factory-managed links.
 func (f *portFactory) probeInterval() time.Duration {
 	interval := time.Duration(float64(f.n.RouterTunables.LinkDeadThreshold) * hopProbeFraction)
@@ -248,12 +313,17 @@ func (f *portFactory) probeReady(addr string) bool {
 }
 
 // NextHopEndpoint implements device.HopSource. It is called from the device
-// send path (never the dispatch loop) and must be fast and lock-safe.
+// send path (never the dispatch loop) and must be fast and lock-safe. The
+// rotation path deliberately performs NO dispatch-loop work: it retires the
+// port in the pool (own locking), records the retired endpoint as prev, and
+// lets the next reconcileLinks pass sort out the links.
 func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpoint) (conn.Endpoint, error) {
 	if exhausted != nil {
 		ap := exhausted.DstIPPort()
 		f.pool.Retire(ap)
-		f.retireLink(ap)
+		f.mu.Lock()
+		f.prev = ap
+		f.mu.Unlock()
 	} else {
 		// The device's hop state has no endpoint yet (first send after SetHop,
 		// or a fresh peer). If the factory already drew one — the eager
@@ -294,10 +364,12 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 	ap, err := f.pool.Select(avoid)
 	if err != nil {
+		f.warnPoolExhausted(err)
 		return nil, err
 	}
 	f.mu.Lock()
 	f.current = ap
+	f.lastProbeAt = time.Now()
 	f.mu.Unlock()
 
 	// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
@@ -311,87 +383,216 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	if err != nil {
 		return nil, err
 	}
-	f.materializeLink(ap)
-	f.mu.Lock()
-	f.lastProbeAt = time.Now()
-	f.mu.Unlock()
-	f.n.Log.Info("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String())
+	f.logRotation(ap)
 	return ep, nil
 }
 
-// materializeLink registers the drawn endpoint as a regular nylon link and
-// probes it once so it becomes active for routing and ranking.
+// logRotation records a carrying-endpoint rotation: Debug per rotation, plus
+// a rate-limited Info line that counts how many rotations it covers, so a
+// rotation storm shows up as one "rotations=N" line per second instead of N
+// lines.
+func (f *portFactory) logRotation(ap netip.AddrPort) {
+	f.mu.Lock()
+	now := time.Now()
+	f.rotationCount++
+	if now.Sub(f.lastRotationLog) >= hopRotationLogInterval {
+		count := f.rotationCount
+		f.rotationCount = 0
+		f.lastRotationLog = now
+		f.mu.Unlock()
+		f.n.Log.Info("port hop: carrying endpoint rotated",
+			"peer", f.node, "endpoint", ap.String(), "rotations", count)
+		return
+	}
+	f.mu.Unlock()
+	f.n.Log.Debug("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String())
+}
+
+// warnPoolExhausted reports (rate-limited) that rotation is stalled because
+// every candidate port is cooling down. Sustained load rotates at
+// packets-per-second / budget; if that exceeds range_size / cooldown the pool
+// runs dry and the carrying port overshoots its budget until a port cools
+// down — the warning carries the pool stats so the trade-off is diagnosable.
+func (f *portFactory) warnPoolExhausted(err error) {
+	f.mu.Lock()
+	now := time.Now()
+	if now.Sub(f.lastPoolWarn) < hopPoolWarnInterval {
+		f.mu.Unlock()
+		f.n.Log.Debug("port hop: rotation stalled, port pool exhausted", "peer", f.node, "error", err.Error())
+		return
+	}
+	f.lastPoolWarn = now
+	f.mu.Unlock()
+	groups, recent, cooling, retired := f.pool.Stats()
+	f.n.Log.Warn("port hop: rotation stalled, port pool exhausted",
+		"peer", f.node,
+		"groups", groups,
+		"recent", recent,
+		"cooling", cooling,
+		"retired", retired,
+		"error", err.Error())
+}
+
+// reconcileLinks runs on the dispatch loop once per SyncApplicationState pass.
+// It materialises the current carrying endpoint as a link (seeded from the
+// predecessor's RTT, so routes stay feasible across rotations without
+// waiting for the first probe pong) and tombstones the links of ports the
+// factory has rotated away from. Ports drawn and retired between two passes
+// (the intermediate ports of a rotation storm) never get links: nothing
+// probed them, so nothing needs to match them.
+func (f *portFactory) reconcileLinks() {
+	f.mu.Lock()
+	current := f.current
+	prev := f.prev
+	f.prev = netip.AddrPort{} // consumed
+	f.mu.Unlock()
+
+	if !current.IsValid() {
+		return // nothing drawn yet (bootstrap in flight)
+	}
+
+	neigh := f.n.RouterState.GetNeighbour(f.node)
+	if neigh == nil {
+		return
+	}
+
+	// A stalled rotation (pool exhausted) leaves the current endpoint cooling
+	// in the pool: the device keeps carrying on it until the retry succeeds,
+	// so keep its existing link untouched as well.
+	if f.pool.IsCooling(current) {
+		f.n.Log.Debug("port hop: carrying endpoint cooling down, skipping reconciliation", "peer", f.node, "endpoint", current.String())
+		return
+	}
+
+	curAddr := current.String()
+	var curLink state.Endpoint
+	for _, ep := range neigh.Eps {
+		if !ep.IsRemote() && ep.AsNylonEndpoint().Address == curAddr {
+			curLink = ep
+			break
+		}
+	}
+	if curLink == nil {
+		f.materializeCarrying(neigh, current, prev)
+		f.n.Log.Debug("port hop: carrying link materialised at reconciliation", "peer", f.node, "endpoint", curAddr)
+	} else if curLink.IsExhausted() {
+		// Should not happen (the current port is never retired while current),
+		// but if it does, do not rank a burned port: the tombstone removal
+		// will reap it and the next pass materialises a fresh link.
+		f.n.Log.Debug("port hop: carrying link is exhausted, awaiting re-materialisation", "peer", f.node, "endpoint", curAddr)
+	}
+
+	// Tombstone every other hop link of this peer: they belong to ports the
+	// factory has rotated away from. This includes the predecessor recorded by
+	// the latest rotation. Deferring the exhaustion to here (instead of
+	// marking it on the send path) is what keeps the neighbour continuously
+	// ranked: the predecessor stays the best endpoint until its successor is
+	// materialised, so routes never flap on rotation.
+	for _, ep := range neigh.Eps {
+		nep := ep.AsNylonEndpoint()
+		if ep.IsRemote() || ep.IsExhausted() {
+			continue
+		}
+		if nep.Address == curAddr {
+			continue
+		}
+		ap, err := netip.ParseAddrPort(nep.Address)
+		if err != nil || !f.ownsEndpoint(ap) {
+			continue
+		}
+		nep.MarkExhausted()
+		f.scheduleTombstoneRemoval(nep.Address)
+		f.n.Log.Debug("port hop: retired carrying link tombstoned", "peer", f.node, "endpoint", nep.Address)
+	}
+}
+
+// materializeCarrying registers the current carrying endpoint as a regular
+// nylon link. If a healthy predecessor link exists, its RTT estimate is
+// seeded onto the new link so ComputeRoutes sees a feasible, cost-continuous
+// endpoint immediately (the carrying port is by construction forwarding live
+// traffic — the send path drew it); the relaxed probe loop refines the
+// estimate afterwards. Without a predecessor (bootstrap), the link starts
+// cold and an on-demand probe validates it.
 //
-// If the port has been retired by the time the dispatched closure runs (the
-// send path rotated away between the draw and this materialisation, or a
-// bootstrap draw was superseded), the link is born as a tombstone instead:
-// exhausted and scheduled for removal. Materialising it unexhausted would
-// recreate the retirement race the other direction — retireLink's
-// MarkExhausted dispatch may already have run against a link list that did
-// not contain this port yet, and an unexhausted orphan never stops probing.
-func (f *portFactory) materializeLink(ap netip.AddrPort) {
+// Runs on the dispatch loop. ComputeRoutes is invoked only on reachability
+// transitions (endpoint-less neighbour becomes ranked, or vice versa): in
+// steady rotation the seeded metric keeps the neighbour's cost continuous,
+// and the periodic recomputes (probe pongs, route updates) pick up exact
+// values — recomputing per rotation is what a rotation storm cannot afford.
+func (f *portFactory) materializeCarrying(neigh *state.Neighbour, ap netip.AddrPort, prev netip.AddrPort) {
 	addr := ap.String()
-	f.n.Dispatch(func() error {
-		neigh := f.n.RouterState.GetNeighbour(f.node)
-		if neigh == nil {
-			return nil
+	hadBest := neigh.BestEndpoint() != nil
+
+	for _, ep := range neigh.Eps {
+		if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
+			return // already materialized
 		}
-		for _, ep := range neigh.Eps {
-			if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-				return nil // already materialized
-			}
+	}
+	// the cached bind keeps the factory free of the device net lock even
+	// when re-materialising from the dispatch loop
+	bind := f.bindIfReady()
+	if bind == nil {
+		return
+	}
+	wgEp, err := bind.ParseEndpoint(addr)
+	if err != nil {
+		return
+	}
+	link := state.NewEndpoint(addr, false, wgEp, &f.n.RouterTunables)
+
+	if seed := f.findSeedLink(neigh, ap, prev); seed != nil {
+		if rtt := seed.AsNylonEndpoint().FilteredPing(); rtt > 0 && !math.IsInf(float64(rtt), 1) {
+			// CAUTION: order matters — Renew() on an inactive link resets the
+			// history and the EWMA (see NylonEndpoint.Renew), so it must run
+			// BEFORE the seed is planted, or it wipes it right back out.
+			link.Renew()
+			link.SeedRTT(rtt)
 		}
-		// the cached bind keeps the factory free of the device net lock even
-		// when re-materialising from the dispatch loop
-		bind := f.bindIfReady()
-		if bind == nil {
-			return nil
-		}
-		wgEp, err := bind.ParseEndpoint(addr)
-		if err != nil {
-			return nil
-		}
-		link := state.NewEndpoint(addr, false, wgEp, &f.n.RouterTunables)
-		if f.pool.IsCooling(ap) {
-			// retired between draw and materialisation: keep the tombstone so
-			// late pongs still match, but never let it become a healthy ghost
-			link.MarkExhausted()
-			neigh.Eps = append(neigh.Eps, link)
-			f.n.UpdateNeighbour(f.node)
-			f.scheduleTombstoneRemoval(addr)
-			f.n.Log.Debug("port hop: materialised retired endpoint as tombstone", "peer", f.node, "endpoint", addr)
-			return nil
-		}
-		neigh.Eps = append(neigh.Eps, link)
-		f.n.UpdateNeighbour(f.node)
-		// on-demand probe: validates the port and marks the link active so
-		// routes through this neighbour stay feasible during rotation
+	}
+
+	neigh.Eps = append(neigh.Eps, link)
+	f.n.UpdateNeighbour(f.node)
+
+	if !link.IsActive() {
+		// no predecessor to seed from: bootstrap-grade link, validate with an
+		// on-demand probe (marks the link active on the first pong)
 		go func() {
 			if err := f.n.Probe(f.node, link.AsNylonEndpoint()); err != nil {
 				f.n.Log.Debug("port hop: probe of new endpoint failed", "peer", f.node, "endpoint", addr, "error", err)
 			}
 		}()
-		return nil
-	})
+		return
+	}
+	// seeded: the neighbour's reachability may have just been restored
+	if !hadBest && neigh.BestEndpoint() != nil {
+		ComputeRoutes(f.n.RouterState, f.n)
+	}
 }
 
-// retireLink marks the exhausted endpoint's link and schedules its removal
-// after the tombstone grace period.
-func (f *portFactory) retireLink(ap netip.AddrPort) {
-	addr := ap.String()
-	f.n.Dispatch(func() error {
-		neigh := f.n.RouterState.GetNeighbour(f.node)
-		if neigh == nil {
-			return nil
+// findSeedLink returns the healthiest hop link to use as the RTT seed source
+// for a freshly drawn carrying endpoint: the link of the port the latest
+// rotation retired, if it still exists and has a measurement, else any other
+// healthy hop link (a rotation storm's intermediate ports have no links, so
+// this falls back to the last materialised predecessor).
+func (f *portFactory) findSeedLink(neigh *state.Neighbour, drawn netip.AddrPort, prev netip.AddrPort) state.Endpoint {
+	var fallback state.Endpoint
+	for _, ep := range neigh.Eps {
+		if ep.IsRemote() || ep.IsExhausted() {
+			continue
 		}
-		for _, ep := range neigh.Eps {
-			if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-				ep.AsNylonEndpoint().MarkExhausted()
-			}
+		nep := ep.AsNylonEndpoint()
+		ap, err := netip.ParseAddrPort(nep.Address)
+		if err != nil || ap == drawn || !f.ownsEndpoint(ap) {
+			continue
 		}
-		return nil
-	})
-	f.scheduleTombstoneRemoval(addr)
+		if prev.IsValid() && nep.Address == prev.String() {
+			return ep
+		}
+		if fallback == nil {
+			fallback = ep
+		}
+	}
+	return fallback
 }
 
 // scheduleTombstoneRemoval removes the exhausted link for addr after the

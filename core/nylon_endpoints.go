@@ -269,7 +269,22 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 			}
 		}
 	}
-	n.Log.Warn("probe came back and couldn't find link", "from", ep.DstToString(), "node", node)
+	// A pong that matches no link is an expected artefact of endpoint churn:
+	// the link (a hop port rotated away from, or a learned remote endpoint
+	// that expired) is reaped while a probe in flight to it is still coming
+	// back. Warn once per (peer, address) per hour, then Debug — a storm of
+	// these under load would otherwise bury the journal without carrying new
+	// information.
+	key := string(node) + "|" + ep.DstToString()
+	if n.router.pongWarns == nil {
+		n.router.pongWarns = make(map[string]time.Time)
+	}
+	if last, ok := n.router.pongWarns[key]; !ok || time.Since(last) >= time.Hour {
+		n.router.pongWarns[key] = time.Now()
+		n.Log.Warn("probe came back and couldn't find link", "from", ep.DstToString(), "node", node)
+		return
+	}
+	n.Log.Debug("probe came back and couldn't find link", "from", ep.DstToString(), "node", node)
 }
 
 func (n *Nylon) probeLinks(active bool) error {
@@ -284,8 +299,12 @@ func (n *Nylon) probeLinks(active bool) error {
 			if ep.IsActive() == active {
 				// port hopping: factory-managed carrying links probe at a relaxed
 				// cadence (see portFactory.probeReady) so idle probing does not burn
-				// the port budget; stock links keep the stock cadence
-				if !n.hopProbeReady(neigh.Id, ep.AsNylonEndpoint().Address) {
+				// the port budget — but ONLY while the link is active. An inactive
+				// link (never answered, or went dead) is probed at the stock
+				// cadence: gating its recovery behind the relaxed interval stalled
+				// tunnel setup for a full probe interval whenever the first
+				// probe's pong was lost (integration: TestPortAsEndpointHoppingGate).
+				if active && !n.hopProbeReady(neigh.Id, ep.AsNylonEndpoint().Address) {
 					continue
 				}
 				_, err := n.sendEndpointProbe(neigh.Id, ep.AsNylonEndpoint(), n.ProbeTimeout)
