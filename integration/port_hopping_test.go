@@ -463,7 +463,17 @@ func TestPortAsEndpointNoGhostLinks(t *testing.T) {
 	// carryLast maps each observed carrying port to the last instant it was
 	// carrying; transitional states (tombstone not yet marked exhausted)
 	// reference a port that was carrying within the last few samples.
+	//
+	// The history is seeded with every port the middlebox actually saw — the
+	// traffic phase predates the sampling loop, and the lazy (once per second)
+	// tombstone reconciliation legitimately leaves the last traffic-era
+	// carrying port healthy at the first sample.
+	trafficEnd := time.Now()
 	carryLast := map[string]time.Time{}
+	bRangeAddr := netip.MustParseAddr(bRange)
+	for _, port := range fwd.CarriedPorts() {
+		carryLast[netip.AddrPortFrom(bRangeAddr, port).String()] = trafficEnd
+	}
 	for _, s := range samples {
 		if s.carrying != "" {
 			carryLast[s.carrying] = s.at

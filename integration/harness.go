@@ -134,6 +134,20 @@ func (v *VirtualLink) DistinctDstPorts() int {
 	return len(v.portsSeen)
 }
 
+// CarriedPorts returns the distinct destination ports that have carried
+// packets over this link (range links only) — the ground truth of "this port
+// was actually used" for ghost-link assertions, independent of when the
+// test's sampling loop happens to run.
+func (v *VirtualLink) CarriedPorts() []uint16 {
+	v.portsMu.Lock()
+	defer v.portsMu.Unlock()
+	out := make([]uint16, 0, len(v.portsSeen))
+	for p := range v.portsSeen {
+		out = append(out, p)
+	}
+	return out
+}
+
 // observePort records a destination port on a range link.
 func (v *VirtualLink) observePort(port uint16) {
 	v.portsMu.Lock()

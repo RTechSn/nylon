@@ -194,6 +194,38 @@ func (u *NylonEndpoint) UpdatePing(ping time.Duration) {
 	u.dirty = true
 }
 
+// SeedRTT carries a measured RTT estimate from a predecessor link onto a
+// freshly drawn carrying endpoint (port rotation: same peer, different
+// destination port, effectively the same path). The estimate is written into
+// the EWMA and padded into the history window so the confidence-gated
+// statistics (LowRange/StabilizedPing) report it immediately: the successor
+// link is ranked feasible from birth, and route costs stay continuous across
+// the rotation instead of flapping to infinity until the first probe pong.
+// The relaxed probe loop replaces the seed with real measurements in due
+// course.
+func (u *NylonEndpoint) SeedRTT(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	u.Lock()
+	defer u.Unlock()
+	u.expRTT = float64(rtt)
+	u.history = u.history[:0]
+	n := u.t.MinimumConfidenceWindow
+	if n < 1 {
+		n = 1
+	}
+	if n > u.t.WindowSamples {
+		n = u.t.WindowSamples
+	}
+	for i := 0; i < n; i++ {
+		u.history = append(u.history, rtt)
+	}
+	u.dirty = true
+	u.probeSuccess = 1
+	u.probeSamples = 0
+}
+
 func (u *NylonEndpoint) Metric() uint32 {
 	u.RLock()
 	lossDead := u.lossDeadUnlocked()

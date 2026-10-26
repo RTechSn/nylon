@@ -62,6 +62,10 @@ type Nylon struct {
 		// per prefix. Written only from the dispatch goroutine (all checkPrefix
 		// callers are dispatched via n.Dispatch), like the rest of router state.
 		unknownPrefixWarns map[netip.Prefix]time.Time
+		// pongWarns tracks the last emitted unmatched-pong warning per
+		// (peer, address). Written only from the dispatch goroutine
+		// (handleProbePong is dispatched), like the rest of router state.
+		pongWarns map[string]time.Time
 	}
 
 	// runtime/application

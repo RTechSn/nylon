@@ -251,7 +251,9 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 	}
 
 	// 1) one handshake initiation: draws a fresh carrying port (budget 12)
-	//    and spends 11 buffers (5 junk + 5 I + init) -> exactly 1 left
+	//    and spends most of it (5 junk + 5 I + init). Probe traffic on the
+	//    carrying port also spends budget units, so the exact remainder is
+	//    read back from the device instead of assumed.
 	done := make(chan error, 1)
 	go func() { done <- peer.SendHandshakeInitiation(false) }()
 	select {
@@ -267,35 +269,55 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 		t.Fatal("no carrying endpoint was drawn")
 	}
 
-	// 2) a two-buffer batch addressed to the carrying port: the first buffer
-	//    spends the last budget unit, the second rotates MID-BATCH inside
-	//    Peer.SendBuffers — the exact field-rig deadlock shape. The call must
-	//    return promptly; the buggy build hangs here forever holding the
-	//    device net read lock and the hop mutex.
-	firstEp, err := n.Device.Bind().ParseEndpoint(first.Carrying)
-	if err != nil {
-		t.Fatalf("failed to parse carrying endpoint %s: %v", first.Carrying, err)
-	}
-	batch := [][]byte{make([]byte, 64), make([]byte, 64)}
-	eps := []conn.Endpoint{firstEp, firstEp}
-	sent := make(chan error, 1)
-	go func() { sent <- peer.SendBuffers(batch, eps) }()
-	select {
-	case err := <-sent:
-		if err != nil {
-			t.Fatalf("SendBuffers failed: %v", err)
+	// 2) a batch addressed to the carrying port that is exactly one buffer
+	//    larger than the remaining budget: the last buffer rotates
+	//    MID-BATCH inside Peer.SendBuffers — the exact field-rig deadlock
+	//    shape. The call must return promptly; the buggy build hangs here
+	//    forever holding the device net read lock and the hop mutex.
+	//    In-flight probe traffic can spend budget (or exhaust it, rotating
+	//    and refilling) between the HopStatus read and the batch, so the
+	//    sized batch is retried until a rotation is observed.
+	rotationDeadline := time.Now().Add(20 * time.Second)
+	for {
+		st, ok := peer.HopStatus()
+		if !ok || st.Carrying == "" {
+			t.Fatal("carrying endpoint disappeared")
 		}
-	case <-time.After(10 * time.Second):
-		var buf bytes.Buffer
-		pprof.Lookup("goroutine").WriteTo(&buf, 2)
-		t.Fatalf("SendBuffers with a mid-batch rotation did not return within 10s — the device net lock self-deadlock is back:\n%s", buf.String())
-	}
-
-	second, ok := peer.HopStatus()
-	if !ok || second.Carrying == "" {
-		t.Fatal("carrying endpoint disappeared after mid-batch rotation")
-	}
-	if second.Carrying == first.Carrying {
-		t.Fatalf("carrying endpoint did not rotate (%s); expected a fresh port after the budget was spent", second.Carrying)
+		batchLen := st.BudgetLeft + 1
+		if batchLen < 2 {
+			batchLen = 2 // keep the multi-buffer mid-batch shape
+		}
+		batch := make([][]byte, batchLen)
+		eps := make([]conn.Endpoint, batchLen)
+		ep, err := n.Device.Bind().ParseEndpoint(st.Carrying)
+		if err != nil {
+			t.Fatalf("failed to parse carrying endpoint %s: %v", st.Carrying, err)
+		}
+		for i := range batch {
+			batch[i] = make([]byte, 64)
+			eps[i] = ep
+		}
+		sent := make(chan error, 1)
+		go func() { sent <- peer.SendBuffers(batch, eps) }()
+		select {
+		case err := <-sent:
+			if err != nil {
+				t.Fatalf("SendBuffers failed: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			var buf bytes.Buffer
+			pprof.Lookup("goroutine").WriteTo(&buf, 2)
+			t.Fatalf("SendBuffers with a mid-batch rotation did not return within 10s — the device net lock self-deadlock is back:\n%s", buf.String())
+		}
+		after, ok := peer.HopStatus()
+		if !ok || after.Carrying == "" {
+			t.Fatal("carrying endpoint disappeared after mid-batch rotation")
+		}
+		if after.Carrying != st.Carrying {
+			break // rotated
+		}
+		if time.Now().After(rotationDeadline) {
+			t.Fatalf("carrying endpoint did not rotate (%s); expected a fresh port after the budget was spent", st.Carrying)
+		}
 	}
 }

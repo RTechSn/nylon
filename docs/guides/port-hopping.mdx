@@ -85,8 +85,17 @@ All fields are optional; omit `port_hopping` entirely to keep stock single-endpo
 ### Tuning notes
 
 - `budget_packets` must stay **below** the middlebox's per-flow budget. The default 12 leaves headroom under the worst observed 16–20 for handshake junk and in-flight packets at rotation time. Overshooting a few packets is harmless in practice: the port is retired immediately after, and a ban on an abandoned port costs nothing.
-- `cooldown_seconds` should be at least the observed middlebox recovery time. Range longevity is bounded by `sustained ≈ (ports / cooldown) × budget × ~1200 B`: 40 000 ports with a 180 s cooldown sustain roughly 35 Mbit/s indefinitely; a 100-port test range with the default policy sustains idle probing comfortably (a few ports per minute) but not heavy traffic.
-- The carrying link is probed at a relaxed cadence (a fraction of `link_dead_threshold`) so idle probing does not burn the budget; active traffic rotates the port naturally.
+- `cooldown_seconds` should be at least the observed middlebox recovery time. Range longevity is bounded by `sustained ≈ (ports / cooldown) × budget × ~1200 B`: 40 000 ports with a 180 s cooldown sustain roughly 35 Mbit/s indefinitely; a 100-port test range with the default policy sustains idle probing comfortably (a few ports per minute) but not heavy traffic. When the pool does run dry, rotation stalls (traffic keeps flowing on the burned port) and nylon warns at most once a minute with the pool stats — `port hop: rotation stalled, port pool exhausted ... cooling=N`.
+- The carrying link is probed at a relaxed cadence (a fraction of `link_dead_threshold`) so idle probing does not burn the budget; active traffic rotates the port naturally. A link that is not yet (or no longer) active is always probed at the stock cadence — recovery is never gated.
+
+### Behaviour under load
+
+Rotation rate follows the traffic: one rotation per `budget_packets` wire packets, so a saturated link rotates its port hundreds of times per second (at iperf3 speeds with the default budget). This is by design — it is the only way a single flow stays under the per-flow volume ban — and the control plane absorbs it cheaply:
+
+- the rotation hot path does no dispatch work; link bookkeeping is reconciled once per second, so a rotation storm costs one materialisation per second, not one per rotation,
+- ports drawn and abandoned between two reconciliation passes never become links (nothing probed them, so nothing needs to match them),
+- the freshly drawn port's link is seeded with the predecessor's RTT estimate, so routes stay feasible and their cost continuous across every rotation — the neighbour never flaps to `no endpoint to neighbour` because of rotation,
+- `port hop: carrying endpoint rotated` is logged at most once per second at INFO with a `rotations=N` counter covering the interval (every individual rotation is DEBUG).
 
 ## Multi-IP diversity
 
@@ -102,7 +111,7 @@ When drawing a new carrying port, the pool scores candidates by dissimilarity to
 
 ## Observability
 
-Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO. The device UAPI (`wg show nylon dump`) reports per-peer:
+Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO — at most one line per second under load, carrying a `rotations=N` counter of the rotations it covers. The device UAPI (`wg show nylon dump`) reports per-peer:
 
 ```
 hop_budget=12
@@ -110,7 +119,7 @@ hop_endpoint=203.0.113.7:30142
 hop_budget_left=7
 ```
 
-The rotation counters in the logs are the quickest way to verify hopping is active: a new endpoint line every few seconds under load is the expected pattern.
+The rotation counters in the logs are the quickest way to verify hopping is active: under sustained load expect one INFO line per second with a large `rotations=N`; while idle, a new endpoint line every ~minute as the relaxed probes burn the budget.
 
 ### Verifying the server side
 
