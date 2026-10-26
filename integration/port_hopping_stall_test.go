@@ -50,6 +50,7 @@ func TestPortAsEndpointIdleActorStall(t *testing.T) {
 
 	// the client runs the hopping policy from the rig (recent=64, cooldown=180)
 	aIdx := vh.IndexOf("a")
+	vh.Local[aIdx].PortMode = state.HopModeProactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:    uint32ptr(12),
 		CooldownSeconds:  uint32ptr(180),
@@ -213,6 +214,7 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
 		bRange+":"+bPorts.String())
 
+	vh.Local[aIdx].PortMode = state.HopModeProactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:    uint32ptr(12),
 		CooldownSeconds:  uint32ptr(180),

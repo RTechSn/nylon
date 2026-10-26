@@ -54,6 +54,9 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	} else if node.ListenMode != "" && node.ListenMode != ListenModeSockets {
 		return fmt.Errorf("listen_mode %q requires listen_ports to be set", node.ListenMode)
 	}
+	if err := ValidateHopPolicyCfg(node.PortMode, node.PortHopping, "node config"); err != nil {
+		return err
+	}
 	if node.PortHopping != nil {
 		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
 			return fmt.Errorf("port_hopping.budget_packets must be greater than 0 (or omitted for the default)")
@@ -208,6 +211,9 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			if _, err := ParseEndpointSpec(endpoint); err != nil {
 				return fmt.Errorf("router %s has invalid endpoint: %w", node.Id, err)
 			}
+		}
+		if err := ValidateHopPolicyCfg(node.PortMode, node.PortHopping, fmt.Sprintf("router %s", node.Id)); err != nil {
+			return err
 		}
 		nodes = append(nodes, string(node.Id))
 	}

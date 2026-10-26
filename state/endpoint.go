@@ -30,9 +30,11 @@ type NylonEndpoint struct {
 	dirty         bool
 	prevMedian    time.Duration
 	lastHeardBack time.Time
+	firstSeen     time.Time // creation time; gates reactive rotation so a cold, not-yet-validated link is not rotated away before its first probe completes
 	probeSuccess  float64
 	probeSamples  uint32
 	probeTimeouts uint64
+	probeStreak   uint32 // consecutive probe attempts that timed out; reset only by a successful pong (NOT by Renew — a peer's own pings must not mask our blackholed direction)
 	expRTT        float64
 	remoteInit    bool
 	exhausted     bool // port-hopping: budget burned on this endpoint; keep it for late pongs, but stop probing it
@@ -111,9 +113,11 @@ func (u *NylonEndpoint) RecordProbe(success bool) {
 	u.probeSamples++
 	if success {
 		u.probeSuccess = ewmaAlpha + (1-ewmaAlpha)*u.probeSuccess
+		u.probeStreak = 0
 	} else {
 		u.probeSuccess = (1 - ewmaAlpha) * u.probeSuccess
 		u.probeTimeouts++
+		u.probeStreak++
 	}
 }
 
@@ -130,7 +134,17 @@ func NewEndpoint(address string, remoteInit bool, wgEndpoint conn.Endpoint, t *R
 		history:      make([]time.Duration, 0),
 		expRTT:       math.Inf(1),
 		probeSuccess: 1,
+		firstSeen:    time.Now(),
 	}
+}
+
+// FirstSeen returns the link's creation time (see the reactive hop mode:
+// a link younger than the liveness threshold is given time to prove itself
+// before rotation is triggered on it).
+func (u *NylonEndpoint) FirstSeen() time.Time {
+	u.RLock()
+	defer u.RUnlock()
+	return u.firstSeen
 }
 
 func (u *NylonEndpoint) calcR() (time.Duration, time.Duration, time.Duration) {
@@ -253,6 +267,16 @@ func (u *NylonEndpoint) ProbeTimeouts() uint64 {
 	u.RLock()
 	defer u.RUnlock()
 	return u.probeTimeouts
+}
+
+// ProbeStreak returns how many consecutive probe attempts timed out without a
+// successful pong in between (see the reactive hop mode: the peer's own
+// traffic keeps a link IsActive while OUR direction to it is blackholed; only
+// our probes going unanswered exposes that).
+func (u *NylonEndpoint) ProbeStreak() uint32 {
+	u.RLock()
+	defer u.RUnlock()
+	return u.probeStreak
 }
 
 func (u *NylonEndpoint) IsRemote() bool {

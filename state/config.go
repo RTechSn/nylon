@@ -70,8 +70,10 @@ type NodeCfg struct {
 
 // RouterCfg represents a central representation of a node that can route
 type RouterCfg struct {
-	NodeCfg   `yaml:",inline"`
-	Endpoints []string
+	NodeCfg     `yaml:",inline"`
+	Endpoints   []string
+	PortMode    string          `yaml:"port_mode,omitempty"`    // client-side port rotation strategy for range endpoints (static|reactive|proactive|timed); wins wholesale over node.yaml
+	PortHopping *PortHoppingCfg `yaml:"port_hopping,omitempty"` // client-side rotation policy knobs (mode-dependent); wins wholesale over node.yaml
 }
 type ClientCfg struct {
 	NodeCfg `yaml:",inline"`
@@ -152,19 +154,80 @@ type TunablesOverrides struct {
 	HopCost                    *uint32        `yaml:"hop_cost,omitempty"`
 }
 
+// Port rotation modes (port_mode) decide WHEN the carrying endpoint of a
+// range-configured peer changes. The mode governs the node's OUTGOING
+// connections (the client half of port hopping); the listen half
+// (listen_ports/listen_mode) is orthogonal and serves other nodes' rotation
+// into our range, so a hub may serve a wide range while itself running any
+// mode.
+const (
+	// HopModeStatic never rotates: the carrying endpoint stays pinned to
+	// the first port of the first resolvable range spec. Default; the flow
+	// behaves like a pre-hopping single-port connection.
+	HopModeStatic = "static"
+	// HopModeReactive rotates only when the carrying link is considered
+	// dead: no traffic heard back for link_dead_threshold, or loss-dead
+	// probe statistics. Minimal port churn; reacts only after a drop.
+	HopModeReactive = "reactive"
+	// HopModeProactive rotates after the carrying port has carried the
+	// configured packet budget (budget_packets, required) — the worst-case
+	// per-flow volume strategy against middleboxes that ban flows by packet
+	// count.
+	HopModeProactive = "proactive"
+	// HopModeTimed rotates on a wall-clock schedule: every period_seconds
+	// (required), with a random jitter so rotations do not synchronise.
+	HopModeTimed = "timed"
+
+	// Reserved mode names, parseable but rejected by validation until their
+	// implementing branch lands.
+	HopModeDynamic = "dynamic" // proactive with an automatically sized budget
+	HopModeAuto    = "auto"    // automatic mode switching by connection conditions
+)
+
+// HopModes lists the implemented port_mode values.
+func HopModes() []string {
+	return []string{HopModeStatic, HopModeReactive, HopModeProactive, HopModeTimed}
+}
+
+// ReservedHopModes lists the port_mode values reserved for future branches.
+func ReservedHopModes() []string {
+	return []string{HopModeDynamic, HopModeAuto}
+}
+
+// ValidateHopMode checks a port_mode value: implemented modes pass,
+// reserved names get a dedicated not-yet-implemented error, anything else
+// is unknown.
+func ValidateHopMode(mode string) error {
+	if slices.Contains(HopModes(), mode) {
+		return nil
+	}
+	if slices.Contains(ReservedHopModes(), mode) {
+		return fmt.Errorf("port_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, HopModes())
+	}
+	return fmt.Errorf("unknown port_mode %q (want one of %v)", mode, HopModes())
+}
+
 // PortHoppingCfg is the client-side port rotation policy for peers whose
 // endpoints are configured with port ranges. Nil values keep the built-in
-// defaults (see DefaultPortHoppingPolicy).
+// defaults (see DefaultPortHoppingPolicy). Which knobs are meaningful
+// depends on the configured port_mode; knobs the mode does not use are
+// ignored.
 type PortHoppingCfg struct {
-	BudgetPackets    *uint32 `yaml:"budget_packets,omitempty"`    // rotate the carrying port after N wire packets (worst-case per-flow budget)
+	BudgetPackets    *uint32 `yaml:"budget_packets,omitempty"`    // proactive: rotate the carrying port after N wire packets (worst-case per-flow budget)
+	PeriodSeconds    *uint32 `yaml:"period_seconds,omitempty"`    // timed: rotate every N seconds (required in timed mode)
+	PeriodJitterPct  *uint32 `yaml:"period_jitter_pct,omitempty"` // timed: random jitter around the period, as a percentage of it (default 10, at most 50)
 	RecentPorts      *uint32 `yaml:"recent_ports,omitempty"`      // avoid reusing the last N selected endpoints
 	CooldownSeconds  *uint32 `yaml:"cooldown_seconds,omitempty"`  // quarantine a retired port for this long
 	CandidateSamples *uint32 `yaml:"candidate_samples,omitempty"` // candidates sampled per selection for diversity scoring
 }
 
 // PortHoppingPolicy is the resolved, always-set form of PortHoppingCfg.
+// Mode is filled by ResolveHopPolicy (the knob block does not carry it).
 type PortHoppingPolicy struct {
+	Mode             string
 	Budget           uint32
+	Period           time.Duration
+	JitterPct        uint32 // percentage of Period; the effective interval is Period ± Period*JitterPct/100
 	Recent           uint32
 	Cooldown         time.Duration
 	CandidateSamples uint32
@@ -177,14 +240,18 @@ type PortHoppingPolicy struct {
 // preference across IPs and subnets.
 func DefaultPortHoppingPolicy() PortHoppingPolicy {
 	return PortHoppingPolicy{
+		Mode:             HopModeStatic,
 		Budget:           12,
+		Period:           0,
+		JitterPct:        10,
 		Recent:           512,
 		Cooldown:         3 * time.Minute,
 		CandidateSamples: 32,
 	}
 }
 
-// Resolve fills unset fields with the defaults.
+// Resolve fills unset fields with the defaults. The mode is the static
+// default; ResolveHopPolicy overrides it with the winning source's port_mode.
 func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	p := DefaultPortHoppingPolicy()
 	if c == nil {
@@ -192,6 +259,12 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	}
 	if c.BudgetPackets != nil && *c.BudgetPackets > 0 {
 		p.Budget = *c.BudgetPackets
+	}
+	if c.PeriodSeconds != nil && *c.PeriodSeconds > 0 {
+		p.Period = time.Duration(*c.PeriodSeconds) * time.Second
+	}
+	if c.PeriodJitterPct != nil {
+		p.JitterPct = *c.PeriodJitterPct
 	}
 	if c.RecentPorts != nil && *c.RecentPorts > 0 {
 		p.Recent = *c.RecentPorts
@@ -203,6 +276,70 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 		p.CandidateSamples = *c.CandidateSamples
 	}
 	return p
+}
+
+// ResolveHopPolicy merges the central router entry and the local node config
+// into the effective port rotation policy. The hop policy is atomic per
+// source: when the central router entry sets port_mode or port_hopping, the
+// central pair wins wholesale (node.yaml hop fields are ignored), and vice
+// versa; with no hop fields anywhere the static default applies. The second
+// return value names the winning source ("central", "node" or "default") for
+// the journal.
+func ResolveHopPolicy(central *RouterCfg, local *LocalCfg) (PortHoppingPolicy, string) {
+	if central != nil && (central.PortMode != "" || central.PortHopping != nil) {
+		p := central.PortHopping.Resolve()
+		p.Mode = central.PortMode
+		if p.Mode == "" {
+			p.Mode = HopModeStatic
+		}
+		return p, "central"
+	}
+	if local != nil && (local.PortMode != "" || local.PortHopping != nil) {
+		p := local.PortHopping.Resolve()
+		p.Mode = local.PortMode
+		if p.Mode == "" {
+			p.Mode = HopModeStatic
+		}
+		return p, "node"
+	}
+	return DefaultPortHoppingPolicy(), "default"
+}
+
+// ValidateHopPolicyCfg checks one file's hop policy for internal
+// consistency: the mode must be implemented (or clearly reserved), and the
+// parameters the configured mode requires must be co-located in the same
+// block — a mode may not rely on knobs from the other config file. Knobs
+// the configured mode does not use are not an error (they are ignored).
+// where names the config location for error messages.
+func ValidateHopPolicyCfg(mode string, cfg *PortHoppingCfg, where string) error {
+	if mode == "" {
+		if cfg != nil {
+			return fmt.Errorf("%s: port_hopping is configured but port_mode is not set; this build requires an explicit mode (earlier builds rotated by packet budget implicitly — set port_mode: proactive to keep that behaviour, or reactive|timed|static)", where)
+		}
+		return nil
+	}
+	if err := ValidateHopMode(mode); err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+	switch mode {
+	case HopModeProactive:
+		if cfg == nil || cfg.BudgetPackets == nil {
+			return fmt.Errorf("%s: port_mode proactive requires port_hopping.budget_packets in the same config file", where)
+		}
+	case HopModeTimed:
+		if cfg == nil || cfg.PeriodSeconds == nil {
+			return fmt.Errorf("%s: port_mode timed requires port_hopping.period_seconds in the same config file", where)
+		}
+	}
+	if cfg != nil {
+		if cfg.PeriodSeconds != nil && *cfg.PeriodSeconds == 0 {
+			return fmt.Errorf("%s: port_hopping.period_seconds must be greater than 0 (or omitted)", where)
+		}
+		if cfg.PeriodJitterPct != nil && *cfg.PeriodJitterPct > 50 {
+			return fmt.Errorf("%s: port_hopping.period_jitter_pct must be at most 50, got %d", where, *cfg.PeriodJitterPct)
+		}
+	}
+	return nil
 }
 
 // Listen modes for the port-hopping server half (see LocalCfg.ListenPorts).
@@ -244,7 +381,8 @@ type LocalCfg struct {
 	Port               uint16                // Address that the data plane can be accessed by
 	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
 	ListenMode         string                `yaml:"listen_mode,omitempty"`          // how listen_ports is served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
-	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints
+	PortMode           string                `yaml:"port_mode,omitempty"`            // client-side port rotation strategy for range endpoints: static (default) | reactive | proactive | timed
+	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints (mode-dependent knobs)
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface
 	NoTun              bool                  `yaml:"no_tun,omitempty"`               // relay-only mode; requires no advertised addresses or prefixes
