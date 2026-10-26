@@ -72,15 +72,29 @@ func (n *Nylon) obfDeviceIPC() string {
 
 // hopDeviceIPC renders the device-level port-hopping UAPI knob: the listen
 // range (server half). The client half (rotation budget) is applied per-peer
-// through the hop controller, not through device UAPI.
+// through the hop controller, not through device UAPI. In listen_mode:
+// nftables the range is served by the kernel redirect instead of per-port
+// sockets, so the device is deliberately left unaware of it.
 func (n *Nylon) hopDeviceIPC() string {
 	var b strings.Builder
-	if n.LocalCfg.ListenPorts != "" {
+	if n.LocalCfg.ListenPorts != "" && !n.LocalCfg.UsesNftListenMode() {
 		if _, err := state.ParsePortRange(n.LocalCfg.ListenPorts); err == nil {
 			fmt.Fprintf(&b, "listen_ports=%s\n", n.LocalCfg.ListenPorts)
 		}
 	}
 	return b.String()
+}
+
+// installNftRedirect installs the daemon-owned netfilter redirect serving the
+// listen range on the primary port and remembers it for shutdown removal.
+// Callers make a failure here fatal (see initWireGuard).
+func (n *Nylon) installNftRedirect(pr state.PortRange) error {
+	r := newNftRangeRedirect(n.Port, pr)
+	if err := r.Install(); err != nil {
+		return err
+	}
+	n.nftRedirect = r
+	return nil
 }
 
 func (n *Nylon) initWireGuard() error {
@@ -126,11 +140,27 @@ listen_port=%d
 	// through dead ports forever.
 	if n.LocalCfg.ListenPorts != "" {
 		if pr, perr := state.ParsePortRange(n.LocalCfg.ListenPorts); perr == nil {
-			n.Log.Info("port hopping range listener active",
-				"listen_ports", pr.String(),
-				"ports", pr.Size(),
-				"primary_port", n.Port,
-			)
+			if n.LocalCfg.UsesNftListenMode() {
+				// daemon-managed netfilter redirect: single socket, the kernel
+				// rewrites the range onto the primary port. A failure here is
+				// fatal by design — same contract as the socket range listener,
+				// the daemon refuses to run with a half-served range.
+				if err := n.installNftRedirect(pr); err != nil {
+					return fmt.Errorf("listen_mode: nftables failed to serve listen_ports %s: %v", pr, err)
+				}
+				n.Log.Info("port hopping nftables redirect active",
+					"listen_ports", pr.String(),
+					"ports", pr.Size(),
+					"primary_port", n.Port,
+					"table", "inet "+NftTableName,
+				)
+			} else {
+				n.Log.Info("port hopping range listener active",
+					"listen_ports", pr.String(),
+					"ports", pr.Size(),
+					"primary_port", n.Port,
+				)
+			}
 		} else {
 			// unreachable via Bootstrap (the config validator rejects a
 			// malformed range), kept as a tripwire for embedders

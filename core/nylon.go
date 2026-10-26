@@ -50,6 +50,11 @@ type Nylon struct {
 		factories map[state.NodeId]*portFactory
 	}
 
+	// port hopping (server half, listen_mode: nftables): the daemon-owned
+	// netfilter redirect serving the listen range on the primary port. nil
+	// unless the mode is active; removed again on shutdown.
+	nftRedirect *nftRangeRedirect
+
 	router struct {
 		LastStarvationRequest time.Time
 		IO                    map[state.NodeId]*IOPending

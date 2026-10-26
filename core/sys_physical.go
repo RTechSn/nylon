@@ -92,6 +92,14 @@ func NewWireGuardDevice(n *Nylon) (dev *device.Device, tunDevice tun.Device, rea
 }
 
 func CleanupWireGuardDevice(n *Nylon) error {
+	// remove the daemon-owned nftables redirect (listen_mode: nftables)
+	// before the socket goes away, so redirected range ports stop being
+	// served the moment the primary listener does
+	if n.nftRedirect != nil {
+		if err := n.nftRedirect.Remove(); err != nil {
+			n.Log.Warn("failed to remove the nftables port-hopping table; remove it manually with `nft delete table inet "+NftTableName+"`", "error", err)
+		}
+	}
 	n.Device.Close()
 	if n.wgUapi != nil {
 		err := n.wgUapi.Close()

@@ -31,9 +31,14 @@ dynamic_prefixes_dir: "" # directory watched for dynamic prefix JSON files, e.g.
 
 # Port hopping (server side): also listen on every port of this range and
 # answer peers from the port their packets targeted. The range must contain
-# `port` and is limited to 4096 ports; wider ranges belong behind an nftables
-# DNAT redirect (see guides/port-hopping). Default: disabled.
+# `port`. Default: disabled.
 listen_ports: "" # e.g. "57175-57575"
+
+# How listen_ports is served: "sockets" (default) binds one extra UDP socket
+# per port, limited to 4096 ports; "nftables" keeps the single primary-port
+# socket and installs a daemon-managed netfilter redirect for the range
+# (Linux, CAP_NET_ADMIN; no width ceiling). Requires listen_ports.
+listen_mode: "" # "sockets" | "nftables"; empty = sockets
 
 # Port hopping (client side): rotation policy for peers whose endpoints are
 # configured as port ranges in central.yaml. All fields optional.

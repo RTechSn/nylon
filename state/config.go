@@ -205,6 +205,37 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	return p
 }
 
+// Listen modes for the port-hopping server half (see LocalCfg.ListenPorts).
+const (
+	// ListenModeSockets binds one extra UDP socket per port of the listen
+	// range (the MultiBind range listener). It is the default and works
+	// everywhere, but every port costs file descriptors and receive buffers,
+	// hence the MaxInDaemonListenPorts ceiling.
+	ListenModeSockets = "sockets"
+	// ListenModeNftables keeps the single primary-port bind and installs a
+	// netfilter redirect for the listen range instead: the kernel rewrites
+	// inbound packets addressed to any port of the range to the primary
+	// port, and conntrack mirrors the reverse direction so replies still
+	// originate from the port the peer targeted. Sockets and memory stay
+	// O(1) for arbitrarily wide ranges. Linux only, requires CAP_NET_ADMIN.
+	ListenModeNftables = "nftables"
+)
+
+// EffectiveListenMode returns the configured listen mode, defaulting to
+// ListenModeSockets.
+func (c *LocalCfg) EffectiveListenMode() string {
+	if c.ListenMode == "" || c.ListenMode == ListenModeSockets {
+		return ListenModeSockets
+	}
+	return c.ListenMode
+}
+
+// UsesNftListenMode reports whether the listen range is served by the
+// daemon-managed netfilter redirect instead of per-port sockets.
+func (c *LocalCfg) UsesNftListenMode() bool {
+	return c.EffectiveListenMode() == ListenModeNftables
+}
+
 // LocalCfg represents local node-level configuration
 type LocalCfg struct {
 	// Node Private Key
@@ -212,6 +243,7 @@ type LocalCfg struct {
 	Id                 NodeId                // unique id for this node
 	Port               uint16                // Address that the data plane can be accessed by
 	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
+	ListenMode         string                `yaml:"listen_mode,omitempty"`          // how listen_ports is served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
 	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface

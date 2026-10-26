@@ -38,9 +38,21 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 		if !pr.Contains(node.Port) {
 			return fmt.Errorf("listen_ports %s must contain the primary port %d", pr, node.Port)
 		}
-		if pr.Size() > MaxInDaemonListenPorts {
-			return fmt.Errorf("listen_ports %s exceeds the %d-port ceiling of the in-daemon range listener; use a narrower range or the netfilter DNAT deployment mode (docs/guides/port-hopping.mdx)", pr, MaxInDaemonListenPorts)
+		switch node.EffectiveListenMode() {
+		case ListenModeNftables:
+			// The kernel redirect covers arbitrarily wide ranges; no port
+			// ceiling applies. Platform and capability requirements are
+			// enforced at runtime by the daemon (configs stay portable, so
+			// `nylon verify` may run on a different OS than the target node).
+		case ListenModeSockets:
+			if pr.Size() > MaxInDaemonListenPorts {
+				return fmt.Errorf("listen_ports %s exceeds the %d-port ceiling of the in-daemon range listener; use listen_mode: nftables (daemon-managed DNAT redirect) or a narrower range (docs/guides/port-hopping.mdx)", pr, MaxInDaemonListenPorts)
+			}
+		default:
+			return fmt.Errorf("listen_mode: unknown value %q (want %q or %q)", node.ListenMode, ListenModeSockets, ListenModeNftables)
 		}
+	} else if node.ListenMode != "" && node.ListenMode != ListenModeSockets {
+		return fmt.Errorf("listen_mode %q requires listen_ports to be set", node.ListenMode)
 	}
 	if node.PortHopping != nil {
 		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
