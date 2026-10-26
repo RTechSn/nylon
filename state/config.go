@@ -80,11 +80,32 @@ type ClientCfg struct {
 type DistributionCfg struct {
 	Key   NyPublicKey // also used as shared secret, so, although its "public", it's not a good idea to share it.
 	Repos []string
+	// Interval is how often the repos are polled for config updates.
+	// nil = fall back to LocalDistributionCfg.Interval, then the built-in
+	// default (RouterTunables.CentralUpdateDelay).
+	Interval *time.Duration `yaml:"interval,omitempty"`
 }
 
 type LocalDistributionCfg struct {
 	Key NyPublicKey
 	Url string
+	// Interval is the fallback polling cadence used while the active
+	// central config's dist block sets no interval of its own. The url/key
+	// above are bootstrap-only; the interval outlives bootstrap.
+	Interval *time.Duration `yaml:"interval,omitempty"`
+}
+
+// ResolveUpdateDelay returns the effective cadence for polling the
+// distribution repos: the central dist interval takes precedence, then the
+// node.yaml dist interval, then the tunables default.
+func ResolveUpdateDelay(central *DistributionCfg, local *LocalDistributionCfg, def time.Duration) time.Duration {
+	if central != nil && central.Interval != nil && *central.Interval > 0 {
+		return *central.Interval
+	}
+	if local != nil && local.Interval != nil && *local.Interval > 0 {
+		return *local.Interval
+	}
+	return def
 }
 
 type CentralCfg struct {

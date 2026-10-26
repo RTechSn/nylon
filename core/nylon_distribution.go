@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/encodeous/nylon/state"
 	"github.com/goccy/go-yaml"
@@ -115,4 +116,28 @@ func checkForConfigUpdates(n *Nylon) error {
 		}(repoStr)
 	}
 	return nil
+}
+
+// configUpdateLoop polls the distribution repos for config updates. Unlike a
+// RepeatTask ticker, the delay is re-resolved every round from the current
+// configuration (central dist interval > node.yaml dist interval > tunables
+// default), so updating dist.interval in a distributed config applies live,
+// without a restart.
+func (n *Nylon) configUpdateLoop() {
+	n.Dispatch(func() error { return checkForConfigUpdates(n) })
+	for n.Context.Err() == nil {
+		timer := time.NewTimer(n.updateDelay())
+		select {
+		case <-n.Context.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		n.Dispatch(func() error { return checkForConfigUpdates(n) })
+	}
+}
+
+// updateDelay resolves the current config polling cadence.
+func (n *Nylon) updateDelay() time.Duration {
+	return state.ResolveUpdateDelay(n.CentralCfg.Dist, n.LocalCfg.Dist, n.CentralUpdateDelay)
 }
