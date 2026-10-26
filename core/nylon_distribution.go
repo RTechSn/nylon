@@ -14,6 +14,13 @@ import (
 	"github.com/goccy/go-yaml"
 )
 
+// configFetchTimeout bounds a single config repo fetch. Without it a
+// half-open server connection would pin one goroutine per poll round
+// forever. It is intentionally larger than the default poll interval so a
+// slow-but-alive repo still succeeds; rounds may overlap while a fetch is in
+// flight, which is harmless (each repo fetch is a separate goroutine).
+const configFetchTimeout = 30 * time.Second
+
 // fetches and unbundles central config from url
 func FetchConfig(repoStr string, key state.NyPublicKey, maxSize int64) (*state.CentralCfg, error) {
 	return fetchConfig(repoStr, key, maxSize, state.NewDNSResolver(nil))
@@ -34,12 +41,17 @@ func fetchConfig(repoStr string, key state.NyPublicKey, maxSize int64, resolver 
 		}
 		cfgBody = file
 	case "http", "https":
+		transport := &http.Transport{
+			DialContext: resolver.DialContext,
+		}
 		client := &http.Client{
-			Transport: &http.Transport{
-				DialContext: resolver.DialContext,
-			},
+			Timeout:   configFetchTimeout,
+			Transport: transport,
 		}
 		res, err := client.Get(repo.String())
+		// the transport is per-fetch; release pooled idle connections
+		// right away instead of waiting for the garbage collector
+		defer transport.CloseIdleConnections()
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch %s: %w", repo.String(), err)
 		}
@@ -66,6 +78,11 @@ func checkForConfigUpdates(n *Nylon) error {
 	if n.CentralCfg.Dist == nil {
 		return errors.New("nylon is not configured for automatic config distribution")
 	}
+	delay, source := n.pollDelay()
+	n.Log.Info("checking config sources for updates",
+		"repos", len(n.CentralCfg.Dist.Repos),
+		"interval", delay.String(),
+		"interval_source", source)
 	key := n.CentralCfg.Dist.Key
 	currentTimestamp := n.Timestamp
 	repos := slices.Clone(n.CentralCfg.Dist.Repos)
@@ -77,6 +94,15 @@ func checkForConfigUpdates(n *Nylon) error {
 					return err
 				}
 				if config.Timestamp <= currentTimestamp {
+					// Info on purpose: an unchanged bundle is the
+					// number one cause of "my interval / repo
+					// edit changed nothing" (missing re-seal or
+					// re-upload), and the timestamps make it
+					// obvious on sight
+					n.Log.Info("config bundle is not newer than the active config, skipping",
+						"repo", repo,
+						"bundle_timestamp", config.Timestamp,
+						"active_timestamp", currentTimestamp)
 					if n.DBG_log_repo_updates {
 						n.Log.Debug(fmt.Sprintf("found old update bundle at %s, skipping", repo))
 					}
@@ -111,7 +137,8 @@ func checkForConfigUpdates(n *Nylon) error {
 				return nil
 			}()
 			if err != nil {
-				n.Log.Error("Error updating config", "err", err.Error())
+				n.Log.Error("failed to fetch config update",
+					"repo", repo, "err", err.Error())
 			}
 		}(repoStr)
 	}
@@ -124,20 +151,35 @@ func checkForConfigUpdates(n *Nylon) error {
 // default), so updating dist.interval in a distributed config applies live,
 // without a restart.
 func (n *Nylon) configUpdateLoop() {
+	delay, source := n.pollDelay()
+	n.Log.Info("config poll loop started",
+		"interval", delay.String(),
+		"interval_source", source,
+		"repos", len(n.CentralCfg.Dist.Repos))
+	lastDelay, lastSource := delay, source
 	n.Dispatch(func() error { return checkForConfigUpdates(n) })
 	for n.Context.Err() == nil {
-		timer := time.NewTimer(n.updateDelay())
+		timer := time.NewTimer(delay)
 		select {
 		case <-n.Context.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
 		}
+		delay, source = n.pollDelay()
+		if delay != lastDelay || source != lastSource {
+			n.Log.Info("config poll interval changed",
+				"from", lastDelay.String(),
+				"to", delay.String(),
+				"interval_source", source)
+			lastDelay, lastSource = delay, source
+		}
 		n.Dispatch(func() error { return checkForConfigUpdates(n) })
 	}
 }
 
-// updateDelay resolves the current config polling cadence.
-func (n *Nylon) updateDelay() time.Duration {
-	return state.ResolveUpdateDelay(n.CentralCfg.Dist, n.LocalCfg.Dist, n.CentralUpdateDelay)
+// pollDelay resolves the current config polling cadence together with the
+// configuration level it was taken from.
+func (n *Nylon) pollDelay() (time.Duration, string) {
+	return state.ResolveUpdateDelaySource(n.CentralCfg.Dist, n.LocalCfg.Dist, n.CentralUpdateDelay)
 }

@@ -72,6 +72,32 @@ func TestResolveUpdateDelay(t *testing.T) {
 	assert.Equal(t, local, ResolveUpdateDelay(&DistributionCfg{Interval: &bad}, &LocalDistributionCfg{Interval: &local}, def), "non-positive central ignored")
 }
 
+func TestResolveUpdateDelaySource(t *testing.T) {
+	def := 10 * time.Second
+	central := 5 * time.Minute
+	local := time.Minute
+
+	d, s := ResolveUpdateDelaySource(nil, nil, def)
+	assert.Equal(t, def, d, "no dist blocks: default delay")
+	assert.Equal(t, "default", s)
+
+	d, s = ResolveUpdateDelaySource(&DistributionCfg{}, &LocalDistributionCfg{}, def)
+	assert.Equal(t, def, d, "unset intervals: default delay")
+	assert.Equal(t, "default", s)
+
+	d, s = ResolveUpdateDelaySource(nil, &LocalDistributionCfg{Interval: &local}, def)
+	assert.Equal(t, local, d)
+	assert.Equal(t, "node", s)
+
+	d, s = ResolveUpdateDelaySource(&DistributionCfg{}, &LocalDistributionCfg{Interval: &local}, def)
+	assert.Equal(t, local, d, "central dist without interval falls back to node")
+	assert.Equal(t, "node", s)
+
+	d, s = ResolveUpdateDelaySource(&DistributionCfg{Interval: &central}, &LocalDistributionCfg{Interval: &local}, def)
+	assert.Equal(t, central, d)
+	assert.Equal(t, "central", s)
+}
+
 func TestNodeConfigValidator_RejectsNonPositiveDistInterval(t *testing.T) {
 	bad := -time.Second
 	err := NodeConfigValidator(nil, &LocalCfg{

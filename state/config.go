@@ -99,13 +99,24 @@ type LocalDistributionCfg struct {
 // distribution repos: the central dist interval takes precedence, then the
 // node.yaml dist interval, then the tunables default.
 func ResolveUpdateDelay(central *DistributionCfg, local *LocalDistributionCfg, def time.Duration) time.Duration {
+	delay, _ := ResolveUpdateDelaySource(central, local, def)
+	return delay
+}
+
+// ResolveUpdateDelaySource additionally reports where the effective cadence
+// came from: "central" (dist.interval of the active central config), "node"
+// (dist.interval in node.yaml) or "default" (RouterTunables). The source is
+// logged with every poll attempt so that a silently ignored interval - for
+// example one sealed into a bundle by an older binary - is diagnosable from
+// the journal alone.
+func ResolveUpdateDelaySource(central *DistributionCfg, local *LocalDistributionCfg, def time.Duration) (time.Duration, string) {
 	if central != nil && central.Interval != nil && *central.Interval > 0 {
-		return *central.Interval
+		return *central.Interval, "central"
 	}
 	if local != nil && local.Interval != nil && *local.Interval > 0 {
-		return *local.Interval
+		return *local.Interval, "node"
 	}
-	return def
+	return def, "default"
 }
 
 type CentralCfg struct {
