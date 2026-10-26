@@ -270,7 +270,10 @@ func (n *Nylon) Init() error {
 		for _, repo := range n.CentralCfg.Dist.Repos {
 			n.Log.Info("config source", "repo", repo)
 		}
-		n.RepeatTask(func() error { return checkForConfigUpdates(n) }, n.CentralUpdateDelay)
+		// dynamic-delay loop instead of RepeatTask: a new
+		// dist.interval arriving in a config update takes effect
+		// without a restart
+		go n.configUpdateLoop()
 	}
 	if n.DynamicPrefixesDir != "" {
 		go n.watchDynamicPrefixes(n.DynamicPrefixesDir)

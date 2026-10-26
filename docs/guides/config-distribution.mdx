@@ -57,9 +57,10 @@ Despite being called a "public" key, the distribution key also acts as the share
    dist:
      url: "https://your-server.com/central.nybundle"
      key: "<contents-of-dist.pub>"
+     interval: "1h" # optional
    ```
 
-   The `dist` block in `node.yaml` is bootstrap-only: it is consulted only when `central.yaml` does not exist yet. Afterwards it is ignored, and updates flow solely from the `dist` block in `central.yaml`; a corrupt `central.yaml` is not replaced from `node.yaml`.
+   The `url` and `key` in the `dist` block of `node.yaml` are bootstrap-only: they are consulted only when `central.yaml` does not exist yet. The optional `interval` outlives bootstrap — it acts as the fallback polling cadence while the active central config's `dist` block sets no `interval` of its own.
 
    #### Automatic Updates (`central.yaml`)
    Once bootstrapped, nodes poll the repositories defined in `central.yaml`:
@@ -69,11 +70,24 @@ Despite being called a "public" key, the distribution key also acts as the share
      key: "<contents-of-dist.pub>"
      repos:
        - "https://your-server.com/central.nybundle"
+     interval: "6h" # optional
    ```
 
-   Nylon polls for updates every 10 seconds, but applies a bundle only when its timestamp is strictly newer than the active config. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout.
+   Nylon polls for updates on the resolved cadence — the `interval` from `central.yaml` takes precedence, then the `interval` from `node.yaml`, then the built-in default of 10 seconds — and applies a bundle only when its timestamp is strictly newer than the active config. Interval changes distributed inside a config update take effect live, without a restart. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout.
 
 </Steps>
+
+## Observing the poll loop
+
+Every poll round is visible in the journal, which makes "why is my node still hitting the config sources every 10 seconds" answerable from the logs alone:
+
+- `config poll loop started interval=1h0m0s interval_source=central repos=1` — the effective cadence at startup and where it came from (`central` = `dist.interval` of the active central config, `node` = `dist.interval` in `node.yaml`, `default` = built-in 10 seconds).
+- `checking config sources for updates repos=1 interval=1h0m0s interval_source=central` — one record per poll attempt, before the fetches start.
+- `config bundle is not newer than the active config, skipping repo=... bundle_timestamp=... active_timestamp=...` — the source was reached but still serves a bundle that is not newer than the active one. Equal or older timestamps mean the re-seal or re-upload never landed (for example, an edit to the plain `central.yaml` without running `nylon seal`, or a bundle sealed by an older binary that silently drops unknown fields such as `interval`).
+- `failed to fetch config update repo=... err=...` — the source could not be reached or the bundle failed to verify.
+- `config poll interval changed from=10s to=1h0m0s interval_source=central` — a live interval change distributed inside a config update.
+
+Note that an `interval` added to a served `central.yaml` only takes effect after the bundle carrying it is applied — the apply requires a strictly newer timestamp, so a missing re-seal keeps the old cadence while the log lines above show exactly that.
 
 ## Key rotation
 

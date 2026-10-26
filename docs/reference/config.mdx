@@ -47,6 +47,7 @@ port_hopping:
 dist:
   url: https://static.example.com/network1.nybundle
   key: 7PaN6DmAayz4KnDnsXSXJH+Oy0TFGeoM4FEbQfLriVY= # distribution public key
+  interval: 1h # optional: fallback polling cadence (used while central.yaml's dist sets no interval)
 
 # Split tunneling (per-node overrides)
 exclude_ips: # add to the central exclude list
@@ -77,10 +78,12 @@ dist:
   # The distribution key is used to verify and decrypt sealed bundles.
   # Despite being called "public", treat it as a shared secret. It can decrypt your topology.
   key: 7PaN6DmAayz4KnDnsXSXJH+Oy0TFGeoM4FEbQfLriVY=
-  # Nylon polls these URLs every 10 seconds for config updates
+  # Nylon polls these URLs for config updates; the cadence defaults to 10s
+  # and can be changed with `interval` (re-read live from config updates).
   repos:
     - file:central.nybundle          # local file
     - https://static.example.com/network1.nybundle # remote URL (HTTP GET)
+  interval: 1h # optional: polling cadence; takes precedence over node.yaml's dist.interval
 
 # --- Routers ---
 # Active nylon nodes that participate in routing and can forward traffic.

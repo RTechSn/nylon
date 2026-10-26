@@ -90,6 +90,9 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 		if err != nil {
 			return err
 		}
+		if node.Dist.Interval != nil && *node.Dist.Interval <= 0 {
+			return fmt.Errorf("dist.interval must be a positive duration")
+		}
 	}
 	if len(node.DnsResolvers) != 0 {
 		for _, resolver := range node.DnsResolvers {
@@ -243,6 +246,9 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			if err != nil {
 				return err
 			}
+		}
+		if cfg.Dist.Interval != nil && *cfg.Dist.Interval <= 0 {
+			return fmt.Errorf("dist.interval must be a positive duration")
 		}
 	}
 	// validate excludes
