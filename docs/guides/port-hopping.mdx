@@ -20,39 +20,52 @@ The rotation itself lives in the device send path (a per-peer packet budget enfo
 
 ## Server side
 
-The server must accept packets on **every** port of its advertised range and — crucially — answer each peer from exactly the port that peer's last packet targeted. There are two modes:
+The server must accept packets on **every** port of its advertised range and — crucially — answer each peer from exactly the port that peer's last packet targeted. There are two modes; both satisfy the same contract, so the client cannot tell them apart:
 
-### In-daemon range listener (up to 4096 ports)
+### In-daemon range listener (default, up to 4096 ports)
 
-Set `listen_ports` in the server's `node.yaml`. The daemon binds one extra UDP socket per port and tags received packets with the receiving port, so replies leave through the same socket (NAT path symmetry):
+Set `listen_ports` in the server's `node.yaml` (the default `listen_mode: sockets`). The daemon binds one extra UDP socket per port and tags received packets with the receiving port, so replies leave through the same socket (NAT path symmetry):
 
 ```yaml title="node.yaml (server)"
 port: 57175
 listen_ports: 57175-57575 # must contain the primary port; max 4096 ports wide
+listen_mode: sockets # default, may be omitted
 ```
 
 This mode is the simplest and works everywhere without root firewall changes, but every port costs file descriptors and one receive goroutine per address family, hence the ceiling. Budget roughly `0.6 MB` of resident memory per range port (receive buffers plus socket overhead): a 500-port range sits around 300 MB above the daemon baseline, and the full 4096-port ceiling around 2.5 GB. Plan file descriptors accordingly — the range needs about `2 × ports` descriptors (IPv4+IPv6) plus headroom; `LimitNOFILE=8192` (as shipped in `nylon.service`) covers ranges up to a few thousand ports. A bind failure is fatal at startup by design — the daemon refuses to run with a half-open range — so a *running* daemon either has the full range or none of it.
 
-### Netfilter DNAT (arbitrarily wide ranges)
+### Netfilter DNAT mode (daemon-managed, arbitrarily wide ranges)
 
-For wide ranges, redirect the whole range to the single real listen port and let conntrack mirror the reverse direction:
+For wide ranges, `listen_mode: nftables` keeps the daemon on its single primary-port socket and lets the kernel do the range: at startup the daemon installs (and at shutdown removes) an nftables table that redirects the whole listen range to the primary port, and conntrack mirrors the reverse direction:
 
-```bash title="nftables"
-table ip nylon {
+```yaml title="node.yaml (server)"
+port: 57175
+listen_ports: 1024-65535 # must contain the primary port; no width ceiling in this mode
+listen_mode: nftables
+```
+
+The daemon owns the `inet nylon` nftables table while running; the ruleset it maintains is equivalent to:
+
+```bash title="nftables (what the daemon installs)"
+table inet nylon {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
-    udp dport 30000-65535 redirect to :57175
+    udp dport 1024-65535 redirect to :57175
   }
 }
 ```
 
-With DNAT, the kernel rewrites inbound packets destined to any port of the range to the real listen port, and conntrack automatically rewrites the *source* of the replies back to the original destination port — the program never needs to know which port the peer targeted. The server only binds its normal `port: 57175`.
+With the redirect in place, the kernel rewrites inbound packets destined to any port of the range to the real listen port, and conntrack automatically rewrites the *source* of the replies back to the original destination port — the program never needs to know which port the peer targeted. The server only binds its normal `port: 57175`, so sockets, file descriptors and receive memory stay **O(1)** regardless of range width: a 500-port range costs the same as no range at all, and tens of thousands of ports are fine. Because all traffic rides the primary socket, the range-listener throughput and memory ceilings of the sockets mode (capped receive batches, no GRO/GSO offload on extra sockets) do not apply — the data path performs like a plain single-port node.
 
-Notes:
+Requirements and behaviour:
 
-- DNAT needs `conntrack` to keep state for each flow; idle UDP flows time out from the conntrack table, which is harmless — the next packet from the peer creates a new mapping.
-- Pick ranges that do not overlap other services on the host.
-- Both modes satisfy the same contract (accept range, reply from the receiving port), so the client cannot tell them apart.
+- Linux only, and the daemon needs `CAP_NET_ADMIN` (run as root, or grant the capability to the binary). A failure to install is **fatal at startup** by design — the daemon refuses to run with a half-served range, same contract as a failed socket bind in the sockets mode.
+- `conntrack` keeps state for each flow; idle UDP flows time out from the conntrack table, which is harmless — the next packet from the peer creates a new mapping.
+- Install is idempotent: a table left behind by a crash (or a concurrent instance) is replaced wholesale on the next start. On graceful shutdown the table is removed; after a crash it lingers harmlessly (it only redirects to a port nothing listens on) and is reclaimed on the next start. Only one nylon daemon per host may own the table.
+- Pick ranges that do not overlap other services on the host, and make sure the firewall allows the whole UDP range — a rule for the primary port alone is not enough (the redirect happens in `prerouting`, before any filter policy you may add).
+- Hub-initiated traffic to a peer (probes before the peer ever contacts us) leaves from the primary port; it is still attributed correctly by range-aware peers, and reply traffic to an active peer rides that peer's own conntrack mapping, i.e. rotates in lockstep with the peer's hops.
+
+If you prefer to manage the firewall yourself, the mode also works with hand-written rules: omit `listen_mode` (or set `sockets` but *not* `listen_ports`), bind only `port: 57175` and install the table above manually — the daemon then simply never learns about the range, and `nylon verify` cannot check it for you.
 
 ## Client side
 
@@ -123,13 +136,14 @@ The rotation counters in the logs are the quickest way to verify hopping is acti
 
 ### Verifying the server side
 
-On the server, the startup log confirms the range listener:
+On the server, the startup log confirms which server-half mode is active:
 
 ```
 INFO port hopping range listener active listen_ports=57175-57575 ports=401 primary_port=57175
+INFO port hopping nftables redirect active listen_ports=1024-65535 ports=64512 primary_port=57175 table=inet nylon
 ```
 
-Two checks are definitive:
+Sockets mode — two checks are definitive:
 
 ```bash
 # 1. the UAPI dump carries the range (absent => old binary or missing listen_ports)
@@ -141,7 +155,13 @@ wg show nylon dump | grep listen_ports
 ss -ulnp | grep -c 57175 # ~2 per port: one v4 + one v6 line
 ```
 
-A hopping client that logs endless `carrying endpoint rotated` lines while the tunnel passes no traffic is rotating through dead ports: on the server, confirm the log line above, the `listen_ports` dump entry and the sockets, then check the firewall (`nft list ruleset`, `ufw status`) allows the whole UDP range — a rule for the primary port alone is not enough.
+Nftables mode — the daemon-owned table is the state:
+
+```bash
+nft list table inet nylon # the redirect rule must cover the whole range
+```
+
+A hopping client that logs endless `carrying endpoint rotated` lines while the tunnel passes no traffic is rotating through dead ports: on the server, confirm the startup log for the active mode, the sockets / `nft list table inet nylon` state, then check the firewall (`nft list ruleset`, `ufw status`) allows the whole UDP range — a rule for the primary port alone is not enough.
 
 ## Threat model and limits
 
