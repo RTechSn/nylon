@@ -133,6 +133,16 @@ Notes per mode:
 - **proactive** — unchanged behaviour; see the tuning notes below and [Behaviour under load](#behaviour-under-load).
 - **timed** — the rotation deadline is checked on the one-second reconciliation pass, so effective intervals are the period plus up to a second; each interval is drawn as `period ± period*period_jitter_pct/100` so rotations never synchronise. A rotation that fails (port pool fully cooling down) stays due and retries on the next pass.
 
+### Retired ports go quiet
+
+A port the node rotates away from is not merely abandoned — the port factory owns the lifecycle of every link on its ports, so the artefacts of an old port are reaped on a schedule:
+
+- the retired carrying link is tombstoned (kept briefly so late probe pongs still match) and removed after a short grace; tombstoned links are never probed and never ranked, so nothing spends packets on the retired port,
+- links inside the factory's port ranges are never *learned* from inbound traffic: a probe ping arriving from a range port that matches no local link is, by construction, a stale rotation artefact — the peer answering or probing through the port you rotated away from. Learning it would create a link the factory cannot retire: it would be probed at the full stock cadence and renewed by every pong, keeping the old port passing traffic forever,
+- the peer's answering and probing follow the **current** carrying port: nylon control traffic (route updates, seqno requests, acks) rides the current port continuously, and its arrivals re-pin the endpoints used for replies and probes — so a retired port is not fed by a stale pin either.
+
+On the wire, an old port sees at most a short tail — in-flight packets plus one control-traffic cycle — and then goes fully quiet: the per-port tx/rx rate on your router must drop to zero for every port except the current carrying one, including the very first port the session ever used. A retired port that keeps passing traffic long after rotation is a bug.
+
 ### Tuning notes
 
 - `budget_packets` (proactive) must stay **below** the middlebox's per-flow budget. The default 12 leaves headroom under the worst observed 16–20 for handshake junk and in-flight packets at rotation time. Overshooting a few packets is harmless in practice: the port is retired immediately after, and a ban on an abandoned port costs nothing.

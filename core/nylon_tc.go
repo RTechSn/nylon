@@ -208,14 +208,20 @@ func (n *Nylon) handleNylonPacket(packet []byte, endpoint conn.Endpoint, peer *d
 		switch pkt.Type.(type) {
 		case *protocol.Ny_SeqnoRequestOp:
 			n.Dispatch(func() error {
+				// port hopping: control traffic rides the peer's current
+				// carrying port, so its arrival endpoint is the freshest
+				// flow to answer and probe through (see adoptLinkEndpoint)
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleSeqnoRequest(neigh, pkt.GetSeqnoRequestOp())
 			})
 		case *protocol.Ny_RouteOp:
 			n.Dispatch(func() error {
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleRouteUpdate(neigh, pkt.GetRouteOp())
 			})
 		case *protocol.Ny_AckRetractOp:
 			n.Dispatch(func() error {
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleAckRetract(neigh, pkt.GetAckRetractOp())
 			})
 		case *protocol.Ny_ProbeOp:

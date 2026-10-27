@@ -646,13 +646,17 @@ func (f *portFactory) reconcileLinks() {
 
 	// Tombstone every other hop link of this peer: they belong to ports the
 	// factory has rotated away from. This includes the predecessor recorded by
-	// the latest rotation. Deferring the exhaustion to here (instead of
-	// marking it on the send path) is what keeps the neighbour continuously
-	// ranked: the predecessor stays the best endpoint until its successor is
-	// materialised, so routes never flap on rotation.
+	// the latest rotation, remote (learned) links whose address lies inside
+	// the factory's ranges, and anything a ping created before the factory was
+	// wired — a link on an owned port that is not the carrying endpoint is by
+	// construction retired (the local node owns port selection for its
+	// ranges). Deferring the exhaustion to here (instead of marking it on the
+	// send path) is what keeps the neighbour continuously ranked: the
+	// predecessor stays the best endpoint until its successor is materialised,
+	// so routes never flap on rotation.
 	for _, ep := range neigh.Eps {
 		nep := ep.AsNylonEndpoint()
-		if ep.IsRemote() || ep.IsExhausted() {
+		if ep.IsExhausted() {
 			continue
 		}
 		if nep.Address == curAddr {
@@ -957,6 +961,19 @@ func (n *Nylon) hasPortFactory(peer state.NodeId) bool {
 	defer n.portHopping.mu.Unlock()
 	_, ok := n.portHopping.factories[peer]
 	return ok
+}
+
+// hopOwnedEndpoint reports whether the addr:port lies inside a port range
+// configured for the peer, i.e. a port whose link lifecycle the peer's port
+// factory owns (see handleProbePing's remote-link learning).
+func (n *Nylon) hopOwnedEndpoint(peer state.NodeId, ap netip.AddrPort) bool {
+	n.portHopping.mu.Lock()
+	f, ok := n.portHopping.factories[peer]
+	n.portHopping.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return f.ownsEndpoint(ap)
 }
 
 // hopProbeReady reports whether the link with the given address is due for

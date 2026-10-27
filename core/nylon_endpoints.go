@@ -201,6 +201,21 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 	// create a new link if we dont have a link
 	for _, neigh := range n.RouterState.Neighbours {
 		if neigh.Id == node {
+			// port hopping: never learn a remote link inside a
+			// factory-managed port range. The local node owns port
+			// selection for those ranges (the port factory
+			// materialises exactly one carrying link at a time); an
+			// inbound packet from a range port that matches no
+			// local link is a stale rotation artefact — the peer
+			// answering or probing through a port the factory
+			// rotated away from. Learning it would create an
+			// immortal zombie: remote links are exempt from the
+			// factory's tombstoning, are probed at the full stock
+			// cadence, and every pong renews them, so the peer
+			// keeps answering and the port never goes quiet.
+			if n.hopOwnedEndpoint(node, wgEndpoint.DstIPPort()) {
+				return
+			}
 			newEp := state.NewEndpoint(wgEndpoint.DstIPPort().String(), true, wgEndpoint, &n.RouterTunables)
 			newEp.Renew()
 			neigh.Eps = append(neigh.Eps, newEp)
@@ -209,6 +224,42 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 			n.UpdateNeighbour(node)
 			return
 		}
+	}
+}
+
+// adoptLinkEndpoint re-pins the neighbour link matching an inbound nylon
+// packet's arrival endpoint to that endpoint. A link's stored wireguard
+// endpoint otherwise only follows probe pings, which a port-hopping peer may
+// not send for a full relaxed probe interval — or at all, when its rotation
+// period is shorter — so the stored endpoint can linger on a port the peer
+// rotated away from while its data and control traffic have long since moved
+// on. Route updates and other control traffic keep flowing on the peer's
+// CURRENT carrying port, making their arrival endpoint the freshest flow to
+// answer and probe through. Probe pongs are deliberately NOT adopted (see
+// handleProbePong): a pong is sent to wherever OUR ping came from, so
+// adopting it pins the link's outbound port onto itself.
+//
+// Must run on the dispatch loop.
+func (n *Nylon) adoptLinkEndpoint(node state.NodeId, ep conn.Endpoint) {
+	if ep == nil {
+		return
+	}
+	ap := ep.DstIPPort()
+	for _, neigh := range n.RouterState.Neighbours {
+		if neigh.Id != node {
+			continue
+		}
+		for _, dep := range neigh.Eps {
+			dep := dep.AsNylonEndpoint()
+			lap, err := n.EndpointResolver.Get(dep.Address)
+			if err == nil && lap == ap {
+				if dep.WgEndpoint != ep {
+					dep.WgEndpoint = ep
+				}
+				return
+			}
+		}
+		return
 	}
 }
 
