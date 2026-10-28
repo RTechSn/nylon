@@ -19,7 +19,7 @@ var portModeRange = conn.PortRange{First: 30000, Last: 30099}
 // portModeRig builds the range-only rig shape (no concrete endpoint for the
 // server) shared by the mode tests: client "a" reaching server "b" whose only
 // advertised endpoint is the port range.
-func portModeRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink) {
+func portModeRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink, *VirtualLink) {
 	t.Helper()
 	vh := &VirtualHarness{}
 
@@ -40,9 +40,9 @@ func portModeRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink) {
 		bRange+":"+portModeRange.String())
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, portModeRange)
-	vh.AddLinkFromAddr(bRange, a1)
+	rev := vh.AddLinkFromAddr(bRange, a1)
 
-	return vh, vh.IndexOf("a"), bIdx, fwd
+	return vh, vh.IndexOf("a"), bIdx, fwd, rev
 }
 
 // portModeDeliveries starts the rig and returns a delivery counter for data
@@ -67,7 +67,7 @@ func portModeDeliveries(vh *VirtualHarness) (*atomic.Int64, *atomic.Int64, chan 
 // device runs without a packet budget (externally driven rotation that never
 // fires), and sustained traffic flows on exactly that one port.
 func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
-	vh, aIdx, bIdx, fwd := portModeRig(t)
+	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
 	vh.Local[aIdx].PortMode = state.HopModeStatic
 	// an explicitly configured budget is meaningless in static mode and must
@@ -122,7 +122,7 @@ func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
 // latency), traffic is delivered continuously across rotations, and no other
 // rotation trigger exists (no packet budget).
 func TestPortModeTimedRotatesOnSchedule(t *testing.T) {
-	vh, aIdx, bIdx, fwd := portModeRig(t)
+	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
 	vh.Local[aIdx].PortMode = state.HopModeTimed
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
@@ -186,7 +186,7 @@ func TestPortModeTimedRotatesOnSchedule(t *testing.T) {
 // to a fresh port and recover. Rotation count stays small compared to the
 // proactive mode under the same load.
 func TestPortModeReactiveRotatesOnDeadCarryingLink(t *testing.T) {
-	vh, aIdx, bIdx, fwd := portModeRig(t)
+	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
 	// a shorter liveness threshold keeps the death->rotation->recovery cycle
 	// inside the test window (the router tunables are shared by the rig)

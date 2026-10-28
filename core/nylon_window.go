@@ -23,6 +23,12 @@ import (
 // pure bookkeeping.
 const hopTombstoneGrace = 15 * time.Second
 
+// hopDrawnRegistryCap is the default size of a factory's drawn-port registry
+// (see portFactory.registerDrawn). ensurePortFactories raises it to
+// max(4 x recent_ports, this) so the registry comfortably covers the recent
+// ring plus the tombstone-grace horizon of the latest rotations.
+const hopDrawnRegistryCap = 64
+
 // hopProbeFraction scales LinkDeadThreshold into the probe interval for
 // factory-managed links: the stock 1s probe cadence would burn a port's whole
 // packet budget in seconds while idle. The interval stays below
@@ -116,6 +122,18 @@ type portFactory struct {
 	lastRotationLog time.Time
 	rotationCount   uint64
 
+	// drawnPort registry: every address this factory ever drew (bounded FIFO).
+	// Tombstoning and the remote-link learning guard consult it IN ADDITION to
+	// ownsEndpoint, whose address check re-resolves the range spec host
+	// through the live resolver — a DNS answer change (dual-stack A/AAAA
+	// round-robin, DDNS flip) would otherwise retroactively de-own every link
+	// drawn under the old address, leaving retired links never tombstoned:
+	// probed at the full 1s cadence and renewed by every pong forever (the
+	// "every port ever used still shows tx/rx on the router" zombie).
+	drawn      map[string]struct{}
+	drawnOrder []string
+	drawnCap   int
+
 	// pool-exhaustion warn rate limiting
 	lastPoolWarn time.Time
 
@@ -128,6 +146,54 @@ type portFactory struct {
 	// ensurePortFactories pass, so a BindUpdate (listen port change) is
 	// picked up within one reconciliation tick.
 	bind conn.Bind
+}
+
+// registerDrawn records an address this factory drew as a carrying endpoint
+// (or pinned, in static mode). Bounded FIFO: the registry only needs to cover
+// the live link window plus the grace/probe-timeout horizon of the latest
+// rotations — tombstoning and stale-ping learning both concern links of the
+// recent past, not ports drawn an hour ago.
+func (f *portFactory) registerDrawn(ap netip.AddrPort) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drawnCap <= 0 {
+		f.drawnCap = hopDrawnRegistryCap
+	}
+	if f.drawn == nil {
+		f.drawn = make(map[string]struct{})
+	}
+	if _, ok := f.drawn[ap.String()]; !ok {
+		f.drawn[ap.String()] = struct{}{}
+		f.drawnOrder = append(f.drawnOrder, ap.String())
+	}
+	for len(f.drawnOrder) > f.drawnCap {
+		oldest := f.drawnOrder[0]
+		f.drawnOrder = f.drawnOrder[1:]
+		delete(f.drawn, oldest)
+	}
+}
+
+// drewEndpoint reports whether the addr:port was ever drawn by this factory
+// (see registerDrawn): such a link is by construction factory-owned, whatever
+// the resolver currently answers for the spec host.
+func (f *portFactory) drewEndpoint(ap netip.AddrPort) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drawn == nil {
+		return false
+	}
+	_, ok := f.drawn[ap.String()]
+	return ok
+}
+
+// ownsOrDrew reports whether the addr:port belongs to this factory's link
+// lifecycle: drawn by it at any point, or lying inside one of its currently
+// configured ranges (see ownsEndpoint). The union — never the intersection —
+// is what tombstoning and the learning guard need: a resolver flip must
+// never exempt a previously drawn port, and a spec range change must still
+// cover ports inside the new ranges.
+func (f *portFactory) ownsOrDrew(ap netip.AddrPort) bool {
+	return f.drewEndpoint(ap) || f.ownsEndpoint(ap)
 }
 
 // bindIfReady returns the cached device bind, or nil before the factory has
@@ -161,6 +227,9 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	}
 	f.mu.Lock()
 	f.specs = slices.Clone(specs)
+	// Bounded drawn-port registry sized from the hop policy's recent ring (see
+	// registerDrawn): covers the live window plus the grace horizon.
+	f.drawnCap = max(4*int(policy.Recent), hopDrawnRegistryCap)
 	// Refresh the bind cache on the dispatch loop (see the field comment: the
 	// send path must never acquire the device net write lock).
 	f.bind = n.Device.Bind()
@@ -272,6 +341,7 @@ func (f *portFactory) drawAndMaterialize() {
 	f.current = ap
 	f.lastProbeAt = time.Now()
 	f.mu.Unlock()
+	f.registerDrawn(ap)
 	neigh := f.n.RouterState.GetNeighbour(f.node)
 	if neigh == nil {
 		return
@@ -458,6 +528,7 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	f.current = ap
 	f.lastProbeAt = time.Now()
 	f.mu.Unlock()
+	f.registerDrawn(ap)
 
 	// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
 	// device.net READ lock. Never call n.Device.Bind() here — it takes the
@@ -663,11 +734,19 @@ func (f *portFactory) reconcileLinks() {
 			continue
 		}
 		ap, err := netip.ParseAddrPort(nep.Address)
-		if err != nil || !f.ownsEndpoint(ap) {
+		if err != nil {
+			continue
+		}
+		// The union of the drawn registry and the resolver-based range check:
+		// a link on a port this factory DREW is retired by construction even
+		// when the resolver's answer for the spec host has since changed
+		// (dual-stack round-robin / DDNS) — the resolver alone de-owning it is
+		// exactly how the every-port-still-talking zombies were born.
+		if !f.ownsOrDrew(ap) {
 			continue
 		}
 		nep.MarkExhausted()
-		f.scheduleTombstoneRemoval(nep.Address)
+		f.n.scheduleExhaustedLinkRemoval(f.node, nep.Address)
 		f.n.Log.Debug("port hop: retired carrying link tombstoned", "peer", f.node, "endpoint", nep.Address)
 	}
 }
@@ -850,28 +929,11 @@ func (f *portFactory) findSeedLink(neigh *state.Neighbour, drawn netip.AddrPort,
 	return fallback
 }
 
-// scheduleTombstoneRemoval removes the exhausted link for addr after the
-// tombstone grace period (late pongs still match it until then). Safe to call
-// more than once for the same address: extra runs find nothing to delete.
+// scheduleTombstoneRemoval is the factory's shorthand for the shared
+// exhausted-link removal (grace window, still-exhausted-only safety, see
+// Nylon.scheduleExhaustedLinkRemoval).
 func (f *portFactory) scheduleTombstoneRemoval(addr string) {
-	time.AfterFunc(hopTombstoneGrace, func() {
-		if f.n.Context.Err() != nil {
-			return
-		}
-		f.n.Dispatch(func() error {
-			neigh := f.n.RouterState.GetNeighbour(f.node)
-			if neigh == nil {
-				return nil
-			}
-			for i, ep := range neigh.Eps {
-				if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-					neigh.Eps = slices.Delete(neigh.Eps, i, i+1)
-					break
-				}
-			}
-			return nil
-		})
-	})
+	f.n.scheduleExhaustedLinkRemoval(f.node, addr)
 }
 
 // ensurePortFactories wires a HopSource into every device peer whose
@@ -965,7 +1027,10 @@ func (n *Nylon) hasPortFactory(peer state.NodeId) bool {
 
 // hopOwnedEndpoint reports whether the addr:port lies inside a port range
 // configured for the peer, i.e. a port whose link lifecycle the peer's port
-// factory owns (see handleProbePing's remote-link learning).
+// factory owns — including every port the factory has EVER DRAWN (see
+// portFactory.ownsOrDrew): handleProbePing's remote-link learning must refuse
+// both, or a stale ping from a retired port re-learns an immortal zombie once
+// the retired link's grace removal has run.
 func (n *Nylon) hopOwnedEndpoint(peer state.NodeId, ap netip.AddrPort) bool {
 	n.portHopping.mu.Lock()
 	f, ok := n.portHopping.factories[peer]
@@ -973,7 +1038,7 @@ func (n *Nylon) hopOwnedEndpoint(peer state.NodeId, ap netip.AddrPort) bool {
 	if !ok {
 		return false
 	}
-	return f.ownsEndpoint(ap)
+	return f.ownsOrDrew(ap)
 }
 
 // hopProbeReady reports whether the link with the given address is due for

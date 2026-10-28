@@ -137,11 +137,16 @@ Notes per mode:
 
 A port the node rotates away from is not merely abandoned — the port factory owns the lifecycle of every link on its ports, so the artefacts of an old port are reaped on a schedule:
 
-- the retired carrying link is tombstoned (kept briefly so late probe pongs still match) and removed after a short grace; tombstoned links are never probed and never ranked, so nothing spends packets on the retired port,
-- links inside the factory's port ranges are never *learned* from inbound traffic: a probe ping arriving from a range port that matches no local link is, by construction, a stale rotation artefact — the peer answering or probing through the port you rotated away from. Learning it would create a link the factory cannot retire: it would be probed at the full stock cadence and renewed by every pong, keeping the old port passing traffic forever,
-- the peer's answering and probing follow the **current** carrying port: nylon control traffic (route updates, seqno requests, acks) rides the current port continuously, and its arrivals re-pin the endpoints used for replies and probes — so a retired port is not fed by a stale pin either.
+- the retired carrying link is tombstoned (kept briefly so late probe pongs still match) and removed after a short grace; tombstoned links are never probed and never ranked, so nothing spends packets on the retired port. Tombstoning is decided by the factory's **drawn-port registry** — the memory of every port it has ever drawn — not by re-resolving the endpoint hostname, so a DNS answer change (dual-stack round-robin, a DDNS flip) can never retroactively "de-own" a drawn port and leave its link alive forever,
+- links inside the factory's port ranges are never *learned* from inbound traffic: a probe ping arriving from a range port that matches no local link is, by construction, a stale rotation artefact — the peer answering or probing through the port you rotated away from. Learning it would create a link the factory cannot retire: it would be probed at the full stock cadence and renewed by every pong, keeping the old port passing traffic forever. The guard covers drawn ports from the registry as well, so it holds across DNS flips,
+- on the **receiving side**, the peer's endpoints follow the *current arrival*: the device refreshes its reply endpoint from every authenticated packet (same remote address, new local arrival port → replies switch ports in-step with the rotation, per packet), data arrivals also re-pin the link endpoints used for probing, and when a peer's *source* mapping rotates (per-flow NAT rewrites the external port on every rotation), the freshly learned remote link supersedes the older ones instead of leaving each retired NAT mapping its own immortal probe-pong loop.
 
 On the wire, an old port sees at most a short tail — in-flight packets plus one control-traffic cycle — and then goes fully quiet: the per-port tx/rx rate on your router must drop to zero for every port except the current carrying one, including the very first port the session ever used. A retired port that keeps passing traffic long after rotation is a bug.
+
+Two deployment notes for reading your router's per-port stats:
+
+- the **reply direction** switches ports synchronously with the rotation — a few milliseconds, not a control cycle: if you ever see the server answering through the previous port for seconds after each rotation, that is a bug worth reporting,
+- the peer's *advertised* endpoint (the single-port address in its router entry) is still probed for liveness; those probes ride the same current reply port, so they do not pin a static flow onto the first port of your range. A flow to the peer's advertised port itself (a different 5-tuple destination) is stock behaviour and is unrelated to rotation.
 
 ### Tuning notes
 

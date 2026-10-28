@@ -33,7 +33,7 @@ import (
 // running lossy links (consecutive probe losses) reach the same regime with
 // default tunables.
 func TestTimedRetiredPortsGoQuiet(t *testing.T) {
-	vh, aIdx, bIdx, fwd := portModeRig(t)
+	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
 	// the ignition regime: relaxed probe interval (20s) > tombstone grace (15s)
 	tun := state.DefaultRouterTunables()
