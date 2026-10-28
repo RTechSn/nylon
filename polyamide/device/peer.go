@@ -370,7 +370,38 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 		if changed {
 			peer.udpWindow.Store(DefaultUdpWindow)
 		}
+		return
 	}
+
+	// Port hopping (reply-port symmetry): the remote address is unchanged, so
+	// this is not a roaming decision — but the packet arrived through a NEW
+	// LOCAL PORT of our listen range (the peer rotated its flow onto the next
+	// carrying port). Refresh the stored endpoint to the arrival endpoint so
+	// every reply (data, handshakes, keepalives and the nylon control plane
+	// riding val[0]) leaves through exactly the port the peer's traffic is
+	// currently addressed to. Without this, replies keep egressing from the
+	// port the peer rotated away from until some slower control path moves
+	// the pin — observed on the wire as the server answering through the
+	// previous port for seconds after each rotation.
+	if peer.endpoints.val[0].DstIPPort() == endpoint.DstIPPort() {
+		if peer.endpoints.val[0] != endpoint {
+			peer.endpoints.val[0] = endpoint
+		}
+	}
+}
+
+// CurrentEndpoint returns the endpoint the device currently sends to for this
+// peer (val[0]), or nil when none is set. For range listeners the returned
+// endpoint carries the local reply-port hint of the peer's latest arrival
+// (see SetEndpointFromPacket), making it the freshest endpoint object to
+// originate traffic through.
+func (peer *Peer) CurrentEndpoint() conn.Endpoint {
+	peer.endpoints.Lock()
+	defer peer.endpoints.Unlock()
+	if len(peer.endpoints.val) == 0 {
+		return nil
+	}
+	return peer.endpoints.val[0]
 }
 
 // SetEndpoints configures the endpoints of the peer. The first endpoint will be the default endpoint used for packet routing

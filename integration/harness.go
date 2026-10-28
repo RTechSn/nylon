@@ -81,6 +81,47 @@ type VirtualLink struct {
 	// by tests to assert that port rotation actually happened
 	portsMu   sync.Mutex
 	portsSeen map[uint16]struct{}
+
+	// per-port activity timeline: first/last time a destination port carried
+	// a packet on a range link (forward direction), and first/last time a
+	// source port carried a packet on a reverse (srcAddrMatch) link. The
+	// ground truth for "retired ports must go quiet" assertions: a port whose
+	// carrying window ended but whose lastSeen keeps advancing is a zombie
+	// (still passing traffic long after rotation away).
+	firstSeenFwd map[uint16]time.Time
+	lastSeenFwd  map[uint16]time.Time
+	firstSeenRev map[uint16]time.Time
+	lastSeenRev  map[uint16]time.Time
+}
+
+// PortTimeline describes a port's carrying activity window on a link.
+type PortTimeline struct {
+	First time.Time
+	Last  time.Time
+}
+
+// ForwardTimeline returns the first/last packet times of every destination
+// port that carried packets on a range link (client -> server direction).
+func (v *VirtualLink) ForwardTimeline() map[uint16]PortTimeline {
+	v.portsMu.Lock()
+	defer v.portsMu.Unlock()
+	out := make(map[uint16]PortTimeline, len(v.lastSeenFwd))
+	for p, last := range v.lastSeenFwd {
+		out[p] = PortTimeline{First: v.firstSeenFwd[p], Last: last}
+	}
+	return out
+}
+
+// ReverseTimeline returns the first/last packet times of every source port
+// that carried packets on a reverse link (server -> client direction).
+func (v *VirtualLink) ReverseTimeline() map[uint16]PortTimeline {
+	v.portsMu.Lock()
+	defer v.portsMu.Unlock()
+	out := make(map[uint16]PortTimeline, len(v.lastSeenRev))
+	for p, last := range v.lastSeenRev {
+		out[p] = PortTimeline{First: v.firstSeenRev[p], Last: last}
+	}
+	return out
 }
 
 type flowKey struct {
@@ -150,11 +191,35 @@ func (v *VirtualLink) CarriedPorts() []uint16 {
 
 // observePort records a destination port on a range link.
 func (v *VirtualLink) observePort(port uint16) {
+	now := time.Now()
 	v.portsMu.Lock()
 	if v.portsSeen == nil {
 		v.portsSeen = make(map[uint16]struct{})
 	}
 	v.portsSeen[port] = struct{}{}
+	if v.lastSeenFwd == nil {
+		v.firstSeenFwd = make(map[uint16]time.Time)
+		v.lastSeenFwd = make(map[uint16]time.Time)
+	}
+	if _, ok := v.firstSeenFwd[port]; !ok {
+		v.firstSeenFwd[port] = now
+	}
+	v.lastSeenFwd[port] = now
+	v.portsMu.Unlock()
+}
+
+// observeRevPort records a reply source port on a reverse (srcAddrMatch) link.
+func (v *VirtualLink) observeRevPort(port uint16) {
+	now := time.Now()
+	v.portsMu.Lock()
+	if v.lastSeenRev == nil {
+		v.firstSeenRev = make(map[uint16]time.Time)
+		v.lastSeenRev = make(map[uint16]time.Time)
+	}
+	if _, ok := v.firstSeenRev[port]; !ok {
+		v.firstSeenRev[port] = now
+	}
+	v.lastSeenRev[port] = now
 	v.portsMu.Unlock()
 }
 
@@ -166,6 +231,15 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 	}
 
 	var toIdx int
+	// deliverEp is the endpoint the receiver attributes the packet to. For
+	// range links it carries the arrival port as a hint: the receiver's
+	// device roams onto the hinted endpoint and its replies (and nylon
+	// probe traffic routed through it) return through the same port —
+	// exactly how the real MultiBind answers from the receiving socket.
+	// Without the hint every reply would be synthesized from the last
+	// flow, which hides stale-pin behaviours (see the retired-port
+	// tests).
+	var deliverEp conn.Endpoint = from
 	if v.IsRangeLink() {
 		toIdx = i.cfg.IndexOf(v.dstNode)
 		// record the reply source for the flow so the destination node's
@@ -173,7 +247,9 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 		// mirrors a real range listener answering from the receiving port)
 		i.setFlowSrc(v.dstNode, from, to)
 		v.observePort(netip.AddrPort(to).Port())
+		deliverEp = bindtest.NewHintedEndpoint(from, netip.AddrPort(to).Port())
 	} else if v.srcAddrMatch.IsValid() {
+		v.observeRevPort(netip.AddrPort(from).Port())
 		toIdx = i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
 	} else {
 		toIdx = i.cfg.IndexOf(i.cfg.Endpoints[to.DstToString()])
@@ -191,7 +267,7 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 				return
 			case <-time.After(simLat):
 				//fmt.Printf("delay sent: %s -> %s\n", from.DstToString(), to.DstToString())
-				err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
+				err := i.binds[toIdx].Send([][]byte{pkt[:len]}, deliverEp)
 				if err != nil && !errors.Is(err, net.ErrClosed) {
 					panic(err)
 				}
@@ -199,7 +275,7 @@ func (v *VirtualLink) simulate(pkt []byte, len int, from, to bindtest.ChannelEnd
 		}()
 	} else {
 		//fmt.Printf("sent: %s -> %s\n", from.DstToString(), to.DstToString())
-		err := i.binds[toIdx].Send([][]byte{pkt[:len]}, from)
+		err := i.binds[toIdx].Send([][]byte{pkt[:len]}, deliverEp)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			panic(err)
 		}
@@ -579,8 +655,17 @@ func (i *InMemoryNetwork) Bind(node state.NodeId) conn.Bind {
 					if lenBuf[pi] == 0 {
 						continue
 					}
-					toIp := epBuf[pi].(bindtest.ChannelEndpoint2)
+					toIp, srcHint := bindtest.EndpointDstOf(epBuf[pi])
 					fromIp := epSendMapping(toIp)
+					if srcHint != 0 {
+						// port-hopping reply symmetry: this packet rides a
+						// hinted (range-listener) flow — the reply must originate
+						// from the hinted port, not whatever flow happened to
+						// arrive last
+						if ap := netip.AddrPort(fromIp); ap.Port() != srcHint {
+							fromIp = bindtest.ChannelEndpoint2(netip.AddrPortFrom(ap.Addr(), srcHint))
+						}
+					}
 					i.virtualInternet(slices.Clone(pktBuf[pi]), lenBuf[pi], fromIp, toIp)
 				}
 			}

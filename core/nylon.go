@@ -46,8 +46,14 @@ type Nylon struct {
 	// endpoints from the port pool and materialise them as regular nylon
 	// links, so runtime state stays O(active window) instead of O(range).
 	portHopping struct {
-		mu        sync.Mutex
-		factories map[state.NodeId]*portFactory
+		mu            sync.Mutex
+		factories     map[state.NodeId]*portFactory
+		appliedPolicy string // signature of the last applied hop policy (change detection for the "port hop policy applied" log)
+
+		// hintSigs caches the last adopted data-arrival signature per peer
+		// (see hopAdoptDataArrival): a lock-free read on the TC hot path that
+		// bounds adoption dispatches to one per arrival-port change.
+		hintSigs sync.Map // state.NodeId -> hopArrivalSig
 	}
 
 	// port hopping (server half, listen_mode: nftables): the daemon-owned

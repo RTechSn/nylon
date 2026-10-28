@@ -55,6 +55,7 @@ func TestPortAsEndpointHoppingGate(t *testing.T) {
 	// the client runs the hopping policy: rotate after 12 wire packets,
 	// short cooldown so the 100-port test range never runs dry
 	aIdx := vh.IndexOf("a")
+	vh.Local[aIdx].PortMode = state.HopModeProactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:    uint32ptr(12),
 		CooldownSeconds:  uint32ptr(5),
@@ -161,6 +162,7 @@ func TestPortAsEndpointRangeOnlyHoppingGate(t *testing.T) {
 	// the client runs the hopping policy: rotate after 12 wire packets,
 	// short cooldown so the 100-port test range never runs dry
 	aIdx := vh.IndexOf("a")
+	vh.Local[aIdx].PortMode = state.HopModeProactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:    uint32ptr(12),
 		CooldownSeconds:  uint32ptr(5),
@@ -338,6 +340,7 @@ func TestPortAsEndpointNoGhostLinks(t *testing.T) {
 		bRange+":"+bPorts.String())
 
 	aIdx := vh.IndexOf("a")
+	vh.Local[aIdx].PortMode = state.HopModeProactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:    uint32ptr(12),
 		CooldownSeconds:  uint32ptr(5),

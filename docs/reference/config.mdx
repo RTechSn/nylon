@@ -40,13 +40,26 @@ listen_ports: "" # e.g. "57175-57575"
 # (Linux, CAP_NET_ADMIN; no width ceiling). Requires listen_ports.
 listen_mode: "" # "sockets" | "nftables"; empty = sockets
 
-# Port hopping (client side): rotation policy for peers whose endpoints are
-# configured as port ranges in central.yaml. All fields optional.
+# Port hopping (client side): rotation strategy for peers whose endpoints are
+# configured as port ranges in central.yaml. static (default) pins the first
+# port of the range and never rotates; reactive rotates only when the
+# carrying link is dead or our probes go unanswered; proactive rotates after
+# budget_packets wire packets (required); timed rotates every period_seconds
+# (required). dynamic and auto are reserved for future releases.
+port_mode: "" # "static" | "reactive" | "proactive" | "timed"; empty = static
+
+# Rotation policy knobs; which are meaningful depends on port_mode, knobs the
+# mode does not use are ignored. A port_hopping block without port_mode is a
+# config error (earlier builds rotated by budget implicitly — be explicit).
+# The central router entry (port_mode/port_hopping in central.yaml) overrides
+# these node-level fields wholesale when it sets either.
 port_hopping:
-  budget_packets: 12    # rotate the carrying port after N wire packets
-  recent_ports: 512     # avoid redrawing the last N selected ports
-  cooldown_seconds: 180 # quarantine a retired port for this long
-  candidate_samples: 32 # candidates scored per draw for IP/subnet diversity
+  budget_packets: 12     # proactive: rotate the carrying port after N wire packets
+  period_seconds: 300    # timed: rotate every N seconds (required in timed mode)
+  period_jitter_pct: 10  # timed: random jitter around the period, as % of it (max 50)
+  recent_ports: 512      # avoid redrawing the last N selected ports
+  cooldown_seconds: 180  # quarantine a retired port for this long
+  candidate_samples: 32  # candidates scored per draw for IP/subnet diversity
 
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
@@ -99,10 +112,18 @@ routers:
     endpoints:
       - "alice.example.com:57175" # domain name (re-resolved periodically)
       - "192.168.1.2:57175"       # LAN IP
-      # Port range (port hopping): peers with a port_hopping policy draw
+      # Port range (port hopping): peers with a port hopping policy draw
       # carrying ports from this range instead of pinning one port; the
       # server must accept the whole range (see guides/port-hopping).
       # - "203.0.113.7:30000-40000"
+
+    # Port hopping policy (client half) for THIS router: when set here it
+    # overrides the node's node.yaml port_mode/port_hopping wholesale.
+    # Same semantics as the node-level fields (see node.yaml above).
+    # port_mode: proactive
+    # port_hopping:
+    #   budget_packets: 12
+    #   cooldown_seconds: 180
     prefixes:
       # Static: always advertised at the given metric
       - type: static
