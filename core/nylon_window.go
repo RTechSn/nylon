@@ -123,6 +123,16 @@ type portFactory struct {
 	lastRotationLog time.Time
 	rotationCount   uint64
 
+	// auto_recycle epoch bookkeeping (guarded by mu): how many carrying
+	// endpoints were drawn since the last clean-slate restart and when it
+	// happened. Every recycle journal line carries them as swept=/elapsed=
+	// so a restart is self-evidently preceded by a FULL re-exhaustion of the
+	// range (swept ≈ range size) — back-to-back lines without that context
+	// read like a recycle loop while a ~500-rotation sweep silently unfolded
+	// between them (the per-second rotation summary folds it away).
+	drawsSinceRecycle uint64
+	lastRecycleAt     time.Time
+
 	// drawnPort registry: every address this factory ever drew (bounded FIFO).
 	// Tombstoning and the remote-link learning guard consult it IN ADDITION to
 	// ownsEndpoint, whose address check re-resolves the range spec host
@@ -344,6 +354,7 @@ func (f *portFactory) drawAndMaterialize() {
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
+	f.drawsSinceRecycle++
 	f.mu.Unlock()
 	f.registerDrawn(ap)
 	neigh := f.n.RouterState.GetNeighbour(f.node)
@@ -530,11 +541,27 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 		// into a clean-slate restart — release the retired ports and draw
 		// again instead of stalling on the burned port until the cooldown
 		// elapses. The draw below still avoids the current endpoint.
-		if cleared := f.pool.Recycle(); cleared > 0 {
-			f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine",
-				"peer", f.node, "cleared", cleared)
-			ap, err = f.pool.Select(avoid)
+		cleared := f.pool.Recycle()
+		if cleared > 0 {
+			f.mu.Lock()
+			swept := f.drawsSinceRecycle
+			hadEpoch := !f.lastRecycleAt.IsZero()
+			var elapsed time.Duration
+			if hadEpoch {
+				elapsed = time.Since(f.lastRecycleAt)
+			}
+			f.drawsSinceRecycle = 0
+			f.lastRecycleAt = time.Now()
+			f.mu.Unlock()
+			attrs := []any{"peer", f.node, "cleared", cleared, "swept", swept}
+			if hadEpoch {
+				attrs = append(attrs, "elapsed", elapsed)
+			}
+			f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine", attrs...)
 		}
+		// retry the draw regardless: a concurrent rotation may have won the
+		// recycle (cleared == 0) — the pool is on a clean slate either way
+		ap, err = f.pool.Select(avoid)
 	}
 	if err != nil {
 		f.warnPoolExhausted(err)
@@ -543,6 +570,7 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
+	f.drawsSinceRecycle++
 	f.mu.Unlock()
 	f.registerDrawn(ap)
 

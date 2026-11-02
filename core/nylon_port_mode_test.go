@@ -353,6 +353,9 @@ func TestHopAutoRecycleRestartsExhaustedPool(t *testing.T) {
 	if !strings.Contains(out, "cleared=1") {
 		t.Fatalf("the journal line must carry the released-port count:\n%s", out)
 	}
+	if !strings.Contains(out, "swept=1") {
+		t.Fatalf("the journal line must carry the swept count (draws since the last recycle):\n%s", out)
+	}
 	if strings.Contains(out, "rotation stalled") {
 		t.Fatalf("a successful auto-recycle must not warn about a stall:\n%s", out)
 	}
@@ -399,4 +402,62 @@ func lbTrunc(lb *lockedBuffer) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 	lb.buf.Reset()
+}
+
+// TestHopAutoRecycleFiresOncePerFullSweep pins the auto_recycle epoch
+// contract: a clean-slate restart may only fire after the CURRENT sweep has
+// exhausted the whole range, and the journal line must prove it (swept =
+// range size = cleared). Field report: the pool's random sampling gave up
+// 1-13 ports early, so recycles fired back-to-back while good ports remained
+// and every line read like a loop; with exact exhaustion a 6-port range
+// recycles exactly once per 6 draws, three times in a row.
+func TestHopAutoRecycleFiresOncePerFullSweep(t *testing.T) {
+	lb := &lockedBuffer{}
+	n := newHopFixturesNylonWithLog(t, time.Hour, lb)
+	ip := netip.MustParseAddr("192.168.1.2")
+	const first, last = 30000, 30005
+	const size = int(last - first + 1)
+	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: first, Last: last}}},
+		state.PortPoolConfig{Recent: 512, Cooldown: time.Hour, Samples: 32})
+	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: first, Last: last}}},
+		mode:  state.HopModeProactive}
+	f.mu.Lock()
+	f.autoRecycle = true
+	f.mu.Unlock()
+
+	// bootstrap: draw 1 of epoch 1
+	f.drawAndMaterialize()
+	f.mu.Lock()
+	cur := f.current
+	f.mu.Unlock()
+	ep, err := f.bind.ParseEndpoint(cur.String())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	const epochs = 3
+	for rotation := 1; rotation <= epochs*size; rotation++ {
+		next, err := f.NextHopEndpoint(nil, ep)
+		if err != nil {
+			t.Fatalf("rotation %d: %v", rotation, err)
+		}
+		ep = next
+		wantRecycles := rotation / size
+		if got := strings.Count(lb.String(), "auto-recycle cleared the retired-port quarantine"); got != wantRecycles {
+			t.Fatalf("rotation %d: %d recycle lines so far, want %d (one per full sweep):\n%s",
+				rotation, got, wantRecycles, lb.String())
+		}
+	}
+
+	out := lb.String()
+	if got := strings.Count(out, "swept=6"); got != epochs {
+		t.Fatalf("every recycle line must report swept=%d (a full re-exhaustion before the restart), got %d:\n%s", size, got, out)
+	}
+	if got := strings.Count(out, "cleared=6"); got != epochs {
+		t.Fatalf("every recycle line must report cleared=%d, got %d:\n%s", size, got, out)
+	}
+	if strings.Contains(out, "rotation stalled") {
+		t.Fatalf("a successful auto-recycle must never warn about a stall:\n%s", out)
+	}
 }
