@@ -104,11 +104,10 @@ type portFactory struct {
 
 	// rotation policy (refreshed by ensurePortFactories on every pass); the
 	// mode governs WHEN the carrying endpoint rotates (see state.HopMode*)
-	mode        string        // static | reactive | proactive | timed
-	period      time.Duration // timed: nominal rotation interval
-	jitterPct   uint32        // timed: jitter as a percentage of period
-	nextRotate  time.Time     // timed: deadline of the next scheduled rotation (zero = not scheduled)
-	autoRecycle bool          // proactive auto_recycle: clear the retirement quarantine when the pool runs dry
+	mode       string        // static | reactive | proactive | timed
+	period     time.Duration // timed: nominal rotation interval
+	jitterPct  uint32        // timed: jitter as a percentage of period
+	nextRotate time.Time     // timed: deadline of the next scheduled rotation (zero = not scheduled)
 	// rotateReason decorates the next rotation's log line when the rotation
 	// is externally driven (reactive/timed); consumed by logRotation.
 	rotateReason string
@@ -123,13 +122,16 @@ type portFactory struct {
 	lastRotationLog time.Time
 	rotationCount   uint64
 
-	// auto_recycle epoch bookkeeping (guarded by mu): how many carrying
+	// recycle_seconds epoch bookkeeping (guarded by mu): how many carrying
 	// endpoints were drawn since the last clean-slate restart and when it
-	// happened. Every recycle journal line carries them as swept=/elapsed=
-	// so a restart is self-evidently preceded by a FULL re-exhaustion of the
-	// range (swept ≈ range size) — back-to-back lines without that context
-	// read like a recycle loop while a ~500-rotation sweep silently unfolded
-	// between them (the per-second rotation summary folds it away).
+	// happened; recycleMin (the resolved port_hopping.recycle_seconds) is
+	// the rate limit between restarts. Every recycle journal line carries
+	// the epoch as swept=/elapsed= so a restart is self-evidently preceded
+	// by a FULL re-exhaustion of the range (swept ≈ range size) —
+	// back-to-back lines without that context read like a recycle loop
+	// while a ~500-rotation sweep silently unfolded between them (the
+	// per-second rotation summary folds it away).
+	recycleMin        time.Duration
 	drawsSinceRecycle uint64
 	lastRecycleAt     time.Time
 
@@ -271,7 +273,7 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	f.mode = policy.Mode
 	f.period = policy.Period
 	f.jitterPct = policy.JitterPct
-	f.autoRecycle = policy.AutoRecycle
+	f.recycleMin = policy.RecycleMinInterval
 	f.devPeer = wgPeer
 	// a live change of cooldown_seconds applies without a restart
 	f.pool.SetCooldown(policy.Cooldown)
@@ -552,39 +554,33 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 	f.mu.Lock()
 	avoid := make([]netip.AddrPort, 0, 1)
-	autoRecycle := f.autoRecycle
 	if f.current.IsValid() {
 		avoid = append(avoid, f.current)
 	}
 	f.mu.Unlock()
 
 	ap, err := f.pool.Select(avoid)
-	if err != nil && autoRecycle {
-		// auto_recycle: every port is cooling down and the operator opted
-		// into a clean-slate restart — release the retired ports and draw
-		// again instead of stalling on the burned port until the cooldown
-		// elapses. The draw below still avoids the current endpoint.
-		cleared := f.pool.Recycle()
-		if cleared > 0 {
-			f.mu.Lock()
-			swept := f.drawsSinceRecycle
-			hadEpoch := !f.lastRecycleAt.IsZero()
-			var elapsed time.Duration
-			if hadEpoch {
-				elapsed = time.Since(f.lastRecycleAt)
+	if err != nil {
+		// recycle_seconds: every port is cooling down and the operator
+		// opted into clean-slate restarts — release the retired ports and
+		// draw again instead of stalling on the burned port until the
+		// cooldown elapses. The gate rate-limits restarts to once per the
+		// configured interval; the draw below still avoids the current
+		// endpoint.
+		if swept, elapsed, hadEpoch, ok := f.recycleGate(); ok {
+			cleared := f.pool.Recycle()
+			if cleared > 0 {
+				attrs := []any{"peer", f.node, "cleared", cleared, "swept", swept}
+				if hadEpoch {
+					attrs = append(attrs, "elapsed", elapsed)
+				}
+				f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine", attrs...)
 			}
-			f.drawsSinceRecycle = 0
-			f.lastRecycleAt = time.Now()
-			f.mu.Unlock()
-			attrs := []any{"peer", f.node, "cleared", cleared, "swept", swept}
-			if hadEpoch {
-				attrs = append(attrs, "elapsed", elapsed)
-			}
-			f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine", attrs...)
+			// retry the draw regardless: a concurrent rotation may have
+			// won the recycle (cleared == 0) — the pool is on a clean
+			// slate either way
+			ap, err = f.pool.Select(avoid)
 		}
-		// retry the draw regardless: a concurrent rotation may have won the
-		// recycle (cleared == 0) — the pool is on a clean slate either way
-		ap, err = f.pool.Select(avoid)
 	}
 	if err != nil {
 		f.warnPoolExhausted(err)
@@ -666,6 +662,39 @@ func (f *portFactory) logRotation(ap netip.AddrPort) {
 	}
 	f.mu.Unlock()
 	f.n.Log.Debug("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String())
+}
+
+// recycleGate decides and atomically claims the opt-in auto-recycle
+// (port_hopping.recycle_seconds, resolved onto the factory as recycleMin):
+// when the pool has run dry and the configured interval has elapsed since
+// the previous restart, it consumes the recycle epoch — the swept=/elapsed=
+// journal context — under mu and reports ok; the caller then performs the
+// wholesale quarantine swap and retries the draw. A zero recycleMin never
+// grants (the stock stall-and-warn behaviour); a refusal inside the
+// interval leaves the epoch untouched, so the context is not lost.
+//
+// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
+// device.net READ lock. The granted swap itself is PortPool.Recycle — one
+// map replacement under the pool lock, O(1) — and the gate only takes f.mu
+// briefly. Never do per-port work, dispatch, resolve or touch the device
+// from here: a field-reported recycle that swept the quarantine per port
+// on the send path is long enough to wedge the factory against the
+// dispatch loop.
+func (f *portFactory) recycleGate() (swept uint64, elapsed time.Duration, hadEpoch, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now()
+	if f.recycleMin <= 0 || now.Sub(f.lastRecycleAt) < f.recycleMin {
+		return 0, 0, false, false
+	}
+	swept = f.drawsSinceRecycle
+	hadEpoch = !f.lastRecycleAt.IsZero()
+	if hadEpoch {
+		elapsed = now.Sub(f.lastRecycleAt)
+	}
+	f.drawsSinceRecycle = 0
+	f.lastRecycleAt = now
+	return swept, elapsed, hadEpoch, true
 }
 
 // warnPoolExhausted reports (rate-limited) that rotation is stalled because
@@ -1030,7 +1059,7 @@ func (n *Nylon) ensurePortFactories() error {
 	// log the active policy whenever it changes (startup, config update,
 	// mode switch): the mode is a fleet-level decision and deserves its own
 	// line in the journal
-	sig := fmt.Sprintf("%s|%d|%s|%d|%t|%s", policy.Mode, policy.Budget, policy.Period, policy.JitterPct, policy.AutoRecycle, policy.Cooldown)
+	sig := fmt.Sprintf("%s|%d|%s|%d|%s|%s", policy.Mode, policy.Budget, policy.Period, policy.JitterPct, policy.RecycleMinInterval, policy.Cooldown)
 	n.portHopping.mu.Lock()
 	policyChanged := sig != n.portHopping.appliedPolicy
 	n.portHopping.appliedPolicy = sig
@@ -1040,12 +1069,14 @@ func (n *Nylon) ensurePortFactories() error {
 		switch policy.Mode {
 		case state.HopModeProactive:
 			attrs = append(attrs, "budget", policy.Budget,
-				"cooldown", policy.Cooldown.String(), "auto_recycle", policy.AutoRecycle)
+				"cooldown", policy.Cooldown.String(), "recycle_seconds", policy.RecycleMinInterval.String())
 		case state.HopModeTimed:
 			attrs = append(attrs, "period", policy.Period.String(),
-				"jitter_pct", policy.JitterPct, "cooldown", policy.Cooldown.String())
+				"jitter_pct", policy.JitterPct, "cooldown", policy.Cooldown.String(),
+				"recycle_seconds", policy.RecycleMinInterval.String())
 		case state.HopModeReactive:
-			attrs = append(attrs, "cooldown", policy.Cooldown.String())
+			attrs = append(attrs, "cooldown", policy.Cooldown.String(),
+				"recycle_seconds", policy.RecycleMinInterval.String())
 		}
 		n.Log.Info("port hop policy applied", attrs...)
 	}

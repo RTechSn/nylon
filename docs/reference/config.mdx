@@ -62,7 +62,7 @@ port_hopping:
   recent_ports: 512      # avoid redrawing the last N selected ports
   cooldown_seconds: 180  # quarantine a retired port for this long (default 180s; at least the middlebox's per-flow recovery time). A live change applies without a restart: a shortened window also releases already-quarantined ports
   candidate_samples: 32  # candidates scored per draw for IP/subnet diversity
-  auto_recycle: false    # proactive: when every port is cooling down (pool exhausted), clear the retirement quarantine and start a fresh sweep instead of stalling on the burned port
+  recycle_seconds: 0     # opt-in auto-recycle: when every port is cooling down (pool exhausted), clear the retirement quarantine and restart the sweep, at most once per this many seconds (0 = off: stall until the cooldown elapses); applies to every rotating mode
 
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
@@ -127,7 +127,7 @@ routers:
     # port_hopping:
     #   budget_packets: 12
     #   cooldown_seconds: 180
-    #   auto_recycle: true
+    #   recycle_seconds: 1
     prefixes:
       # Static: always advertised at the given metric
       - type: static

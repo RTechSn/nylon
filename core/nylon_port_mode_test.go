@@ -334,10 +334,10 @@ func TestHopAutoRecycleRestartsExhaustedPool(t *testing.T) {
 		t.Fatalf("pool exhaustion must be warned:\n%s", lb.String())
 	}
 
-	// auto_recycle on: the quarantine is cleared and the sweep restarts
+	// recycle_seconds on: the quarantine is cleared and the sweep restarts
 	lbTrunc(lb)
 	f.mu.Lock()
-	f.autoRecycle = true
+	f.recycleMin = time.Hour
 	f.mu.Unlock()
 	ep, err := f.NextHopEndpoint(nil, cur)
 	if err != nil {
@@ -423,7 +423,11 @@ func TestHopAutoRecycleFiresOncePerFullSweep(t *testing.T) {
 		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: first, Last: last}}},
 		mode:  state.HopModeProactive}
 	f.mu.Lock()
-	f.autoRecycle = true
+	// a nanosecond floor never refuses a recycle here: six draws take
+	// microseconds, so each epoch is older than the interval by the time
+	// the next one exhausts. The refusal path (the rate limit holding)
+	// is pinned separately by TestHopAutoRecycleClearsQuarantine.
+	f.recycleMin = time.Nanosecond
 	f.mu.Unlock()
 
 	// bootstrap: draw 1 of epoch 1

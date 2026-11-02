@@ -15,12 +15,14 @@ import (
 	"github.com/encodeous/nylon/state"
 )
 
-func boolptr(v bool) *bool { return &v }
-
 // stormTestRange is the server's port range for the rotation-storm stress
-// tests: small enough that a hot storm sweeps it many times per second with
-// auto_recycle, large enough that sweeps are not degenerate.
-var stormTestRange = conn.PortRange{First: 30000, Last: 30049}
+// tests. It is sized against the storm's rotation rate: a full sweep takes
+// range_ports / rotation_rate, and with recycle_seconds=1 the recycle rate
+// limit must never refuse a genuine full-sweep exhaustion mid-storm — at
+// ~450 rotations/s (healthy-storm) and ~2000 rotations/s (blackout storm)
+// a 4096-port range sweeps in ~9s and ~2s respectively, both comfortably
+// past the 1 s floor, so the storms rotate continuously as intended.
+var stormTestRange = conn.PortRange{First: 30000, Last: 30000 + 4095}
 
 // stormRig builds the same shape as portModeRig but with the storm-test range.
 func stormRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink, *VirtualLink) {
@@ -68,7 +70,7 @@ func TestProactiveStormKeepsDispatchHealthy(t *testing.T) {
 		BudgetPackets:   uint32ptr(2),
 		RecentPorts:     uint32ptr(8),
 		CooldownSeconds: uint32ptr(180),
-		AutoRecycle:     boolptr(true),
+		RecycleSeconds:  uint32ptr(1),
 	}
 
 	errs := vh.Start()
@@ -114,9 +116,11 @@ func TestProactiveStormKeepsDispatchHealthy(t *testing.T) {
 	// carrying endpoint materialise before the storm starts.
 	time.Sleep(2 * time.Second)
 
-	// storm: 2 x 1000 pkt/s, budget 2 -> ~500 rotations/s; the 50-port range
-	// is swept and auto-recycled ~10x per second (the operator's regime, an
-	// order of magnitude harsher: 500 ports at ~650 rotations/s).
+	// storm: 2 x 1000 pkt/s, budget 2 -> ~500 rotations/s; the 4096-port
+	// range is swept roughly once per ~8 s of storm (the operator's regime:
+	// ~500 ports swept every ~0.8 s at ~650 rotations/s — here the sweep is
+	// slower but the rotation rate, which is what loads the control plane,
+	// matches and exceeds it).
 	const runLen = 12 * time.Second
 	dropsAtStart := perf.DispatchDropsTotal.Load()
 	deadline := time.Now().Add(runLen)
@@ -204,7 +208,7 @@ func TestStormSurvivesDispatchBlackout(t *testing.T) {
 		BudgetPackets:   uint32ptr(1),
 		RecentPorts:     uint32ptr(8),
 		CooldownSeconds: uint32ptr(180),
-		AutoRecycle:     boolptr(true),
+		RecycleSeconds:  uint32ptr(1),
 	}
 
 	errs := vh.Start()

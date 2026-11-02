@@ -219,7 +219,8 @@ type PortHoppingCfg struct {
 	RecentPorts      *uint32 `yaml:"recent_ports,omitempty"`      // avoid reusing the last N selected endpoints
 	CooldownSeconds  *uint32 `yaml:"cooldown_seconds,omitempty"`  // quarantine a retired port for this long
 	CandidateSamples *uint32 `yaml:"candidate_samples,omitempty"` // candidates sampled per selection for diversity scoring
-	AutoRecycle      *bool   `yaml:"auto_recycle,omitempty"`      // proactive: when every port is cooling down (pool exhausted), clear the retirement quarantine and start a fresh sweep instead of stalling
+	RecycleSeconds   *uint32 `yaml:"recycle_seconds,omitempty"`   // opt-in auto-recycle: when the pool exhausts, clear the retirement quarantine so rotation resumes immediately, at most once per this many seconds (0/absent = stock behaviour: stall until a cooldown elapses and warn)
+	AutoRecycle      *bool   `yaml:"auto_recycle,omitempty"`      // Deprecated: interim-PR knob replaced by recycle_seconds; parse-only, so a leftover key fails validation with an actionable error instead of being silently ignored
 }
 
 // PortHoppingPolicy is the resolved, always-set form of PortHoppingCfg.
@@ -232,7 +233,12 @@ type PortHoppingPolicy struct {
 	Recent           uint32
 	Cooldown         time.Duration
 	CandidateSamples uint32
-	AutoRecycle      bool // clear the retired-port quarantine when the pool runs dry (see PortHoppingCfg.AutoRecycle)
+	// RecycleMinInterval is the resolved port_hopping.recycle_seconds:
+	// when the pool exhausts, the retired-port quarantine is cleared so
+	// rotation resumes immediately, rate-limited to once per this
+	// interval. Zero keeps the stock behaviour (rotation stalls until a
+	// cooldown elapses). See PortHoppingCfg.RecycleSeconds.
+	RecycleMinInterval time.Duration
 }
 
 // DefaultPortHoppingPolicy returns the worst-case defaults: the budget stays
@@ -249,7 +255,6 @@ func DefaultPortHoppingPolicy() PortHoppingPolicy {
 		Recent:           512,
 		Cooldown:         3 * time.Minute,
 		CandidateSamples: 32,
-		AutoRecycle:      false,
 	}
 }
 
@@ -278,8 +283,8 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	if c.CandidateSamples != nil && *c.CandidateSamples > 0 {
 		p.CandidateSamples = *c.CandidateSamples
 	}
-	if c.AutoRecycle != nil {
-		p.AutoRecycle = *c.AutoRecycle
+	if c.RecycleSeconds != nil && *c.RecycleSeconds > 0 {
+		p.RecycleMinInterval = time.Duration(*c.RecycleSeconds) * time.Second
 	}
 	return p
 }
@@ -338,6 +343,9 @@ func ValidateHopPolicyCfg(mode string, cfg *PortHoppingCfg, where string) error 
 		}
 	}
 	if cfg != nil {
+		if cfg.AutoRecycle != nil {
+			return fmt.Errorf("%s: port_hopping.auto_recycle was replaced by recycle_seconds — it restarted the sweep unconditionally on every pool exhaustion; set recycle_seconds: N to restart at most once per N seconds, or drop the key for the stock stall-until-cooldown behaviour", where)
+		}
 		if cfg.PeriodSeconds != nil && *cfg.PeriodSeconds == 0 {
 			return fmt.Errorf("%s: port_hopping.period_seconds must be greater than 0 (or omitted)", where)
 		}

@@ -92,6 +92,7 @@ func TestValidateHopPolicyCfgMatrix(t *testing.T) {
 		{"proactive without block", HopModeProactive, nil, "requires port_hopping.budget_packets"},
 		{"proactive without budget", HopModeProactive, &PortHoppingCfg{CooldownSeconds: hopStr(5)}, "requires port_hopping.budget_packets"},
 		{"proactive with budget", HopModeProactive, &PortHoppingCfg{BudgetPackets: hopStr(12)}, ""},
+		{"proactive with legacy auto_recycle", HopModeProactive, &PortHoppingCfg{BudgetPackets: hopStr(12), AutoRecycle: hopBool(true)}, "auto_recycle was replaced by recycle_seconds"},
 		{"timed without block", HopModeTimed, nil, "requires port_hopping.period_seconds"},
 		{"timed without period", HopModeTimed, &PortHoppingCfg{BudgetPackets: hopStr(12)}, "requires port_hopping.period_seconds"},
 		{"timed with period", HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(300)}, ""},
@@ -251,37 +252,42 @@ func TestValidateHopMode(t *testing.T) {
 	}
 }
 
-// TestHopAutoRecycleParsingAndResolve pins the auto_recycle knob surface:
-// parsed on both config levels, defaulted off, resolved into the policy.
-func TestHopAutoRecycleParsingAndResolve(t *testing.T) {
+// TestHopRecycleSecondsParsingAndResolve pins the recycle_seconds knob
+// surface: parsed on both config levels, defaulted off, resolved into the
+// policy's rate limit, and the interim auto_recycle key rejected with an
+// actionable error instead of being silently ignored.
+func TestHopRecycleSecondsParsingAndResolve(t *testing.T) {
 	const nodeYaml = `
 id: node1
 port: 30000
 port_hopping_mode: proactive
 port_hopping:
   budget_packets: 24
-  auto_recycle: true
+  recycle_seconds: 7
 `
 	var node LocalCfg
 	if err := yaml.Unmarshal([]byte(nodeYaml), &node); err != nil {
 		t.Fatalf("node yaml: %v", err)
 	}
-	if node.PortHopping == nil || node.PortHopping.AutoRecycle == nil || !*node.PortHopping.AutoRecycle {
-		t.Fatalf("auto_recycle not parsed: %+v", node.PortHopping)
+	if node.PortHopping == nil || node.PortHopping.RecycleSeconds == nil || *node.PortHopping.RecycleSeconds != 7 {
+		t.Fatalf("recycle_seconds not parsed: %+v", node.PortHopping)
 	}
 	p := node.PortHopping.Resolve()
-	if !p.AutoRecycle {
-		t.Fatalf("auto_recycle not resolved: %+v", p)
+	if p.RecycleMinInterval != 7*time.Second {
+		t.Fatalf("recycle_seconds not resolved: %+v", p)
 	}
 	if p.Cooldown != 3*time.Minute {
 		t.Fatalf("default cooldown drifted: %v", p.Cooldown)
 	}
 
-	// default: off
-	if (&PortHoppingCfg{}).Resolve().AutoRecycle {
-		t.Fatal("auto_recycle must default to off")
+	// default and explicit zero: off
+	if p := (&PortHoppingCfg{}).Resolve(); p.RecycleMinInterval != 0 {
+		t.Fatal("recycle_seconds must default to off")
 	}
-	if DefaultPortHoppingPolicy().AutoRecycle {
+	if p := (&PortHoppingCfg{RecycleSeconds: hopStr(0)}).Resolve(); p.RecycleMinInterval != 0 {
+		t.Fatal("recycle_seconds: 0 must resolve to off")
+	}
+	if p := DefaultPortHoppingPolicy(); p.RecycleMinInterval != 0 {
 		t.Fatal("the default policy must not auto-recycle")
 	}
 
@@ -289,10 +295,32 @@ port_hopping:
 	central := &RouterCfg{
 		NodeCfg:         NodeCfg{Id: "n1"},
 		PortHoppingMode: HopModeProactive,
-		PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(12), AutoRecycle: hopBool(true), CooldownSeconds: hopStr(45)},
+		PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(12), RecycleSeconds: hopStr(60), CooldownSeconds: hopStr(45)},
 	}
 	pol, src := ResolveHopPolicy(central, &LocalCfg{})
-	if src != "central" || !pol.AutoRecycle || pol.Cooldown != 45*time.Second {
-		t.Fatalf("central auto_recycle policy: %+v source=%q", pol, src)
+	if src != "central" || pol.RecycleMinInterval != time.Minute || pol.Cooldown != 45*time.Second {
+		t.Fatalf("central recycle_seconds policy: %+v source=%q", pol, src)
+	}
+
+	// the interim auto_recycle key parses (so it can be detected) but fails
+	// validation with the replacement spelled out
+	const legacyYaml = `
+id: node1
+port: 30000
+port_hopping_mode: proactive
+port_hopping:
+  budget_packets: 24
+  auto_recycle: true
+`
+	var legacy LocalCfg
+	if err := yaml.Unmarshal([]byte(legacyYaml), &legacy); err != nil {
+		t.Fatalf("legacy yaml: %v", err)
+	}
+	if legacy.PortHopping == nil || legacy.PortHopping.AutoRecycle == nil {
+		t.Fatalf("legacy auto_recycle not parsed: %+v", legacy.PortHopping)
+	}
+	err := ValidateHopPolicyCfg(legacy.PortHoppingMode, legacy.PortHopping, "node config")
+	if err == nil || !strings.Contains(err.Error(), "auto_recycle was replaced by recycle_seconds") {
+		t.Fatalf("legacy auto_recycle must fail validation with the replacement named, got: %v", err)
 	}
 }
