@@ -218,6 +218,27 @@ func (f *portFactory) bindIfReady() conn.Bind {
 // hopFactories returns (creating if needed) the factory for a peer. Must be
 // called on the dispatch loop.
 func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, policy state.PortHoppingPolicy, wgPeer *device.Peer) *portFactory {
+	// CAUTION: the device bind must be acquired BEFORE any factory lock. The
+	// packet send path (Peer.SendBuffers) holds the device net lock in READ
+	// mode across its whole body — including the factory mutex sections inside
+	// NextHopEndpoint — so acquiring the net WRITE lock (Device.Bind) while
+	// holding f.mu inverts the lock order against the send path:
+	//
+	//      dispatch loop:  f.mu -> net.WLock
+	//      send path:      net.RLock -> f.mu
+	//
+	// Whenever the two align, the dispatch loop parks waiting for the write
+	// lock that only the sender can grant (by dropping its read lock), while
+	// the sender parks waiting for f.mu that the dispatch loop holds: a
+	// permanent deadlock with an idle CPU. The window is microseconds in
+	// steady state, but anything that keeps a sender inside its net READ lock
+	// for longer (a pool-exhaustion scan, lock contention under a rotation
+	// storm) widens it to near-certainty — and every dispatch after the freeze
+	// is discarded, so no link is ever materialised again. Taking the bind
+	// first, with no factory lock held, removes the inversion: the sender can
+	// always finish its f.mu section and release the read lock.
+	bind := n.Device.Bind()
+
 	n.portHopping.mu.Lock()
 	defer n.portHopping.mu.Unlock()
 	if n.portHopping.factories == nil {
@@ -242,8 +263,10 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	// registerDrawn): covers the live window plus the grace horizon.
 	f.drawnCap = max(4*int(policy.Recent), hopDrawnRegistryCap)
 	// Refresh the bind cache on the dispatch loop (see the field comment: the
-	// send path must never acquire the device net write lock).
-	f.bind = n.Device.Bind()
+	// send path must never acquire the device net write lock). The bind was
+	// acquired above, OUTSIDE every factory lock — see the CAUTION at the top
+	// of this function.
+	f.bind = bind
 	modeChanged := f.mode != policy.Mode
 	f.mode = policy.Mode
 	f.period = policy.Period
