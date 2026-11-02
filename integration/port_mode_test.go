@@ -69,7 +69,7 @@ func portModeDeliveries(vh *VirtualHarness) (*atomic.Int64, *atomic.Int64, chan 
 func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
 	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
-	vh.Local[aIdx].PortMode = state.HopModeStatic
+	vh.Local[aIdx].PortHoppingMode = state.HopModeStatic
 	// an explicitly configured budget is meaningless in static mode and must
 	// be ignored (not rejected) per the config contract
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
@@ -124,7 +124,7 @@ func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
 func TestPortModeTimedRotatesOnSchedule(t *testing.T) {
 	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
-	vh.Local[aIdx].PortMode = state.HopModeTimed
+	vh.Local[aIdx].PortHoppingMode = state.HopModeTimed
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		PeriodSeconds:   uint32ptr(2),
 		PeriodJitterPct: uint32ptr(0),
@@ -194,7 +194,7 @@ func TestPortModeReactiveRotatesOnDeadCarryingLink(t *testing.T) {
 	tun.LinkDeadThreshold = 2 * time.Second
 	vh.Tunables = &tun
 
-	vh.Local[aIdx].PortMode = state.HopModeReactive
+	vh.Local[aIdx].PortHoppingMode = state.HopModeReactive
 	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
 		CooldownSeconds: uint32ptr(2),
 		RecentPorts:     uint32ptr(32),

@@ -54,7 +54,7 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	} else if node.ListenMode != "" && node.ListenMode != ListenModeSockets {
 		return fmt.Errorf("listen_mode %q requires listen_ports to be set", node.ListenMode)
 	}
-	if err := ValidateHopPolicyCfg(node.PortMode, node.PortHopping, "node config"); err != nil {
+	if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, "node config"); err != nil {
 		return err
 	}
 	if node.PortHopping != nil {
@@ -212,7 +212,7 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 				return fmt.Errorf("router %s has invalid endpoint: %w", node.Id, err)
 			}
 		}
-		if err := ValidateHopPolicyCfg(node.PortMode, node.PortHopping, fmt.Sprintf("router %s", node.Id)); err != nil {
+		if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, fmt.Sprintf("router %s", node.Id)); err != nil {
 			return err
 		}
 		nodes = append(nodes, string(node.Id))

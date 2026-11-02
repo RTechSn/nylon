@@ -70,10 +70,10 @@ type NodeCfg struct {
 
 // RouterCfg represents a central representation of a node that can route
 type RouterCfg struct {
-	NodeCfg     `yaml:",inline"`
-	Endpoints   []string
-	PortMode    string          `yaml:"port_mode,omitempty"`    // client-side port rotation strategy for range endpoints (static|reactive|proactive|timed); wins wholesale over node.yaml
-	PortHopping *PortHoppingCfg `yaml:"port_hopping,omitempty"` // client-side rotation policy knobs (mode-dependent); wins wholesale over node.yaml
+	NodeCfg         `yaml:",inline"`
+	Endpoints       []string
+	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"` // client-side port rotation strategy for range endpoints (static|reactive|proactive|timed); wins wholesale over node.yaml
+	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`      // client-side rotation policy knobs (mode-dependent); wins wholesale over node.yaml
 }
 type ClientCfg struct {
 	NodeCfg `yaml:",inline"`
@@ -154,7 +154,7 @@ type TunablesOverrides struct {
 	HopCost                    *uint32        `yaml:"hop_cost,omitempty"`
 }
 
-// Port rotation modes (port_mode) decide WHEN the carrying endpoint of a
+// Port rotation modes (port_hopping_mode) decide WHEN the carrying endpoint of a
 // range-configured peer changes. The mode governs the node's OUTGOING
 // connections (the client half of port hopping); the listen half
 // (listen_ports/listen_mode) is orthogonal and serves other nodes' rotation
@@ -184,17 +184,17 @@ const (
 	HopModeAuto    = "auto"    // automatic mode switching by connection conditions
 )
 
-// HopModes lists the implemented port_mode values.
+// HopModes lists the implemented port_hopping_mode values.
 func HopModes() []string {
 	return []string{HopModeStatic, HopModeReactive, HopModeProactive, HopModeTimed}
 }
 
-// ReservedHopModes lists the port_mode values reserved for future branches.
+// ReservedHopModes lists the port_hopping_mode values reserved for future branches.
 func ReservedHopModes() []string {
 	return []string{HopModeDynamic, HopModeAuto}
 }
 
-// ValidateHopMode checks a port_mode value: implemented modes pass,
+// ValidateHopMode checks a port_hopping_mode value: implemented modes pass,
 // reserved names get a dedicated not-yet-implemented error, anything else
 // is unknown.
 func ValidateHopMode(mode string) error {
@@ -202,15 +202,15 @@ func ValidateHopMode(mode string) error {
 		return nil
 	}
 	if slices.Contains(ReservedHopModes(), mode) {
-		return fmt.Errorf("port_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, HopModes())
+		return fmt.Errorf("port_hopping_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, HopModes())
 	}
-	return fmt.Errorf("unknown port_mode %q (want one of %v)", mode, HopModes())
+	return fmt.Errorf("unknown port_hopping_mode %q (want one of %v)", mode, HopModes())
 }
 
 // PortHoppingCfg is the client-side port rotation policy for peers whose
 // endpoints are configured with port ranges. Nil values keep the built-in
 // defaults (see DefaultPortHoppingPolicy). Which knobs are meaningful
-// depends on the configured port_mode; knobs the mode does not use are
+// depends on the configured port_hopping_mode; knobs the mode does not use are
 // ignored.
 type PortHoppingCfg struct {
 	BudgetPackets    *uint32 `yaml:"budget_packets,omitempty"`    // proactive: rotate the carrying port after N wire packets (worst-case per-flow budget)
@@ -219,6 +219,7 @@ type PortHoppingCfg struct {
 	RecentPorts      *uint32 `yaml:"recent_ports,omitempty"`      // avoid reusing the last N selected endpoints
 	CooldownSeconds  *uint32 `yaml:"cooldown_seconds,omitempty"`  // quarantine a retired port for this long
 	CandidateSamples *uint32 `yaml:"candidate_samples,omitempty"` // candidates sampled per selection for diversity scoring
+	AutoRecycle      *bool   `yaml:"auto_recycle,omitempty"`      // proactive: when every port is cooling down (pool exhausted), clear the retirement quarantine and start a fresh sweep instead of stalling
 }
 
 // PortHoppingPolicy is the resolved, always-set form of PortHoppingCfg.
@@ -231,6 +232,7 @@ type PortHoppingPolicy struct {
 	Recent           uint32
 	Cooldown         time.Duration
 	CandidateSamples uint32
+	AutoRecycle      bool // clear the retired-port quarantine when the pool runs dry (see PortHoppingCfg.AutoRecycle)
 }
 
 // DefaultPortHoppingPolicy returns the worst-case defaults: the budget stays
@@ -247,11 +249,12 @@ func DefaultPortHoppingPolicy() PortHoppingPolicy {
 		Recent:           512,
 		Cooldown:         3 * time.Minute,
 		CandidateSamples: 32,
+		AutoRecycle:      false,
 	}
 }
 
 // Resolve fills unset fields with the defaults. The mode is the static
-// default; ResolveHopPolicy overrides it with the winning source's port_mode.
+// default; ResolveHopPolicy overrides it with the winning source's port_hopping_mode.
 func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	p := DefaultPortHoppingPolicy()
 	if c == nil {
@@ -275,28 +278,31 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	if c.CandidateSamples != nil && *c.CandidateSamples > 0 {
 		p.CandidateSamples = *c.CandidateSamples
 	}
+	if c.AutoRecycle != nil {
+		p.AutoRecycle = *c.AutoRecycle
+	}
 	return p
 }
 
 // ResolveHopPolicy merges the central router entry and the local node config
 // into the effective port rotation policy. The hop policy is atomic per
-// source: when the central router entry sets port_mode or port_hopping, the
+// source: when the central router entry sets port_hopping_mode or port_hopping, the
 // central pair wins wholesale (node.yaml hop fields are ignored), and vice
 // versa; with no hop fields anywhere the static default applies. The second
 // return value names the winning source ("central", "node" or "default") for
 // the journal.
 func ResolveHopPolicy(central *RouterCfg, local *LocalCfg) (PortHoppingPolicy, string) {
-	if central != nil && (central.PortMode != "" || central.PortHopping != nil) {
+	if central != nil && (central.PortHoppingMode != "" || central.PortHopping != nil) {
 		p := central.PortHopping.Resolve()
-		p.Mode = central.PortMode
+		p.Mode = central.PortHoppingMode
 		if p.Mode == "" {
 			p.Mode = HopModeStatic
 		}
 		return p, "central"
 	}
-	if local != nil && (local.PortMode != "" || local.PortHopping != nil) {
+	if local != nil && (local.PortHoppingMode != "" || local.PortHopping != nil) {
 		p := local.PortHopping.Resolve()
-		p.Mode = local.PortMode
+		p.Mode = local.PortHoppingMode
 		if p.Mode == "" {
 			p.Mode = HopModeStatic
 		}
@@ -314,7 +320,7 @@ func ResolveHopPolicy(central *RouterCfg, local *LocalCfg) (PortHoppingPolicy, s
 func ValidateHopPolicyCfg(mode string, cfg *PortHoppingCfg, where string) error {
 	if mode == "" {
 		if cfg != nil {
-			return fmt.Errorf("%s: port_hopping is configured but port_mode is not set; this build requires an explicit mode (earlier builds rotated by packet budget implicitly — set port_mode: proactive to keep that behaviour, or reactive|timed|static)", where)
+			return fmt.Errorf("%s: port_hopping is configured but port_hopping_mode is not set; this build requires an explicit mode (earlier builds rotated by packet budget implicitly — set port_hopping_mode: proactive to keep that behaviour, or reactive|timed|static; the knob was renamed from port_mode)", where)
 		}
 		return nil
 	}
@@ -324,11 +330,11 @@ func ValidateHopPolicyCfg(mode string, cfg *PortHoppingCfg, where string) error 
 	switch mode {
 	case HopModeProactive:
 		if cfg == nil || cfg.BudgetPackets == nil {
-			return fmt.Errorf("%s: port_mode proactive requires port_hopping.budget_packets in the same config file", where)
+			return fmt.Errorf("%s: port_hopping_mode proactive requires port_hopping.budget_packets in the same config file", where)
 		}
 	case HopModeTimed:
 		if cfg == nil || cfg.PeriodSeconds == nil {
-			return fmt.Errorf("%s: port_mode timed requires port_hopping.period_seconds in the same config file", where)
+			return fmt.Errorf("%s: port_hopping_mode timed requires port_hopping.period_seconds in the same config file", where)
 		}
 	}
 	if cfg != nil {
@@ -381,7 +387,7 @@ type LocalCfg struct {
 	Port               uint16                // Address that the data plane can be accessed by
 	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
 	ListenMode         string                `yaml:"listen_mode,omitempty"`          // how listen_ports is served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
-	PortMode           string                `yaml:"port_mode,omitempty"`            // client-side port rotation strategy for range endpoints: static (default) | reactive | proactive | timed
+	PortHoppingMode    string                `yaml:"port_hopping_mode,omitempty"`    // client-side port rotation strategy for range endpoints: static (default) | reactive | proactive | timed
 	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints (mode-dependent knobs)
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface

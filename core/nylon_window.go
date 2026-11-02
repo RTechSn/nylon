@@ -104,10 +104,11 @@ type portFactory struct {
 
 	// rotation policy (refreshed by ensurePortFactories on every pass); the
 	// mode governs WHEN the carrying endpoint rotates (see state.HopMode*)
-	mode       string        // static | reactive | proactive | timed
-	period     time.Duration // timed: nominal rotation interval
-	jitterPct  uint32        // timed: jitter as a percentage of period
-	nextRotate time.Time     // timed: deadline of the next scheduled rotation (zero = not scheduled)
+	mode        string        // static | reactive | proactive | timed
+	period      time.Duration // timed: nominal rotation interval
+	jitterPct   uint32        // timed: jitter as a percentage of period
+	nextRotate  time.Time     // timed: deadline of the next scheduled rotation (zero = not scheduled)
+	autoRecycle bool          // proactive auto_recycle: clear the retirement quarantine when the pool runs dry
 	// rotateReason decorates the next rotation's log line when the rotation
 	// is externally driven (reactive/timed); consumed by logRotation.
 	rotateReason string
@@ -237,7 +238,10 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	f.mode = policy.Mode
 	f.period = policy.Period
 	f.jitterPct = policy.JitterPct
+	f.autoRecycle = policy.AutoRecycle
 	f.devPeer = wgPeer
+	// a live change of cooldown_seconds applies without a restart
+	f.pool.SetCooldown(policy.Cooldown)
 	if modeChanged {
 		if policy.Mode == state.HopModeTimed {
 			// entering timed mode: schedule the first rotation one period from
@@ -514,12 +518,24 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 	f.mu.Lock()
 	avoid := make([]netip.AddrPort, 0, 1)
+	autoRecycle := f.autoRecycle
 	if f.current.IsValid() {
 		avoid = append(avoid, f.current)
 	}
 	f.mu.Unlock()
 
 	ap, err := f.pool.Select(avoid)
+	if err != nil && autoRecycle {
+		// auto_recycle: every port is cooling down and the operator opted
+		// into a clean-slate restart — release the retired ports and draw
+		// again instead of stalling on the burned port until the cooldown
+		// elapses. The draw below still avoids the current endpoint.
+		if cleared := f.pool.Recycle(); cleared > 0 {
+			f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine",
+				"peer", f.node, "cleared", cleared)
+			ap, err = f.pool.Select(avoid)
+		}
+	}
 	if err != nil {
 		f.warnPoolExhausted(err)
 		return nil, err
@@ -573,14 +589,19 @@ func (f *portFactory) staticCarrying() (conn.Endpoint, error) {
 // a rate-limited Info line that counts how many rotations it covers, so a
 // rotation storm shows up as one "rotations=N" line per second instead of N
 // lines. Externally driven rotations (reactive/timed) annotate their line
-// with the reason.
+// with the reason. Reactive rotations are rare, decision-driven events (one
+// per detected carrying-link death) and always get their own immediate Info
+// line — the rate limiter only serves the storm-prone scheduled/budgeted
+// modes.
 func (f *portFactory) logRotation(ap netip.AddrPort) {
 	f.mu.Lock()
 	now := time.Now()
 	f.rotationCount++
 	reason := f.rotateReason
 	f.rotateReason = ""
-	if now.Sub(f.lastRotationLog) >= hopRotationLogInterval {
+	mode := f.mode
+	emit := mode == state.HopModeReactive || now.Sub(f.lastRotationLog) >= hopRotationLogInterval
+	if emit {
 		count := f.rotationCount
 		f.rotationCount = 0
 		f.lastRotationLog = now
@@ -857,10 +878,20 @@ func (f *portFactory) materializeCarrying(neigh *state.Neighbour, ap netip.AddrP
 	addr := ap.String()
 	hadBest := neigh.BestEndpoint() != nil
 
-	for _, ep := range neigh.Eps {
-		if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-			return // already materialized
+	for i, ep := range neigh.Eps {
+		if ep.IsRemote() || ep.AsNylonEndpoint().Address != addr {
+			continue
 		}
+		if !ep.IsExhausted() {
+			return // already materialized and live
+		}
+		// a stale tombstone for this port still lingers inside its grace
+		// window (possible whenever a port is redrawn quickly — e.g. an
+		// auto_recycle restart): replace it with a fresh link so the
+		// carrying port is ranked again
+		neigh.Eps = slices.Delete(neigh.Eps, i, i+1)
+		f.n.Log.Debug("port hop: stale tombstoned link replaced on redraw", "peer", f.node, "endpoint", addr)
+		break
 	}
 	// the cached bind keeps the factory free of the device net lock even
 	// when re-materialising from the dispatch loop
@@ -948,7 +979,7 @@ func (n *Nylon) ensurePortFactories() error {
 	// log the active policy whenever it changes (startup, config update,
 	// mode switch): the mode is a fleet-level decision and deserves its own
 	// line in the journal
-	sig := fmt.Sprintf("%s|%d|%s|%d", policy.Mode, policy.Budget, policy.Period, policy.JitterPct)
+	sig := fmt.Sprintf("%s|%d|%s|%d|%t|%s", policy.Mode, policy.Budget, policy.Period, policy.JitterPct, policy.AutoRecycle, policy.Cooldown)
 	n.portHopping.mu.Lock()
 	policyChanged := sig != n.portHopping.appliedPolicy
 	n.portHopping.appliedPolicy = sig
@@ -957,9 +988,13 @@ func (n *Nylon) ensurePortFactories() error {
 		attrs := []any{"mode", policy.Mode, "source", source}
 		switch policy.Mode {
 		case state.HopModeProactive:
-			attrs = append(attrs, "budget", policy.Budget)
+			attrs = append(attrs, "budget", policy.Budget,
+				"cooldown", policy.Cooldown.String(), "auto_recycle", policy.AutoRecycle)
 		case state.HopModeTimed:
-			attrs = append(attrs, "period", policy.Period.String(), "jitter_pct", policy.JitterPct)
+			attrs = append(attrs, "period", policy.Period.String(),
+				"jitter_pct", policy.JitterPct, "cooldown", policy.Cooldown.String())
+		case state.HopModeReactive:
+			attrs = append(attrs, "cooldown", policy.Cooldown.String())
 		}
 		n.Log.Info("port hop policy applied", attrs...)
 	}

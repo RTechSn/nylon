@@ -83,10 +83,10 @@ routers:
       # used by the stock failover machinery as usual
 ```
 
-2. The client opts in with an explicit `port_mode` (and its policy knobs):
+2. The client opts in with an explicit `port_hopping_mode` (and its policy knobs):
 
 ```yaml title="node.yaml (client)"
-port_mode: proactive    # static | reactive | proactive | timed
+port_hopping_mode: proactive    # static | reactive | proactive | timed
 port_hopping:
   budget_packets: 12   # proactive: rotate the carrying port after N wire packets (default 12)
   period_seconds: 300  # timed: rotate every N seconds (required in timed mode)
@@ -94,11 +94,12 @@ port_hopping:
   recent_ports: 512    # never redraw the last N selected ports (default 512)
   cooldown_seconds: 180 # quarantine a retired port for this long (default 180)
   candidate_samples: 32 # candidates scored per draw for diversity (default 32)
+  auto_recycle: false  # proactive: restart the sweep from a clean slate when the pool runs dry (default false)
 ```
 
 ### Rotation modes
 
-`port_mode` decides **when** the carrying endpoint of a range-configured peer changes. It governs the node's outgoing connections only — the listen half (`listen_ports`/`listen_mode`) is orthogonal, so a hub may serve a wide range while itself running any mode.
+`port_hopping_mode` decides **when** the carrying endpoint of a range-configured peer changes (the knob was renamed from `port_mode` to share the `port_hopping` prefix). It governs the node's outgoing connections only — the listen half (`listen_ports`/`listen_mode`) is orthogonal, so a hub may serve a wide range while itself running any mode.
 
 | Mode | Rotates | Required knobs | When to use |
 | --- | --- | --- | --- |
@@ -114,23 +115,24 @@ The policy can also live in `central.yaml` on the router entry — and when it d
 ```yaml title="central.yaml (excerpt, router entry)"
 routers:
   - id: client-node
-    port_mode: proactive
+    port_hopping_mode: proactive
     port_hopping:
       budget_packets: 12
       cooldown_seconds: 180
+      auto_recycle: true
 ```
 
-Precedence: the central router entry (when it sets `port_mode` or `port_hopping`) overrides the node's `node.yaml` hop fields entirely; otherwise `node.yaml` applies; otherwise the `static` default. The active policy is journaled on every change: `port hop policy applied mode=proactive source=central budget=12`.
+Precedence: the central router entry (when it sets `port_hopping_mode` or `port_hopping`) overrides the node's `node.yaml` hop fields entirely; otherwise `node.yaml` applies; otherwise the `static` default. The active policy is journaled on every change, including the knobs you can tune live: `port hop policy applied mode=proactive source=central budget=12 cooldown=3m0s auto_recycle=true` (timed lines carry `period`/`jitter_pct`/`cooldown`).
 
 ::::caution
-**Migration from pre-`port_mode` builds:** earlier builds rotated by packet budget implicitly whenever `port_hopping` was set. This build refuses to guess: a `port_hopping` block without a `port_mode` (in the same file) fails validation with an explanation. Add `port_mode: proactive` to keep the previous behaviour.
+**Migration from pre-`port_mode` builds:** earlier builds rotated by packet budget implicitly whenever `port_hopping` was set. This build refuses to guess: a `port_hopping` block without a `port_hopping_mode` (in the same file) fails validation with an explanation. Add `port_hopping_mode: proactive` to keep the previous behaviour — and if you are coming from an interim build that used the short name `port_mode`, rename it to `port_hopping_mode`.
 ::::
 
 Notes per mode:
 
 - **static** — the carrying endpoint is the first port of the first resolvable range spec; knobs the mode does not use (e.g. a leftover `budget_packets`) are ignored. A config change of the range re-pins automatically (`port hop: static pin moved, re-pinning`).
-- **reactive** — rotation fires when the carrying link is judged dead by the same liveness model the router uses for ranking (no traffic heard back for `link_dead_threshold`, or loss-dead probe statistics), **or** when three consecutive probes of the carrying port go unanswered. The second trigger matters: the peer's own traffic can keep a link "alive" while *your* direction to the port is blackholed — only your probes going unanswered exposes that asymmetry. Expect a rotation (with `reason=...` in the journal) one to two probe cycles after a ban.
-- **proactive** — unchanged behaviour; see the tuning notes below and [Behaviour under load](#behaviour-under-load).
+- **reactive** — rotation fires when the carrying link is judged dead by the same liveness model the router uses for ranking (no traffic heard back for `link_dead_threshold`, or loss-dead probe statistics), **or** when three consecutive probes of the carrying port go unanswered. The second trigger matters: the peer's own traffic can keep a link "alive" while *your* direction to the port is blackholed — only your probes going unanswered exposes that asymmetry. Every reactive rotation logs its own immediate INFO line — `port hop: carrying endpoint rotated ... reason="dead carrying link"` (or `reason="unanswered carrying probes"`) — one line per detected death, never rate-limited: reactive rotations are rare, decision-driven events and each deserves its own journal entry.
+- **proactive** — rotation after `budget_packets` wire packets; see the tuning notes below (including `cooldown_seconds` and `auto_recycle`) and [Behaviour under load](#behaviour-under-load).
 - **timed** — the rotation deadline is checked on the one-second reconciliation pass, so effective intervals are the period plus up to a second; each interval is drawn as `period ± period*period_jitter_pct/100` so rotations never synchronise. A rotation that fails (port pool fully cooling down) stays due and retries on the next pass.
 
 ### Retired ports go quiet
@@ -152,7 +154,8 @@ Two deployment notes for reading your router's per-port stats:
 
 - `budget_packets` (proactive) must stay **below** the middlebox's per-flow budget. The default 12 leaves headroom under the worst observed 16–20 for handshake junk and in-flight packets at rotation time. Overshooting a few packets is harmless in practice: the port is retired immediately after, and a ban on an abandoned port costs nothing.
 - `period_seconds` (timed) should be short enough that a flow never accumulates ban-worthy volume between rotations, and long enough not to churn NAT state or flood the cooldown pool. With the default 3-minute cooldown, periods down to ~10 s are safe for ranges of a few hundred ports.
-- `cooldown_seconds` should be at least the observed middlebox recovery time. Range longevity is bounded by `sustained ≈ (ports / cooldown) × budget × ~1200 B`: 40 000 ports with a 180 s cooldown sustain roughly 35 Mbit/s indefinitely; a 100-port test range with the default policy sustains idle probing comfortably (a few ports per minute) but not heavy traffic. When the pool does run dry, rotation stalls (traffic keeps flowing on the burned port) and nylon warns at most once a minute with the pool stats — `port hop: rotation stalled, port pool exhausted ... cooling=N`.
+- `cooldown_seconds` is the quarantine a retired port serves before it may be redrawn. It is based on the middlebox's observed per-flow recovery time — set it to **at least** that: the point is that a port is only reused after the middlebox has forgotten its ban (typical TSPU windows are one to a few minutes; the default is 180 s). Range longevity is bounded by `sustained ≈ (ports / cooldown) × budget × ~1200 B`: 40 000 ports with a 180 s cooldown sustain roughly 35 Mbit/s indefinitely; a 100-port test range with the default policy sustains idle probing comfortably (a few ports per minute) but not heavy traffic. A live change applies without a restart — a shortened window also releases already-quarantined ports (a lengthened one never extends existing entries). Two quarantines exist: this pool cooldown (configurable, above) and the short tombstone grace (~15 s, hardcoded) that keeps a retired *link* in the table for late probe pongs — they are unrelated knobs.
+- `auto_recycle` (proactive, default `false`) decides what happens when the pool runs dry. Off: rotation stalls (traffic keeps flowing on the burned port, overshooting its budget) and nylon warns at most once a minute with the pool stats — `port hop: rotation stalled, port pool exhausted ... cooling=N` — until a port cools down. On: the retirement quarantine is cleared the moment the pool is exhausted, the sweep restarts from a clean slate, and the restart is journaled — `port hop: pool exhausted, auto-recycle cleared the retired-port quarantine ... cleared=N`. Trade-off: with a cooldown long enough to matter, an exhausted pool means every port has already served its budget since the last recycle, so restarting early reuses ports the middlebox may still remember; prefer a wider range or a shorter cooldown first, and reach for `auto_recycle` when the range is small and continuity beats stealth.
 - The carrying link is probed at a relaxed cadence (a fraction of `link_dead_threshold`) so idle probing does not burn the budget; active traffic rotates the port naturally. A link that is not yet (or no longer) active is always probed at the stock cadence — recovery is never gated.
 
 ### Behaviour under load
@@ -162,7 +165,7 @@ Rotation rate follows the traffic: one rotation per `budget_packets` wire packet
 - the rotation hot path does no dispatch work; link bookkeeping is reconciled once per second, so a rotation storm costs one materialisation per second, not one per rotation,
 - ports drawn and abandoned between two reconciliation passes never become links (nothing probed them, so nothing needs to match them),
 - the freshly drawn port's link is seeded with the predecessor's RTT estimate, so routes stay feasible and their cost continuous across every rotation — the neighbour never flaps to `no endpoint to neighbour` because of rotation,
-- `port hop: carrying endpoint rotated` is logged at most once per second at INFO with a `rotations=N` counter covering the interval (every individual rotation is DEBUG).
+- `port hop: carrying endpoint rotated` is logged at most once per second at INFO with a `rotations=N` counter covering the interval (every individual rotation is DEBUG) — except in reactive mode, where every rotation is a rare, decision-driven event and logs its own immediate INFO line with its `reason`.
 
 ## Multi-IP diversity
 

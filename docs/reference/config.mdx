@@ -46,20 +46,23 @@ listen_mode: "" # "sockets" | "nftables"; empty = sockets
 # carrying link is dead or our probes go unanswered; proactive rotates after
 # budget_packets wire packets (required); timed rotates every period_seconds
 # (required). dynamic and auto are reserved for future releases.
-port_mode: "" # "static" | "reactive" | "proactive" | "timed"; empty = static
+port_hopping_mode: "" # "static" | "reactive" | "proactive" | "timed"; empty = static
+# (renamed from port_mode to share the port_hopping prefix)
 
-# Rotation policy knobs; which are meaningful depends on port_mode, knobs the
-# mode does not use are ignored. A port_hopping block without port_mode is a
-# config error (earlier builds rotated by budget implicitly — be explicit).
-# The central router entry (port_mode/port_hopping in central.yaml) overrides
-# these node-level fields wholesale when it sets either.
+# Rotation policy knobs; which are meaningful depends on port_hopping_mode,
+# knobs the mode does not use are ignored. A port_hopping block without
+# port_hopping_mode is a config error (earlier builds rotated by budget
+# implicitly — be explicit). The central router entry
+# (port_hopping_mode/port_hopping in central.yaml) overrides these node-level
+# fields wholesale when it sets either.
 port_hopping:
   budget_packets: 12     # proactive: rotate the carrying port after N wire packets
   period_seconds: 300    # timed: rotate every N seconds (required in timed mode)
   period_jitter_pct: 10  # timed: random jitter around the period, as % of it (max 50)
   recent_ports: 512      # avoid redrawing the last N selected ports
-  cooldown_seconds: 180  # quarantine a retired port for this long
+  cooldown_seconds: 180  # quarantine a retired port for this long (default 180s; at least the middlebox's per-flow recovery time). A live change applies without a restart: a shortened window also releases already-quarantined ports
   candidate_samples: 32  # candidates scored per draw for IP/subnet diversity
+  auto_recycle: false    # proactive: when every port is cooling down (pool exhausted), clear the retirement quarantine and start a fresh sweep instead of stalling on the burned port
 
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
@@ -118,12 +121,13 @@ routers:
       # - "203.0.113.7:30000-40000"
 
     # Port hopping policy (client half) for THIS router: when set here it
-    # overrides the node's node.yaml port_mode/port_hopping wholesale.
+    # overrides the node's node.yaml port_hopping_mode/port_hopping wholesale.
     # Same semantics as the node-level fields (see node.yaml above).
-    # port_mode: proactive
+    # port_hopping_mode: proactive
     # port_hopping:
     #   budget_packets: 12
     #   cooldown_seconds: 180
+    #   auto_recycle: true
     prefixes:
       # Static: always advertised at the given metric
       - type: static

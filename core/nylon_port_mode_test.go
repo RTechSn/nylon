@@ -3,6 +3,7 @@ package core
 import (
 	"io"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,7 +235,7 @@ func TestResolveHopPolicyNylonWrapper(t *testing.T) {
 	}
 
 	// node.yaml pair applies when central has none
-	n.LocalCfg.PortMode = state.HopModeTimed
+	n.LocalCfg.PortHoppingMode = state.HopModeTimed
 	secs := uint32(90)
 	n.LocalCfg.PortHopping = &state.PortHoppingCfg{PeriodSeconds: &secs}
 	p, src = n.resolveHopPolicy()
@@ -244,9 +245,9 @@ func TestResolveHopPolicyNylonWrapper(t *testing.T) {
 
 	// a central entry for THIS node wins wholesale
 	n.CentralCfg.Routers = append(n.CentralCfg.Routers, state.RouterCfg{
-		NodeCfg:     state.NodeCfg{Id: "a"},
-		PortMode:    state.HopModeProactive,
-		PortHopping: &state.PortHoppingCfg{BudgetPackets: uint32ptr2(24)},
+		NodeCfg:         state.NodeCfg{Id: "a"},
+		PortHoppingMode: state.HopModeProactive,
+		PortHopping:     &state.PortHoppingCfg{BudgetPackets: uint32ptr2(24)},
 	})
 	p, src = n.resolveHopPolicy()
 	if p.Mode != state.HopModeProactive || p.Budget != 24 || src != "central" {
@@ -255,3 +256,147 @@ func TestResolveHopPolicyNylonWrapper(t *testing.T) {
 }
 
 func uint32ptr2(v uint32) *uint32 { return &v }
+
+// TestReactiveRotationLogsImmediately pins the reactive-mode journal contract:
+// every rotation is a rare, decision-driven event (one per detected carrying
+// link death) and gets its own immediate Info line — the per-second rate
+// limiter only serves the storm-prone scheduled/budgeted modes.
+func TestReactiveRotationLogsImmediately(t *testing.T) {
+	lb := &lockedBuffer{}
+	n := newHopFixturesNylonWithLog(t, time.Hour, lb)
+	f := portModeFactory(t, n, state.HopModeReactive, 0, 0)
+
+	cur, err := f.bind.ParseEndpoint("192.168.1.2:30001")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		f.mu.Lock()
+		f.rotateReason = "dead carrying link"
+		f.mu.Unlock()
+		cur, err = f.NextHopEndpoint(nil, cur)
+		if err != nil {
+			t.Fatalf("rotation %d: %v", i, err)
+		}
+	}
+	out := lb.String()
+	if got := strings.Count(out, "level=INFO"); got != 3 {
+		t.Fatalf("reactive rotations must each log their own Info line immediately, got %d:\n%s", got, out)
+	}
+	if got := strings.Count(out, `reason="dead carrying link"`); got != 3 {
+		t.Fatalf("each reactive Info line must carry the trigger reason, got %d:\n%s", got, out)
+	}
+	if got := strings.Count(out, "level=DEBUG"); got != 0 {
+		t.Fatalf("no reactive rotation may be demoted to Debug inside the limiter window, got %d:\n%s", got, out)
+	}
+}
+
+// TestHopAutoRecycleRestartsExhaustedPool pins the proactive auto_recycle
+// policy: when every port of the pool is cooling down, a rotation without
+// auto_recycle fails (rotation stalls on the burned port, warned with the
+// pool stats); with auto_recycle the retirement quarantine is cleared, the
+// sweep restarts from a clean slate, and the restart is journaled.
+func TestHopAutoRecycleRestartsExhaustedPool(t *testing.T) {
+	lb := &lockedBuffer{}
+	n := newHopFixturesNylonWithLog(t, time.Hour, lb)
+	ip := netip.MustParseAddr("192.168.1.2")
+	// a single-port range: the first retirement exhausts the pool for as
+	// long as the cooldown lasts
+	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30000}}},
+		state.PortPoolConfig{Recent: 4, Cooldown: time.Hour, Samples: 4})
+	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30000}}},
+		mode:  state.HopModeProactive}
+
+	f.drawAndMaterialize()
+	f.mu.Lock()
+	first := f.current
+	f.mu.Unlock()
+	if first.Port() != 30000 {
+		t.Fatalf("drew unexpected port %v", first)
+	}
+	cur, err := f.bind.ParseEndpoint(first.String())
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// auto_recycle off (the default): the rotation fails and stalls
+	if _, err := f.NextHopEndpoint(nil, cur); err == nil {
+		t.Fatal("rotation succeeded against a fully cooling pool")
+	}
+	f.mu.Lock()
+	still := f.current
+	f.mu.Unlock()
+	if still != first {
+		t.Fatalf("the carrying endpoint must stay untouched on a failed rotation: %v", still)
+	}
+	if !strings.Contains(lb.String(), "rotation stalled, port pool exhausted") {
+		t.Fatalf("pool exhaustion must be warned:\n%s", lb.String())
+	}
+
+	// auto_recycle on: the quarantine is cleared and the sweep restarts
+	lbTrunc(lb)
+	f.mu.Lock()
+	f.autoRecycle = true
+	f.mu.Unlock()
+	ep, err := f.NextHopEndpoint(nil, cur)
+	if err != nil {
+		t.Fatalf("auto-recycle rotation: %v", err)
+	}
+	if ep.DstIPPort().Port() != 30000 {
+		t.Fatalf("the restart must redraw from the clean slate, drew %v", ep.DstIPPort())
+	}
+	out := lb.String()
+	if !strings.Contains(out, "auto-recycle cleared the retired-port quarantine") {
+		t.Fatalf("the auto-recycle restart must be journaled:\n%s", out)
+	}
+	if !strings.Contains(out, "cleared=1") {
+		t.Fatalf("the journal line must carry the released-port count:\n%s", out)
+	}
+	if strings.Contains(out, "rotation stalled") {
+		t.Fatalf("a successful auto-recycle must not warn about a stall:\n%s", out)
+	}
+}
+
+// TestMaterializeReplacesStaleTombstoneOnRedraw pins the redraw path opened
+// up by auto_recycle: when a port is redrawn while its retired link still
+// lingers in the tombstone grace, the fresh materialisation REPLACES the
+// exhausted link instead of treating it as already materialised (which left
+// the carrying port unranked until the grace removal caught up).
+func TestMaterializeReplacesStaleTombstoneOnRedraw(t *testing.T) {
+	n := newHopFixturesNylon(t, time.Hour)
+	neigh := n.RouterState.GetNeighbour("b")
+	f, cur := newZombieTestFactory(t, n)
+
+	stale := hopLinkByAddr(neigh, cur.String())
+	if stale == nil {
+		t.Fatal("the drawn port must have a materialised link")
+	}
+	stale.AsNylonEndpoint().MarkExhausted()
+
+	f.materializeCarrying(neigh, cur, netip.AddrPort{})
+
+	fresh := hopLinkByAddr(neigh, cur.String())
+	if fresh == nil {
+		t.Fatal("the redrawn port must have a fresh link")
+	}
+	if fresh.IsExhausted() {
+		t.Fatal("the fresh link on the redrawn port must not inherit the tombstone")
+	}
+	count := 0
+	for _, ep := range neigh.Eps {
+		if !ep.IsRemote() && ep.AsNylonEndpoint().Address == cur.String() {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("exactly one link must exist for the redrawn port, got %d", count)
+	}
+}
+
+// lbTrunc clears the captured log between phases of a test.
+func lbTrunc(lb *lockedBuffer) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.buf.Reset()
+}

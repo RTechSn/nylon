@@ -246,3 +246,71 @@ func TestPortPoolEmptyIsExhausted(t *testing.T) {
 		t.Fatalf("expected ErrPoolExhausted for empty pool, got %v", err)
 	}
 }
+
+// TestPortPoolRecycle pins the auto_recycle primitive: Recycle releases every
+// quarantined port and empties the recent ring (a clean-slate restart when
+// the pool has run dry), reporting how many ports it freed. Groups are
+// untouched, so the next Select draws immediately.
+func TestPortPoolRecycle(t *testing.T) {
+	pool := NewPortPool([]PortGroup{testGroup("10.0.0.1", 30000, 30003)},
+		PortPoolConfig{Recent: 8, Cooldown: time.Hour, Samples: 4})
+
+	retired := []netip.AddrPort{}
+	for i := 0; i < 4; i++ {
+		ap, err := pool.Select(nil)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		pool.Retire(ap)
+		retired = append(retired, ap)
+	}
+	if _, err := pool.Select(nil); err != ErrPoolExhausted {
+		t.Fatalf("expected ErrPoolExhausted with all ports quarantined, got %v", err)
+	}
+
+	if cleared := pool.Recycle(); cleared != 4 {
+		t.Fatalf("Recycle reported %d cleared ports, want 4", cleared)
+	}
+	for _, ap := range retired {
+		if pool.IsCooling(ap) {
+			t.Fatalf("port %v must not be cooling after Recycle", ap)
+		}
+	}
+	if _, err := pool.Select(nil); err != nil {
+		t.Fatalf("Select after Recycle: %v", err)
+	}
+	// a second Recycle on an empty quarantine is a no-op reporting zero
+	if cleared := pool.Recycle(); cleared != 0 {
+		t.Fatalf("Recycle on an empty quarantine reported %d, want 0", cleared)
+	}
+}
+
+// TestPortPoolSetCooldown pins the live re-tune of the quarantine duration
+// (a config change of port_hopping.cooldown_seconds applies without a
+// restart).
+func TestPortPoolSetCooldown(t *testing.T) {
+	pool := NewPortPool([]PortGroup{testGroup("10.0.0.1", 30000, 30000)},
+		PortPoolConfig{Recent: 1, Cooldown: time.Hour, Samples: 4})
+
+	ap, err := pool.Select(nil)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	pool.Retire(ap)
+	if !pool.IsCooling(ap) {
+		t.Fatal("control: the port must be cooling before SetCooldown")
+	}
+
+	// shorten the quarantine: the entry clamps to now+10s, so it must lift
+	// within the new window (a lengthening never extends existing entries)
+	pool.SetCooldown(10 * time.Second)
+	base := time.Now()
+	pool.nowFn = func() time.Time { return base }
+	if !pool.IsCooling(ap) {
+		t.Fatal("the port must still be cooling right after the clamp")
+	}
+	pool.nowFn = func() time.Time { return base.Add(11 * time.Second) }
+	if pool.IsCooling(ap) {
+		t.Fatal("the port must not be cooling after the shortened cooldown elapsed")
+	}
+}

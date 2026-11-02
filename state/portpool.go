@@ -305,3 +305,49 @@ func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 	p.recSet[chosen] = struct{}{}
 	return chosen, nil
 }
+
+// SetCooldown adjusts the retirement quarantine duration — a live config
+// change of port_hopping.cooldown_seconds applies without a restart. A
+// shortened window clamps already-quarantined ports so everything lifts
+// within the new duration; a lengthened window never extends entries that
+// were retired under the old policy.
+func (p *PortPool) SetCooldown(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d <= 0 {
+		return
+	}
+	old := p.cfg.Cooldown
+	p.cfg.Cooldown = d
+	if d >= old || len(p.cooldown) == 0 {
+		return
+	}
+	now := p.nowFn()
+	next := time.Time{}
+	for ap, exp := range p.cooldown {
+		if ne := now.Add(d); ne.Before(exp) {
+			exp = ne
+			p.cooldown[ap] = exp
+		}
+		if next.IsZero() || exp.Before(next) {
+			next = exp
+		}
+	}
+	p.nextExp = next
+}
+
+// Recycle empties the retirement quarantine and the recent-selection ring —
+// a clean-slate restart for the auto_recycle policy: once every port is
+// cooling down and the pool would stall, the operator opted into releasing
+// all retired ports and starting a fresh sweep. Groups are untouched. It
+// returns how many quarantined ports were released (for the journal line).
+func (p *PortPool) Recycle() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cleared := len(p.cooldown)
+	p.cooldown = make(map[netip.AddrPort]time.Time)
+	p.nextExp = time.Time{}
+	p.recent = p.recent[:0]
+	p.recSet = make(map[netip.AddrPort]struct{})
+	return cleared
+}

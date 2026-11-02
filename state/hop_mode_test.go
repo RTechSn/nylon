@@ -10,13 +10,15 @@ import (
 
 func hopStr(v uint32) *uint32 { return &v }
 
+func hopBool(v bool) *bool { return &v }
+
 // TestHopModeParsingRoundtrip pins the YAML surface of the hop policy on both
 // the node (node.yaml) and the router (central.yaml) sides.
 func TestHopModeParsingRoundtrip(t *testing.T) {
 	const nodeYaml = `
 id: node1
 port: 30000
-port_mode: timed
+port_hopping_mode: timed
 port_hopping:
   period_seconds: 300
   period_jitter_pct: 15
@@ -26,8 +28,8 @@ port_hopping:
 	if err := yaml.Unmarshal([]byte(nodeYaml), &node); err != nil {
 		t.Fatalf("node yaml: %v", err)
 	}
-	if node.PortMode != HopModeTimed {
-		t.Errorf("port_mode = %q, want %q", node.PortMode, HopModeTimed)
+	if node.PortHoppingMode != HopModeTimed {
+		t.Errorf("port_hopping_mode = %q, want %q", node.PortHoppingMode, HopModeTimed)
 	}
 	if node.PortHopping == nil || node.PortHopping.PeriodSeconds == nil || *node.PortHopping.PeriodSeconds != 300 {
 		t.Fatalf("period_seconds not parsed: %+v", node.PortHopping)
@@ -39,7 +41,7 @@ port_hopping:
 	const centralYaml = `
 routers:
 - id: node2
-  port_mode: proactive
+  port_hopping_mode: proactive
   port_hopping:
     budget_packets: 24
   endpoints: []
@@ -52,8 +54,8 @@ routers:
 		t.Fatalf("routers = %d, want 1", len(central.Routers))
 	}
 	r := central.Routers[0]
-	if r.PortMode != HopModeProactive {
-		t.Errorf("router port_mode = %q, want %q", r.PortMode, HopModeProactive)
+	if r.PortHoppingMode != HopModeProactive {
+		t.Errorf("router port_hopping_mode = %q, want %q", r.PortHoppingMode, HopModeProactive)
 	}
 	if r.PortHopping == nil || r.PortHopping.BudgetPackets == nil || *r.PortHopping.BudgetPackets != 24 {
 		t.Fatalf("budget_packets not parsed: %+v", r.PortHopping)
@@ -68,7 +70,7 @@ routers:
 	if err := yaml.Unmarshal(out, &central2); err != nil {
 		t.Fatalf("re-unmarshal: %v (yaml: %s)", err, out)
 	}
-	if central2.Routers[0].PortMode != HopModeProactive || central2.Routers[0].PortHopping.BudgetPackets == nil {
+	if central2.Routers[0].PortHoppingMode != HopModeProactive || central2.Routers[0].PortHopping.BudgetPackets == nil {
 		t.Errorf("hop policy lost in roundtrip: %+v", central2.Routers[0])
 	}
 }
@@ -96,8 +98,8 @@ func TestValidateHopPolicyCfgMatrix(t *testing.T) {
 		{"timed with period and jitter", HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(300), PeriodJitterPct: hopStr(25)}, ""},
 		{"timed with zero period", HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(0)}, "period_seconds must be greater than 0"},
 		{"timed with excess jitter", HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(300), PeriodJitterPct: hopStr(51)}, "period_jitter_pct must be at most 50"},
-		{"knobs without mode (migration guard)", "", &PortHoppingCfg{BudgetPackets: hopStr(12)}, "port_mode is not set"},
-		{"unknown mode", "surprise", nil, "unknown port_mode"},
+		{"knobs without mode (migration guard)", "", &PortHoppingCfg{BudgetPackets: hopStr(12)}, "port_hopping_mode is not set"},
+		{"unknown mode", "surprise", nil, "unknown port_hopping_mode"},
 		{"reserved dynamic", HopModeDynamic, nil, "reserved for a future release"},
 		{"reserved auto", HopModeAuto, nil, "reserved for a future release"},
 	}
@@ -129,25 +131,25 @@ func TestHopPolicyNodeValidation(t *testing.T) {
 
 	node := base()
 	node.PortHopping = &PortHoppingCfg{BudgetPackets: hopStr(12)}
-	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "port_mode is not set") {
-		t.Errorf("node port_hopping without port_mode: err = %v, want migration guard", err)
+	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "port_hopping_mode is not set") {
+		t.Errorf("node port_hopping without port_hopping_mode: err = %v, want migration guard", err)
 	}
 
 	node = base()
-	node.PortMode = HopModeProactive
+	node.PortHoppingMode = HopModeProactive
 	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "budget_packets") {
 		t.Errorf("node proactive without budget: err = %v, want requirement error", err)
 	}
 
 	node = base()
-	node.PortMode = HopModeTimed
+	node.PortHoppingMode = HopModeTimed
 	node.PortHopping = &PortHoppingCfg{PeriodSeconds: hopStr(60)}
 	if err := NodeConfigValidator(nil, node); err != nil {
 		t.Errorf("node timed with period: unexpected error %v", err)
 	}
 
 	node = base()
-	node.PortMode = HopModeAuto
+	node.PortHoppingMode = HopModeAuto
 	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "reserved") {
 		t.Errorf("node reserved mode: err = %v, want reserved error", err)
 	}
@@ -159,9 +161,9 @@ func TestHopPolicyCentralValidation(t *testing.T) {
 	mk := func(mode string, hop *PortHoppingCfg) *CentralCfg {
 		return &CentralCfg{
 			Routers: []RouterCfg{{
-				NodeCfg:     NodeCfg{Id: "node1"},
-				PortMode:    mode,
-				PortHopping: hop,
+				NodeCfg:         NodeCfg{Id: "node1"},
+				PortHoppingMode: mode,
+				PortHopping:     hop,
 			}},
 		}
 	}
@@ -172,7 +174,7 @@ func TestHopPolicyCentralValidation(t *testing.T) {
 	if err := CentralConfigValidator(mk(HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(90)})); err != nil {
 		t.Errorf("central timed with period: unexpected error %v", err)
 	}
-	if err := CentralConfigValidator(mk("", &PortHoppingCfg{BudgetPackets: hopStr(12)})); err == nil || !strings.Contains(err.Error(), "port_mode is not set") {
+	if err := CentralConfigValidator(mk("", &PortHoppingCfg{BudgetPackets: hopStr(12)})); err == nil || !strings.Contains(err.Error(), "port_hopping_mode is not set") {
 		t.Errorf("central knobs without mode: err = %v, want migration guard", err)
 	}
 }
@@ -181,7 +183,7 @@ func TestHopPolicyCentralValidation(t *testing.T) {
 // precedence of the effective hop policy.
 func TestResolveHopPolicyPrecedence(t *testing.T) {
 	local := &LocalCfg{
-		PortMode: HopModeTimed,
+		PortHoppingMode: HopModeTimed,
 		PortHopping: &PortHoppingCfg{
 			PeriodSeconds:   hopStr(60),
 			PeriodJitterPct: hopStr(20),
@@ -190,7 +192,7 @@ func TestResolveHopPolicyPrecedence(t *testing.T) {
 
 	// central pair wins wholesale; node.yaml hop fields are ignored
 	central := &RouterCfg{
-		PortMode: HopModeProactive,
+		PortHoppingMode: HopModeProactive,
 		PortHopping: &PortHoppingCfg{
 			BudgetPackets: hopStr(40),
 		},
@@ -225,7 +227,7 @@ func TestResolveHopPolicyPrecedence(t *testing.T) {
 	}
 
 	// knobs resolution: unset jitter keeps the default, explicit period wins
-	p, _ = ResolveHopPolicy(nil, &LocalCfg{PortMode: HopModeTimed, PortHopping: &PortHoppingCfg{PeriodSeconds: hopStr(5)}})
+	p, _ = ResolveHopPolicy(nil, &LocalCfg{PortHoppingMode: HopModeTimed, PortHopping: &PortHoppingCfg{PeriodSeconds: hopStr(5)}})
 	if p.Period != 5*time.Second || p.JitterPct != 10 {
 		t.Errorf("timed knob resolution: %+v", p)
 	}
@@ -244,7 +246,53 @@ func TestValidateHopMode(t *testing.T) {
 			t.Errorf("reserved mode %q: err = %v, want reserved error", m, err)
 		}
 	}
-	if err := ValidateHopMode("fast"); err == nil || !strings.Contains(err.Error(), "unknown port_mode") {
+	if err := ValidateHopMode("fast"); err == nil || !strings.Contains(err.Error(), "unknown port_hopping_mode") {
 		t.Errorf("unknown mode: err = %v, want unknown error", err)
+	}
+}
+
+// TestHopAutoRecycleParsingAndResolve pins the auto_recycle knob surface:
+// parsed on both config levels, defaulted off, resolved into the policy.
+func TestHopAutoRecycleParsingAndResolve(t *testing.T) {
+	const nodeYaml = `
+id: node1
+port: 30000
+port_hopping_mode: proactive
+port_hopping:
+  budget_packets: 24
+  auto_recycle: true
+`
+	var node LocalCfg
+	if err := yaml.Unmarshal([]byte(nodeYaml), &node); err != nil {
+		t.Fatalf("node yaml: %v", err)
+	}
+	if node.PortHopping == nil || node.PortHopping.AutoRecycle == nil || !*node.PortHopping.AutoRecycle {
+		t.Fatalf("auto_recycle not parsed: %+v", node.PortHopping)
+	}
+	p := node.PortHopping.Resolve()
+	if !p.AutoRecycle {
+		t.Fatalf("auto_recycle not resolved: %+v", p)
+	}
+	if p.Cooldown != 3*time.Minute {
+		t.Fatalf("default cooldown drifted: %v", p.Cooldown)
+	}
+
+	// default: off
+	if (&PortHoppingCfg{}).Resolve().AutoRecycle {
+		t.Fatal("auto_recycle must default to off")
+	}
+	if DefaultPortHoppingPolicy().AutoRecycle {
+		t.Fatal("the default policy must not auto-recycle")
+	}
+
+	// central router entry carries it too (wholesale precedence)
+	central := &RouterCfg{
+		NodeCfg:         NodeCfg{Id: "n1"},
+		PortHoppingMode: HopModeProactive,
+		PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(12), AutoRecycle: hopBool(true), CooldownSeconds: hopStr(45)},
+	}
+	pol, src := ResolveHopPolicy(central, &LocalCfg{})
+	if src != "central" || !pol.AutoRecycle || pol.Cooldown != 45*time.Second {
+		t.Fatalf("central auto_recycle policy: %+v source=%q", pol, src)
 	}
 }
