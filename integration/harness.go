@@ -82,6 +82,11 @@ type VirtualLink struct {
 	portsMu   sync.Mutex
 	portsSeen map[uint16]struct{}
 
+	// total packets carried per direction (delivered past loss/budget gates);
+	// the rotation-rate ground truth for stress tests: rotations ~ packets/budget
+	fwdPkts atomic.Uint64
+	revPkts atomic.Uint64
+
 	// per-port activity timeline: first/last time a destination port carried
 	// a packet on a range link (forward direction), and first/last time a
 	// source port carried a packet on a reverse (srcAddrMatch) link. The
@@ -167,6 +172,14 @@ func (v *VirtualLink) flowAllows(from, to bindtest.ChannelEndpoint2) bool {
 	return v.flowCounts[k] <= v.flowBudget
 }
 
+// ForwardPackets reports the total number of packets delivered on this link
+// in the forward direction (range links: client -> server).
+func (v *VirtualLink) ForwardPackets() uint64 { return v.fwdPkts.Load() }
+
+// ReversePackets reports the total number of packets delivered on this link
+// in the reverse direction (srcAddrMatch links: server -> client).
+func (v *VirtualLink) ReversePackets() uint64 { return v.revPkts.Load() }
+
 // DistinctDstPorts reports how many distinct destination ports have carried
 // packets over this link (range links only).
 func (v *VirtualLink) DistinctDstPorts() int {
@@ -191,6 +204,7 @@ func (v *VirtualLink) CarriedPorts() []uint16 {
 
 // observePort records a destination port on a range link.
 func (v *VirtualLink) observePort(port uint16) {
+	v.fwdPkts.Add(1)
 	now := time.Now()
 	v.portsMu.Lock()
 	if v.portsSeen == nil {
@@ -210,6 +224,7 @@ func (v *VirtualLink) observePort(port uint16) {
 
 // observeRevPort records a reply source port on a reverse (srcAddrMatch) link.
 func (v *VirtualLink) observeRevPort(port uint16) {
+	v.revPkts.Add(1)
 	now := time.Now()
 	v.portsMu.Lock()
 	if v.lastSeenRev == nil {

@@ -168,6 +168,22 @@ Rotation rate follows the traffic: one rotation per `budget_packets` wire packet
 - the freshly drawn port's link is seeded with the predecessor's RTT estimate, so routes stay feasible and their cost continuous across every rotation — the neighbour never flaps to `no endpoint to neighbour` because of rotation,
 - `port hop: carrying endpoint rotated` is logged at most once per second at INFO with a `rotations=N` counter covering the interval (every individual rotation is DEBUG) — except in reactive mode, where every rotation is a rare, decision-driven event and logs its own immediate INFO line with its `reason`.
 
+The rotation storm also heats the *receive* side: the peer answers from the port your flow targeted, so every rotation changes the arrival signature, and the data-arrival adoption (which keeps the link pin on the peer's current port) used to dispatch once per rotation. It is now **coalesced per peer**: at most one adoption sits on the dispatch queue at any time, and it adopts the *latest* arrival when it runs — the pin's consumers (the 1 s endpoint sync, the relaxed probe loop) run at tick cadence anyway, so the behaviour is unchanged while the queue pressure is bounded under any rotation rate.
+
+### Dispatch-channel saturation and how nylon survives it
+
+All control-plane work (probe passes, route updates, link removals, reconciliations) runs on a single per-node dispatch loop fed by a queue of 512 slots. The loop is cheap — but it is one goroutine, so whenever the machine cannot schedule it for a stretch (a CPU-quota-throttled VPS under a rotation storm, a GC pause, a busy host), every producer keeps enqueueing. Symptoms of a saturation episode in the journal:
+
+```
+ERROR dispatch channel is full, discarded function fun=... len=512 drops_in_window=137
+```
+
+The line is rate-limited to at most one **ERROR per 10 s** (each individual drop is DEBUG; the total is exported as `nylon_dispatch_drops_total` on the metrics endpoint). A non-zero value means the node's CPU could not run the control plane fast enough — the levers are the ones that reduce load: a wider port range (fewer recycles per second), a larger `budget_packets` (proportionally fewer rotations per second at the same throughput), or more CPU for the node. Occasional drops during a transient stall are survivable by design:
+
+- periodic work (probes, reconciliations, route updates) re-fires on its next tick — a dropped pass is a skipped tick, not a lost feature;
+- the coalesced adoption means a storm can no longer be the producer that saturates the queue;
+- a dropped exhausted-link removal no longer leaks the tombstone: the GC pass reaps any link still exhausted a full grace past its mark (`port hop: reaped leaked tombstoned link` at DEBUG), so the retired-ports-go-quiet guarantee holds even after a saturation episode.
+
 ## Multi-IP diversity
 
 Range endpoints may list **different IPs** (the natural Stage-2 extension):

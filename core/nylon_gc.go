@@ -40,6 +40,8 @@ func nylonGc(n *Nylon) error {
 		neigh.Eps = neigh.Eps[:count]
 	}
 
+	n.gcHopTombstones()
+
 	n.checkHandshakeStaleness(time.Now())
 
 	err := n.GcRouter()
@@ -48,6 +50,42 @@ func nylonGc(n *Nylon) error {
 	}
 
 	return nil
+}
+
+// hopTombstoneGcAge is how long an exhausted (tombstoned) link may outlive its
+// exhaustion before the GC reaps it unconditionally: the primary removal path
+// is scheduleExhaustedLinkRemoval's hopTombstoneGrace timer, so a full extra
+// grace of slack means anything still here was leaked — its timer's dispatch
+// was discarded on a saturated channel (Dispatch drops on a full queue) and
+// nothing re-arms it.
+const hopTombstoneGcAge = 2 * hopTombstoneGrace
+
+// gcHopTombstones is the leak-recovery backstop for exhausted-link removals.
+// Exhaustion is one-way (nothing ever clears it) and the tombstones exist
+// only so late probe pongs can still match a link; anything still exhausted
+// this far past its mark is by construction garbage. Without this sweep, a
+// single dropped removal closure under a rotation storm (the dispatch channel
+// saturates exactly then) leaks the tombstone into Neighbour.Eps forever, and
+// every link-table scan (probes, reconciliations, pong matching) pays for it
+// for the rest of the daemon's life. Runs on the dispatch loop via nylonGc.
+func (n *Nylon) gcHopTombstones() {
+	now := time.Now()
+	for _, neigh := range n.RouterState.Neighbours {
+		for i := 0; i < len(neigh.Eps); {
+			ep := neigh.Eps[i]
+			if !ep.IsExhausted() {
+				i++
+				continue
+			}
+			at := ep.AsNylonEndpoint().ExhaustedAt()
+			if at.IsZero() || now.Sub(at) < hopTombstoneGcAge {
+				i++
+				continue
+			}
+			neigh.Eps = append(neigh.Eps[:i], neigh.Eps[i+1:]...)
+			n.Log.Debug("port hop: reaped leaked tombstoned link", "peer", neigh.Id, "endpoint", ep.AsNylonEndpoint().Address)
+		}
+	}
 }
 
 // checkHandshakeStaleness demotes neighbours whose WireGuard handshake is

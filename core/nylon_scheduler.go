@@ -6,7 +6,53 @@ import (
 	"reflect"
 	"runtime"
 	"time"
+
+	"github.com/encodeous/nylon/perf"
 )
+
+// dispatchChannelCapacity is the depth of the per-node dispatch channel. See
+// NewNylon for the sizing rationale.
+const dispatchChannelCapacity = 512
+
+// dispatchDropLogInterval bounds how often the dispatch-overflow ERROR is
+// journalled. A saturated loop discards functions at producer rate (hundreds
+// per second under a rotation storm); one line per drop would bury the
+// journal exactly when the operator needs it readable. The first drop in a
+// window logs at ERROR with the running drop count; the rest count silently
+// into perf.DispatchDropsTotal and surface in the next window's line.
+const dispatchDropLogInterval = 10 * time.Second
+
+// recordDispatchDrop accounts a control-plane function discarded because the
+// dispatch channel was full. Called on producer goroutines, so the journal
+// emission decision is made under a small lock and the write itself happens
+// outside it.
+func (n *Nylon) recordDispatchDrop(fun func() error) {
+	perf.DispatchDropsTotal.Add(1)
+	funName := runtime.FuncForPC(reflect.ValueOf(fun).Pointer()).Name()
+
+	n.dispatchDrops.mu.Lock()
+	n.dispatchDrops.window++
+	now := time.Now()
+	emit := now.Sub(n.dispatchDrops.lastLog) >= dispatchDropLogInterval
+	if emit {
+		n.dispatchDrops.lastLog = now
+	}
+	window := n.dispatchDrops.window
+	if emit {
+		n.dispatchDrops.window = 0
+	}
+	n.dispatchDrops.mu.Unlock()
+
+	if n.Log == nil {
+		return
+	}
+	if emit {
+		n.Log.Error("dispatch channel is full, discarded function",
+			"fun", funName, "len", len(n.DispatchChannel), "drops_in_window", window)
+		return
+	}
+	n.Log.Debug("dispatch channel is full, discarded function", "fun", funName, "len", len(n.DispatchChannel))
+}
 
 func NewDispatchFuture[T any](n *Nylon, fun func() (T, error)) Future[T] {
 	future, complete := NewFuture[T]()
@@ -23,6 +69,7 @@ func NewDispatchFuture[T any](n *Nylon, fun func() (T, error)) Future[T] {
 	default:
 		var zero T
 		complete(zero, fmt.Errorf("dispatch channel is full"))
+		n.recordDispatchDrop(dispatch)
 	}
 	return future
 }
@@ -39,7 +86,7 @@ func (n *Nylon) Dispatch(fun func() error) {
 		case n.DispatchChannel <- fun:
 			return
 		default:
-			n.Log.Error("dispatch channel is full, discarded function", "fun", runtime.FuncForPC(reflect.ValueOf(fun).Pointer()).Name(), "len", len(n.DispatchChannel))
+			n.recordDispatchDrop(fun)
 			return
 		}
 	}

@@ -37,7 +37,8 @@ type NylonEndpoint struct {
 	probeStreak   uint32 // consecutive probe attempts that timed out; reset only by a successful pong (NOT by Renew — a peer's own pings must not mask our blackholed direction)
 	expRTT        float64
 	remoteInit    bool
-	exhausted     bool // port-hopping: budget burned on this endpoint; keep it for late pongs, but stop probing it
+	exhausted     bool      // port-hopping: budget burned on this endpoint; keep it for late pongs, but stop probing it
+	exhaustedAt   time.Time // when exhaustion was marked; the GC backstop reaps tombstones whose grace-timer dispatch was lost (see MarkExhaustedAt)
 	WgEndpoint    conn.Endpoint
 	Address       string
 }
@@ -287,9 +288,25 @@ func (u *NylonEndpoint) IsRemote() bool {
 // link is kept around briefly so late probe pongs still match, but the probe
 // loops stop spending packets on it and it never becomes the best endpoint.
 func (u *NylonEndpoint) MarkExhausted() {
+	u.MarkExhaustedAt(time.Now())
+}
+
+// MarkExhaustedAt is MarkExhausted with an explicit timestamp: exhaustion is
+// one-way, so the timestamp is what tells the GC backstop (gcHopTombstones)
+// a tombstone outlived its grace window — i.e. its removal timer was lost to
+// a saturated dispatch channel — and must be reaped.
+func (u *NylonEndpoint) MarkExhaustedAt(ts time.Time) {
 	u.Lock()
 	defer u.Unlock()
 	u.exhausted = true
+	u.exhaustedAt = ts
+}
+
+// ExhaustedAt returns when the endpoint was exhausted (zero if never).
+func (u *NylonEndpoint) ExhaustedAt() time.Time {
+	u.RLock()
+	defer u.RUnlock()
+	return u.exhaustedAt
 }
 
 func (u *NylonEndpoint) IsExhausted() bool {

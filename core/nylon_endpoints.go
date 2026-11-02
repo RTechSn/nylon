@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/encodeous/nylon/polyamide/conn"
@@ -313,6 +314,11 @@ func (n *Nylon) adoptLinkEndpoint(node state.NodeId, ep conn.Endpoint) {
 // the port factory's rotation tombstoning and by the remote-link supersede
 // path in handleProbePing. Safe to call more than once for the same address:
 // extra runs find nothing eligible to delete.
+//
+// Leak-recovery backstop: if the grace timer's dispatch lands on a saturated
+// channel it is DISCARDED and nothing re-arms it, so the tombstone would live
+// in Neighbour.Eps forever. gcHopTombstones (the 1 Hz GC pass) reaps anything
+// still exhausted a grace past its window — see MarkExhaustedAt.
 func (n *Nylon) scheduleExhaustedLinkRemoval(node state.NodeId, addr string) {
 	time.AfterFunc(hopTombstoneGrace, func() {
 		if n.Context.Err() != nil {
@@ -342,6 +348,22 @@ type hopArrivalSig struct {
 	hint uint16
 }
 
+// hopAdoption is one peer's latest data-arrival snapshot: the arrival
+// signature and the endpoint to adopt. Swapped atomically by the TC hot path
+// (pointer publication), so an adoption closure queued earlier always reads a
+// value at least as fresh as anything stored before it started running.
+type hopAdoption struct {
+	sig hopArrivalSig
+	ep  conn.Endpoint
+}
+
+// hopAdoptionState is the per-peer adoption slot: the latest arrival plus the
+// at-most-one-queued-adoption flag (see hopAdoptDataArrival).
+type hopAdoptionState struct {
+	cur     atomic.Pointer[hopAdoption]
+	pending atomic.Bool
+}
+
 // hopAdoptDataArrival re-pins the neighbour link matching an inbound DATA
 // packet's arrival endpoint to that endpoint (see adoptLinkEndpoint). Data is
 // the freshest and most abundant signal of which local port the peer's flow
@@ -352,10 +374,17 @@ type hopArrivalSig struct {
 // away from.
 //
 // Runs on the TC hot path: the signature check is a lock-free sync.Map read,
-// so the cost per packet is negligible, and the adoption itself is dispatched
-// at most once per arrival-port change (per rotation), never per packet.
-// Nylon protocol packets are deliberately excluded — their adoption paths
-// are the existing, pong-aware ones (see handleNylonPacket).
+// so the cost per packet is negligible. Adoption work is COALESCED per peer:
+// the first arrival through a new (address, reply-port) pair dispatches an
+// adoption immediately, and while one is still queued every further rotation
+// only swaps the snapshot it will read — a rotation storm at hundreds of
+// rotations per second costs at most ONE queued adoption per peer, never one
+// dispatch per rotation (a storm-rate producer is exactly what saturates the
+// dispatch channel and discards unrelated control-plane work). The pin's
+// consumers run at tick cadence (SetEndpoints, the relaxed probe loop), so
+// the coalescing lag is invisible to them. Nylon protocol packets are
+// deliberately excluded — their adoption paths are the existing, pong-aware
+// ones (see handleNylonPacket).
 func (n *Nylon) hopAdoptDataArrival(peer *device.Peer, ep conn.Endpoint) {
 	if ep == nil {
 		return
@@ -372,13 +401,36 @@ func (n *Nylon) hopAdoptDataArrival(peer *device.Peer, ep conn.Endpoint) {
 	if h, ok := ep.(interface{ PortHint() uint16 }); ok {
 		sig.hint = h.PortHint()
 	}
-	if v, loaded := n.portHopping.hintSigs.Load(node); loaded && v.(hopArrivalSig) == sig {
+	v, _ := n.portHopping.hintSigs.LoadOrStore(node, &hopAdoptionState{})
+	st := v.(*hopAdoptionState)
+	if cur := st.cur.Load(); cur != nil && cur.sig == sig {
 		return
 	}
-	n.portHopping.hintSigs.Store(node, sig)
+	st.cur.Store(&hopAdoption{sig: sig, ep: ep})
+	if st.pending.Swap(true) {
+		// an adoption for this peer is already queued; it reads the snapshot
+		// above when it runs, which is at least as fresh as this arrival
+		return
+	}
 	n.Dispatch(func() error {
-		n.adoptLinkEndpoint(node, ep)
-		return nil
+		for {
+			cur := st.cur.Load()
+			if cur == nil {
+				st.pending.Store(false)
+				return nil
+			}
+			n.adoptLinkEndpoint(node, cur.ep)
+			st.pending.Store(false)
+			// An arrival that landed while we were adopting saw pending=true
+			// and queued nothing; pick it up here instead of waiting for the
+			// next signature change.
+			if next := st.cur.Load(); next == cur {
+				return nil
+			}
+			if !st.pending.CompareAndSwap(false, true) {
+				return nil // another arrival already queued a fresh adoption
+			}
+		}
 	})
 }
 
