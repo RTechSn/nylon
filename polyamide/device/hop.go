@@ -6,6 +6,7 @@
 package device
 
 import (
+	"errors"
 	"net/netip"
 	"sync"
 	"time"
@@ -36,20 +37,22 @@ type HopSource interface {
 	NextHopEndpoint(peer *Peer, exhausted conn.Endpoint) (conn.Endpoint, error)
 }
 
-// hopState is the per-peer port rotation state. A nil hop (or budget <= 0)
-// leaves the peer on stock endpoint behaviour.
+// hopState is the per-peer port rotation state. A nil hop (or budget <= 0
+// in SetHop) leaves the peer on stock endpoint behaviour.
 type hopState struct {
 	mu            sync.Mutex
 	src           HopSource
-	budget        int // wire packets per carrying port
+	budget        int  // wire packets per carrying port
+	noBudget      bool // external rotation mode: the carrying endpoint never rotates on the send path
 	current       conn.Endpoint
 	left          int
 	degradedUntil time.Time // source error backoff
 }
 
-// SetHop installs (or, with a nil source, clears) the port hopping policy for
-// the peer. budget is the number of wire packets a carrying port may receive
-// before rotation; budget <= 0 disables hopping.
+// SetHop installs (or, with a nil source, clears) the budgeted port hopping
+// policy for the peer: the carrying port rotates after budget wire packets
+// (the proactive mode). budget is the number of wire packets a carrying port
+// may receive before rotation; budget <= 0 disables hopping.
 func (peer *Peer) SetHop(src HopSource, budget int) {
 	if src == nil || budget <= 0 {
 		peer.hop.Store(nil)
@@ -60,10 +63,64 @@ func (peer *Peer) SetHop(src HopSource, budget int) {
 		h.mu.Lock()
 		h.src = src
 		h.budget = budget
+		h.noBudget = false
 		h.mu.Unlock()
 		return
 	}
 	peer.hop.Store(&hopState{src: src, budget: budget})
+}
+
+// SetHopExternal activates the hop source WITHOUT packet budget accounting:
+// the carrying endpoint only changes when the controller calls
+// HopExternalRotate (the reactive, timed and static rotation modes). The
+// device still draws the first carrying endpoint from the source on the
+// send path, so a peer whose only configured endpoints are ranges keeps
+// working.
+func (peer *Peer) SetHopExternal(src HopSource) {
+	if src == nil {
+		peer.hop.Store(nil)
+		return
+	}
+	h := peer.hop.Load()
+	if h != nil {
+		h.mu.Lock()
+		h.src = src
+		h.noBudget = true
+		h.budget = 0
+		h.mu.Unlock()
+		return
+	}
+	peer.hop.Store(&hopState{src: src, noBudget: true})
+}
+
+// HopExternalRotate forces an immediate carrying-endpoint rotation through
+// the hop source: the current carrying endpoint is retired (handed to the
+// source as exhausted) and its replacement becomes the peer's carrying
+// endpoint. It is called by the nylon controller (dispatch loop) for the
+// reactive and timed rotation modes, never from the send path. Returns the
+// new carrying destination. A peer without hop state, or a source that
+// cannot serve a rotation (e.g. the port pool is fully cooling down),
+// returns an error and leaves the current endpoint untouched.
+func (peer *Peer) HopExternalRotate() (string, error) {
+	h := peer.hop.Load()
+	if h == nil {
+		return "", errors.New("hop not active")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var exhausted conn.Endpoint
+	if h.current != nil {
+		exhausted = h.current
+	}
+	next, err := h.src.NextHopEndpoint(peer, exhausted)
+	if err != nil {
+		return "", err
+	}
+	h.current = next
+	if !h.noBudget {
+		h.left = h.budget
+	}
+	return next.DstToString(), nil
 }
 
 // hopCarrying returns the endpoint that should carry NEW packets, rotating
@@ -81,7 +138,7 @@ func (peer *Peer) hopCarrying() conn.Endpoint {
 	if !h.degradedUntil.IsZero() && now.Before(h.degradedUntil) {
 		return h.current
 	}
-	if h.current == nil || h.left <= 0 {
+	if h.current == nil || (!h.noBudget && h.left <= 0) {
 		next, err := h.src.NextHopEndpoint(peer, h.current)
 		if err != nil {
 			h.degradedUntil = now.Add(hopRetryDelay)
@@ -110,8 +167,9 @@ func (peer *Peer) hopHasCurrent() bool {
 // HopStatus is the port hopping state of a peer, exposed for observability.
 type HopStatus struct {
 	Carrying   string // destination of the current carrying endpoint ("" before the first draw)
-	Budget     int    // per-port wire packet budget
-	BudgetLeft int    // packets left on the carrying port
+	Budget     int    // per-port wire packet budget; 0 when rotation is externally driven
+	BudgetLeft int    // packets left on the carrying port (0 when Budget is 0)
+	External   bool   // true when the carrying endpoint changes only via external rotation (static/reactive/timed modes)
 }
 
 // HopStatus reports the port hopping state of the peer. The second return
@@ -123,7 +181,7 @@ func (peer *Peer) HopStatus() (HopStatus, bool) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	st := HopStatus{Budget: h.budget, BudgetLeft: h.left}
+	st := HopStatus{Budget: h.budget, BudgetLeft: h.left, External: h.noBudget}
 	if h.current != nil {
 		st.Carrying = h.current.DstToString()
 	}
@@ -146,6 +204,12 @@ func (peer *Peer) hopAccountSend(eps []conn.Endpoint) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.noBudget {
+		// external rotation modes never rotate on the send path, and the
+		// hop mutex excludes a concurrent external rotation from the middle
+		// of a batch, so there is nothing to account or re-address
+		return
+	}
 	now := time.Now()
 	if !h.degradedUntil.IsZero() && now.Before(h.degradedUntil) {
 		return

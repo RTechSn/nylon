@@ -344,6 +344,12 @@ func (n *Nylon) syncWireGuardEndpoints() error {
 				return cmp.Compare(a.Metric(), b.Metric())
 			})
 			for _, ep := range links {
+				// port hopping: burned (retired) ports must not receive
+				// fresh handshake initiations — their links exist only for
+				// late pongs and are removed after the tombstone grace.
+				if ep.IsExhausted() {
+					continue
+				}
 				nep, err := ep.AsNylonEndpoint().GetWgEndpoint(n.Device, n.EndpointResolver)
 				if err != nil {
 					continue

@@ -46,8 +46,15 @@ type Nylon struct {
 	// endpoints from the port pool and materialise them as regular nylon
 	// links, so runtime state stays O(active window) instead of O(range).
 	portHopping struct {
-		mu        sync.Mutex
-		factories map[state.NodeId]*portFactory
+		mu            sync.Mutex
+		factories     map[state.NodeId]*portFactory
+		appliedPolicy string // signature of the last applied hop policy (change detection for the "port hop policy applied" log)
+
+		// hintSigs carries the per-peer data-arrival adoption slot (see
+		// hopAdoptDataArrival): a lock-free sync.Map read on the TC hot path
+		// that bounds adoption dispatches to at most ONE queued adoption per
+		// peer, no matter how fast the carrying port rotates.
+		hintSigs sync.Map // state.NodeId -> *hopAdoptionState
 	}
 
 	// port hopping (server half, listen_mode: nftables): the daemon-owned
@@ -77,6 +84,16 @@ type Nylon struct {
 	DispatchChannel chan func() error
 	Log             *slog.Logger
 	ConfigPath      string
+
+	// dispatchDrops accounts control-plane functions discarded on a full
+	// dispatch channel (see recordDispatchDrop): a running window count plus
+	// the last journalled overflow, so a saturation episode is one readable
+	// ERROR line instead of one per dropped function.
+	dispatchDrops struct {
+		mu      sync.Mutex
+		window  uint64
+		lastLog time.Time
+	}
 
 	// resources
 	Tun           tun.Device
@@ -116,7 +133,14 @@ type AppliedSystemState struct {
 func NewNylon(ccfg state.CentralCfg, ncfg state.LocalCfg, logger *slog.Logger, configPath string, aux map[string]any, opts state.NylonOptions, tunables *state.RouterTunables) (*Nylon, error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 
-	dispatch := make(chan func() error, 128)
+	// The channel is deep rather than lossless-by-design: producers are
+	// multiplexed across goroutines (periodic tasks, TC adoption, probe
+	// timers, route handling) while a single loop consumes them, so any
+	// scheduling stall (cgroup CPU quota throttling, GC, a busy VPS under a
+	// rotation storm) converts directly into queue growth. 512 slots absorbs
+	// multi-hundred-millisecond stalls of the post-coalescing producer rate;
+	// the overflow itself is accounted in perf.DispatchDropsTotal.
+	dispatch := make(chan func() error, dispatchChannelCapacity)
 	runtimeCfg, err := ccfg.Clone()
 	if err != nil {
 		cancel(err)

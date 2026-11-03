@@ -192,6 +192,16 @@ func (p *PortPool) drawFromGroupLocked(g PortGroup, ignoreRecent bool) (netip.Ad
 // Select draws the next carrying endpoint, preferring candidates maximally
 // dissimilar from `avoid` (the currently active window members). It returns
 // ErrPoolExhausted when nothing is selectable.
+//
+// Selection is random-sampled for diversity, but exhaustion is EXACT: when
+// the sampling finds nothing, the ranges are walked deterministically before
+// ErrPoolExhausted is reported. A bounded random sampler alone cannot prove
+// the pool empty — near the end of a sweep, when only a handful of ports
+// remain eligible, every attempt can miss them and the miss reads as
+// exhaustion (field report: sweeps over a 501-port range ended 1-13 ports
+// early, and with auto_recycle every premature miss fired a clean-slate
+// restart, so the recycle journal showed back-to-back clears while good
+// ports were still available).
 func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -209,6 +219,10 @@ func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 	}
 	var cands []cand
 	seen := make(map[netip.AddrPort]struct{})
+	avoidSet := make(map[netip.AddrPort]struct{}, len(avoid))
+	for _, a := range avoid {
+		avoidSet[a] = struct{}{}
+	}
 
 	totalPorts := 0
 	for _, g := range p.groups {
@@ -262,7 +276,10 @@ func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 	}
 
 	// Fallback: the recent ring covers the whole group space; retry ignoring
-	// it (cooldown still applies).
+	// it (cooldown still applies). Members of the active window are skipped
+	// here: rotating the carrying port onto itself would silently reset its
+	// budget and defeat the hop while any alternative port exists (the
+	// deterministic scan below keeps the sole-port case working).
 	if len(cands) == 0 {
 		for i := 0; i < 32 && len(cands) < 4; i++ {
 			ap, ok := p.drawFromGroupLocked(p.groups[rand.IntN(len(p.groups))], true)
@@ -272,7 +289,18 @@ func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 			if _, dup := seen[ap]; dup {
 				continue
 			}
+			if _, active := avoidSet[ap]; active {
+				continue
+			}
 			seen[ap] = struct{}{}
+			cands = append(cands, cand{ap: ap, score: scoreOf(ap)})
+		}
+	}
+	// Last resort: the random sampling found nothing. Walk the ranges
+	// deterministically so exhaustion is exact — ErrPoolExhausted must mean
+	// that every port of every group is cooling down, nothing weaker.
+	if len(cands) == 0 {
+		if ap, ok := p.scanEligibleLocked(avoidSet); ok {
 			cands = append(cands, cand{ap: ap, score: scoreOf(ap)})
 		}
 	}
@@ -304,4 +332,89 @@ func (p *PortPool) Select(avoid []netip.AddrPort) (netip.AddrPort, error) {
 	p.recent = append(p.recent, chosen)
 	p.recSet[chosen] = struct{}{}
 	return chosen, nil
+}
+
+// scanEligibleLocked deterministically walks every port of every group and
+// returns the first eligible endpoint, in three passes of decreasing
+// strictness: (1) not cooling, outside the recent ring and outside the active
+// window; (2) recent ring relaxed; (3) active window relaxed — a rotation
+// onto the current carrying port is only ever forced when it is the sole
+// port left anywhere. Each group is entered at a random offset so the walk
+// carries no positional bias. This is Select's exactness backstop: it is
+// reached only when the random sampling found nothing, which near the end of
+// a sweep happens while a handful of eligible ports remain.
+func (p *PortPool) scanEligibleLocked(avoidSet map[netip.AddrPort]struct{}) (netip.AddrPort, bool) {
+	for pass := 0; pass < 3; pass++ {
+		for _, g := range p.groups {
+			n := g.Ports.Size()
+			if n <= 0 {
+				continue
+			}
+			start := rand.IntN(n)
+			for i := 0; i < n; i++ {
+				ap := netip.AddrPortFrom(g.Addr, g.Ports.First+uint16((start+i)%n))
+				if _, cool := p.cooldown[ap]; cool {
+					continue
+				}
+				if pass < 2 {
+					if _, active := avoidSet[ap]; active {
+						continue
+					}
+				}
+				if pass == 0 {
+					if _, rec := p.recSet[ap]; rec {
+						continue
+					}
+				}
+				return ap, true
+			}
+		}
+	}
+	return netip.AddrPort{}, false
+}
+
+// SetCooldown adjusts the retirement quarantine duration — a live config
+// change of port_hopping.cooldown_seconds applies without a restart. A
+// shortened window clamps already-quarantined ports so everything lifts
+// within the new duration; a lengthened window never extends entries that
+// were retired under the old policy.
+func (p *PortPool) SetCooldown(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d <= 0 {
+		return
+	}
+	old := p.cfg.Cooldown
+	p.cfg.Cooldown = d
+	if d >= old || len(p.cooldown) == 0 {
+		return
+	}
+	now := p.nowFn()
+	next := time.Time{}
+	for ap, exp := range p.cooldown {
+		if ne := now.Add(d); ne.Before(exp) {
+			exp = ne
+			p.cooldown[ap] = exp
+		}
+		if next.IsZero() || exp.Before(next) {
+			next = exp
+		}
+	}
+	p.nextExp = next
+}
+
+// Recycle empties the retirement quarantine and the recent-selection ring —
+// a clean-slate restart for the auto_recycle policy: once every port is
+// cooling down and the pool would stall, the operator opted into releasing
+// all retired ports and starting a fresh sweep. Groups are untouched. It
+// returns how many quarantined ports were released (for the journal line).
+func (p *PortPool) Recycle() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cleared := len(p.cooldown)
+	p.cooldown = make(map[netip.AddrPort]time.Time)
+	p.nextExp = time.Time{}
+	p.recent = p.recent[:0]
+	p.recSet = make(map[netip.AddrPort]struct{})
+	return cleared
 }

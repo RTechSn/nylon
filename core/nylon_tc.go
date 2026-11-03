@@ -20,6 +20,22 @@ const (
 func (n *Nylon) InstallTC() {
 	t := n.Trace
 
+	// port hopping: adopt the arrival endpoint of a peer's DATA traffic
+	// into the matching link's pin. Must run FIRST so every incoming
+	// element (including ones later bounced or dropped by downstream
+	// filters) gets the chance to move the pin; nylon protocol packets
+	// (IP version 8) are excluded — their adoption paths in
+	// handleNylonPacket are the pong-aware ones.
+	n.Device.InstallFilter(func(dev *device.Device, packet *device.TCElement) (device.TCAction, error) {
+		if packet.Incoming() && packet.FromPeer != nil && packet.FromEp != nil {
+			switch packet.GetIPVersion() {
+			case 4, 6:
+				n.hopAdoptDataArrival(packet.FromPeer, packet.FromEp)
+			}
+		}
+		return device.TcPass, nil
+	})
+
 	if n.DBG_trace_tc {
 		n.Device.InstallFilter(func(dev *device.Device, packet *device.TCElement) (device.TCAction, error) {
 			if packet.Validate() { // make sure it's an IP packet
@@ -208,14 +224,20 @@ func (n *Nylon) handleNylonPacket(packet []byte, endpoint conn.Endpoint, peer *d
 		switch pkt.Type.(type) {
 		case *protocol.Ny_SeqnoRequestOp:
 			n.Dispatch(func() error {
+				// port hopping: control traffic rides the peer's current
+				// carrying port, so its arrival endpoint is the freshest
+				// flow to answer and probe through (see adoptLinkEndpoint)
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleSeqnoRequest(neigh, pkt.GetSeqnoRequestOp())
 			})
 		case *protocol.Ny_RouteOp:
 			n.Dispatch(func() error {
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleRouteUpdate(neigh, pkt.GetRouteOp())
 			})
 		case *protocol.Ny_AckRetractOp:
 			n.Dispatch(func() error {
+				n.adoptLinkEndpoint(neigh, endpoint)
 				return n.routerHandleAckRetract(neigh, pkt.GetAckRetractOp())
 			})
 		case *protocol.Ny_ProbeOp:

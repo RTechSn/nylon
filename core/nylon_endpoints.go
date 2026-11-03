@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"fmt"
 	"math/rand/v2"
+	"net/netip"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/encodeous/nylon/polyamide/conn"
@@ -86,6 +88,7 @@ func (n *Nylon) sendEndpointProbe(node state.NodeId, ep *state.NylonEndpoint, ti
 	if err != nil {
 		return fail(protocol.EndpointProbeStatus_ENDPOINT_PROBE_RESOLVE_ERROR, err)
 	}
+	nep = n.hopProbeEndpoint(peer, nep)
 	resolved = nep.DstIPPort().String()
 	token := rand.Uint64()
 	sentAt := time.Now()
@@ -129,6 +132,23 @@ func (n *Nylon) sendEndpointProbe(node state.NodeId, ep *state.NylonEndpoint, ti
 	}()
 
 	return resultFuture, nil
+}
+
+// hopProbeEndpoint picks the endpoint a probe egresses through: when the
+// link's address is where the device is currently sending to this peer, ride
+// the peer's LIVE endpoint instead of the link's stored one. val[0] follows
+// every authenticated arrival (SetEndpointFromPacket's reply-port symmetry),
+// so it carries the freshest local reply-port hint — the probe leaves through
+// the peer's current carrying port and switches with the rotation instead of
+// lingering on the port the link pin last saw. This also merges the probe
+// flow of the peer's advertised endpoint (same address as the arrival source
+// when not NAT'd) onto the carrying port, instead of pinning a static 1 Hz
+// probe-pong flow onto the first port of the range forever.
+func (n *Nylon) hopProbeEndpoint(peer *device.Peer, nep conn.Endpoint) conn.Endpoint {
+	if cur := peer.CurrentEndpoint(); cur != nil && cur.DstIPPort() == nep.DstIPPort() {
+		return cur
+	}
+	return nep
 }
 
 func handleProbe(n *Nylon, pkt *protocol.Ny_Probe, endpoint conn.Endpoint, peer *device.Peer, node state.NodeId) {
@@ -201,8 +221,46 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 	// create a new link if we dont have a link
 	for _, neigh := range n.RouterState.Neighbours {
 		if neigh.Id == node {
+			// port hopping: never learn a remote link inside a
+			// factory-managed port range. The local node owns port
+			// selection for those ranges (the port factory
+			// materialises exactly one carrying link at a time); an
+			// inbound packet from a range port that matches no
+			// local link is a stale rotation artefact — the peer
+			// answering or probing through a port the factory
+			// rotated away from. Learning it would create an
+			// immortal zombie: remote links are exempt from the
+			// factory's tombstoning, are probed at the full stock
+			// cadence, and every pong renews them, so the peer
+			// keeps answering and the port never goes quiet.
+			if n.hopOwnedEndpoint(node, wgEndpoint.DstIPPort()) {
+				return
+			}
 			newEp := state.NewEndpoint(wgEndpoint.DstIPPort().String(), true, wgEndpoint, &n.RouterTunables)
 			newEp.Renew()
+			// Port hopping / NAT churn hygiene: a peer's flow rotates its SOURCE
+			// mapping too (per-flow NAT allocations change on every destination
+			// rotation). The freshly learned link is by definition where the peer
+			// lives NOW; any older remote link of this peer is a rotation leftover
+			// whose only life support is the 1 Hz probe->pong loop through its own
+			// pinned hint port — the pongs renew it, which keeps the NAT mapping
+			// alive, which keeps the pongs coming. Supersede them (exhaust now,
+			// grace removal later); late pongs cannot resurrect them (the
+			// IsExhausted guards in this file). Configured (non-remote) links are
+			// the operator's explicit multipath and stay untouched; a genuinely
+			// still-alive source re-learns its link on the peer's next ping.
+			for _, ep := range neigh.Eps {
+				if !ep.IsRemote() || ep.IsExhausted() {
+					continue
+				}
+				old := ep.AsNylonEndpoint()
+				if old == newEp || old.Address == newEp.Address {
+					continue
+				}
+				old.MarkExhausted()
+				n.scheduleExhaustedLinkRemoval(node, old.Address)
+				n.Log.Debug("probe from new source: superseded older remote link", "node", node, "link", old.Address, "new", newEp.Address)
+			}
 			neigh.Eps = append(neigh.Eps, newEp)
 			// push route update to improve convergence time
 			ComputeRoutes(n.RouterState, n)
@@ -210,6 +268,170 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 			return
 		}
 	}
+}
+
+// adoptLinkEndpoint re-pins the neighbour link matching an inbound nylon
+// packet's arrival endpoint to that endpoint. A link's stored wireguard
+// endpoint otherwise only follows probe pings, which a port-hopping peer may
+// not send for a full relaxed probe interval — or at all, when its rotation
+// period is shorter — so the stored endpoint can linger on a port the peer
+// rotated away from while its data and control traffic have long since moved
+// on. Route updates and other control traffic keep flowing on the peer's
+// CURRENT carrying port, making their arrival endpoint the freshest flow to
+// answer and probe through. Probe pongs are deliberately NOT adopted (see
+// handleProbePong): a pong is sent to wherever OUR ping came from, so
+// adopting it pins the link's outbound port onto itself.
+//
+// Must run on the dispatch loop.
+func (n *Nylon) adoptLinkEndpoint(node state.NodeId, ep conn.Endpoint) {
+	if ep == nil {
+		return
+	}
+	ap := ep.DstIPPort()
+	for _, neigh := range n.RouterState.Neighbours {
+		if neigh.Id != node {
+			continue
+		}
+		for _, dep := range neigh.Eps {
+			dep := dep.AsNylonEndpoint()
+			lap, err := n.EndpointResolver.Get(dep.Address)
+			if err == nil && lap == ap {
+				if dep.WgEndpoint != ep {
+					dep.WgEndpoint = ep
+				}
+				return
+			}
+		}
+		return
+	}
+}
+
+// scheduleExhaustedLinkRemoval removes the neighbour's link for addr after the
+// tombstone grace (hopTombstoneGrace), but ONLY if it is still exhausted by
+// then — a port redrawn inside the grace window materialises a FRESH
+// (non-exhausted) link that must survive the stale timer, and a source
+// genuinely still alive re-learns its link on the peer's next ping. Used by
+// the port factory's rotation tombstoning and by the remote-link supersede
+// path in handleProbePing. Safe to call more than once for the same address:
+// extra runs find nothing eligible to delete.
+//
+// Leak-recovery backstop: if the grace timer's dispatch lands on a saturated
+// channel it is DISCARDED and nothing re-arms it, so the tombstone would live
+// in Neighbour.Eps forever. gcHopTombstones (the 1 Hz GC pass) reaps anything
+// still exhausted a grace past its window — see MarkExhaustedAt.
+func (n *Nylon) scheduleExhaustedLinkRemoval(node state.NodeId, addr string) {
+	time.AfterFunc(hopTombstoneGrace, func() {
+		if n.Context.Err() != nil {
+			return
+		}
+		n.Dispatch(func() error {
+			neigh := n.RouterState.GetNeighbour(node)
+			if neigh == nil {
+				return nil
+			}
+			for i, ep := range neigh.Eps {
+				if ep.AsNylonEndpoint().Address == addr && ep.IsExhausted() {
+					neigh.Eps = slices.Delete(neigh.Eps, i, i+1)
+					break
+				}
+			}
+			return nil
+		})
+	})
+}
+
+// hopArrivalSig is the arrival signature used to rate-limit data-traffic
+// adoption: the peer's source address plus the local reply-port hint of the
+// port the packet arrived on.
+type hopArrivalSig struct {
+	addr netip.AddrPort
+	hint uint16
+}
+
+// hopAdoption is one peer's latest data-arrival snapshot: the arrival
+// signature and the endpoint to adopt. Swapped atomically by the TC hot path
+// (pointer publication), so an adoption closure queued earlier always reads a
+// value at least as fresh as anything stored before it started running.
+type hopAdoption struct {
+	sig hopArrivalSig
+	ep  conn.Endpoint
+}
+
+// hopAdoptionState is the per-peer adoption slot: the latest arrival plus the
+// at-most-one-queued-adoption flag (see hopAdoptDataArrival).
+type hopAdoptionState struct {
+	cur     atomic.Pointer[hopAdoption]
+	pending atomic.Bool
+}
+
+// hopAdoptDataArrival re-pins the neighbour link matching an inbound DATA
+// packet's arrival endpoint to that endpoint (see adoptLinkEndpoint). Data is
+// the freshest and most abundant signal of which local port the peer's flow
+// is currently addressed to — relying only on probe pings and control traffic
+// left the pin a full probe/adoption cycle behind every rotation, and every
+// reader of the pin (the 1 Hz probe stream, the 1s SetEndpoints refresh of the
+// device peer endpoint) kept answering through the port the peer just rotated
+// away from.
+//
+// Runs on the TC hot path: the signature check is a lock-free sync.Map read,
+// so the cost per packet is negligible. Adoption work is COALESCED per peer:
+// the first arrival through a new (address, reply-port) pair dispatches an
+// adoption immediately, and while one is still queued every further rotation
+// only swaps the snapshot it will read — a rotation storm at hundreds of
+// rotations per second costs at most ONE queued adoption per peer, never one
+// dispatch per rotation (a storm-rate producer is exactly what saturates the
+// dispatch channel and discards unrelated control-plane work). The pin's
+// consumers run at tick cadence (SetEndpoints, the relaxed probe loop), so
+// the coalescing lag is invisible to them. Nylon protocol packets are
+// deliberately excluded — their adoption paths are the existing, pong-aware
+// ones (see handleNylonPacket).
+func (n *Nylon) hopAdoptDataArrival(peer *device.Peer, ep conn.Endpoint) {
+	if ep == nil {
+		return
+	}
+	nt := n.PeerMap.Load()
+	if nt == nil {
+		return
+	}
+	node, ok := (*nt)[state.NyPublicKey(peer.GetPublicKey())]
+	if !ok {
+		return
+	}
+	sig := hopArrivalSig{addr: ep.DstIPPort()}
+	if h, ok := ep.(interface{ PortHint() uint16 }); ok {
+		sig.hint = h.PortHint()
+	}
+	v, _ := n.portHopping.hintSigs.LoadOrStore(node, &hopAdoptionState{})
+	st := v.(*hopAdoptionState)
+	if cur := st.cur.Load(); cur != nil && cur.sig == sig {
+		return
+	}
+	st.cur.Store(&hopAdoption{sig: sig, ep: ep})
+	if st.pending.Swap(true) {
+		// an adoption for this peer is already queued; it reads the snapshot
+		// above when it runs, which is at least as fresh as this arrival
+		return
+	}
+	n.Dispatch(func() error {
+		for {
+			cur := st.cur.Load()
+			if cur == nil {
+				st.pending.Store(false)
+				return nil
+			}
+			n.adoptLinkEndpoint(node, cur.ep)
+			st.pending.Store(false)
+			// An arrival that landed while we were adopting saw pending=true
+			// and queued nothing; pick it up here instead of waiting for the
+			// next signature change.
+			if next := st.cur.Load(); next == cur {
+				return nil
+			}
+			if !st.pending.CompareAndSwap(false, true) {
+				return nil // another arrival already queued a fresh adoption
+			}
+		}
+	})
 }
 
 func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint) {

@@ -32,6 +32,15 @@ var (
 	TunKernelTxDroppedTotal atomic.Uint64 // /sys/class/net/<iface>/statistics/tx_dropped, last sample
 )
 
+// DispatchDropsTotal counts control-plane functions DISCARDED because the
+// dispatch channel was full (see Nylon.Dispatch). Unlike the TUN datapath
+// counters these are not packet losses: each drop is lost control-plane work
+// — a skipped probe pass, an unhandled route update, a leaked tombstoned link
+// (the GC backstop recovers the leak, but the work is still gone). A non-zero
+// value means the main loop fell behind its producers for longer than the
+// channel could absorb.
+var DispatchDropsTotal atomic.Uint64
+
 // Sample is a single Prometheus sample derived from the live perf counters.
 type Sample struct {
 	Name   string
@@ -93,6 +102,7 @@ var perfTotals = []struct {
 	{"nylon_tun_staged_drops_total", "Packets evicted from a per-peer staged queue because they were too old.", &TunStagedDropsTotal},
 	{"nylon_tun_write_queue_drops_total", "Bounce packets dropped because the target TUN writer queue was full.", &TunWriteQueueDropsTotal},
 	{"nylon_tun_kernel_tx_dropped_total", "Kernel tx_dropped counter of the TUN interface (last sample, resets with the interface).", &TunKernelTxDroppedTotal},
+	{"nylon_dispatch_drops_total", "Control-plane functions discarded because the dispatch channel was full (lost probe passes, route handling, link removals).", &DispatchDropsTotal},
 }
 
 // Snapshot converts the live counters via String() into Prometheus samples.

@@ -220,3 +220,137 @@ func TestHopStatusReportsState(t *testing.T) {
 		t.Fatal("HopStatus reported hopping active for a plain peer")
 	}
 }
+
+// newExternalHopPeer builds a peer whose hop source is externally driven
+// (static/reactive/timed modes): no packet budget, no send-path rotation.
+func newExternalHopPeer(src HopSource) *Peer {
+	peer := &Peer{device: &Device{Log: &Logger{Verbosef: DiscardLogf}}}
+	peer.SetHopExternal(src)
+	return peer
+}
+
+// TestHopExternalModeNeverRotatesOnSendPath verifies that an externally
+// driven hop never rotates on the packet send path: an arbitrarily large
+// batch stays on the carrying endpoint and never retires it.
+func TestHopExternalModeNeverRotatesOnSendPath(t *testing.T) {
+	src := &fakeHopSource{next: []*portEP{{ap(1000)}, {ap(1001)}, {ap(1002)}}}
+	peer := newExternalHopPeer(src)
+
+	first := peer.hopCarrying()
+	if first == nil || first.DstIPPort() != ap(1000) {
+		t.Fatalf("first carrying = %v, want %v", first, ap(1000))
+	}
+
+	eps := make([]conn.Endpoint, 64)
+	for i := range eps {
+		eps[i] = first
+	}
+	peer.hopAccountSend(eps)
+
+	for i, ep := range eps {
+		if ep.DstIPPort() != ap(1000) {
+			t.Fatalf("eps[%d] re-addressed to %v; external mode must not rotate mid-batch", i, ep.DstIPPort())
+		}
+	}
+	if len(src.retired) != 0 {
+		t.Fatalf("external mode retired %v on the send path; want none", src.retired)
+	}
+	if st, _ := peer.HopStatus(); !st.External || st.Budget != 0 {
+		t.Fatalf("HopStatus = %+v, want External=true Budget=0", st)
+	}
+}
+
+// TestHopExternalRotateRewiresCarrying verifies the controller-driven
+// rotation: the current carrying endpoint is handed over as exhausted and
+// its replacement becomes the carrying endpoint for subsequent sends.
+func TestHopExternalRotateRewiresCarrying(t *testing.T) {
+	src := &fakeHopSource{next: []*portEP{{ap(1000)}, {ap(1001)}}}
+	peer := newExternalHopPeer(src)
+
+	if first := peer.hopCarrying(); first.DstIPPort() != ap(1000) {
+		t.Fatalf("first carrying = %v", first.DstIPPort())
+	}
+
+	dest, err := peer.HopExternalRotate()
+	if err != nil {
+		t.Fatalf("HopExternalRotate: %v", err)
+	}
+	if dest != ap(1001).String() {
+		t.Fatalf("rotated to %q, want %q", dest, ap(1001).String())
+	}
+	if len(src.retired) != 1 || src.retired[0] != ap(1000) {
+		t.Fatalf("retired = %v, want [%v]", src.retired, ap(1000))
+	}
+	if second := peer.hopCarrying(); second.DstIPPort() != ap(1001) {
+		t.Fatalf("carrying after external rotation = %v, want %v", second.DstIPPort(), ap(1001))
+	}
+}
+
+// TestHopExternalRotateFailureKeepsCarrying verifies that a failed external
+// rotation (source error, e.g. pool exhausted) leaves the carrying endpoint
+// untouched.
+func TestHopExternalRotateFailureKeepsCarrying(t *testing.T) {
+	src := &fakeHopSource{next: []*portEP{{ap(1000)}}}
+	peer := newExternalHopPeer(src)
+
+	if first := peer.hopCarrying(); first.DstIPPort() != ap(1000) {
+		t.Fatalf("first carrying = %v", first.DstIPPort())
+	}
+
+	src.fail = true
+	if _, err := peer.HopExternalRotate(); err == nil {
+		t.Fatal("HopExternalRotate succeeded against a failing source")
+	}
+	if cur := peer.hopCarrying(); cur == nil || cur.DstIPPort() != ap(1000) {
+		t.Fatalf("carrying after failed rotation = %v, want %v", cur, ap(1000))
+	}
+
+	// a peer without hop state refuses external rotation
+	plain := &Peer{device: &Device{Log: &Logger{Verbosef: DiscardLogf}}}
+	if _, err := plain.HopExternalRotate(); err == nil {
+		t.Fatal("HopExternalRotate succeeded on a peer without hop state")
+	}
+}
+
+// TestHopModeSwitchKeepsCarrying verifies live mode switches between the
+// budgeted (proactive) and externally driven (static/reactive/timed) hop
+// styles: the current carrying endpoint survives the switch, and budget
+// accounting resumes when the budgeted style is re-armed.
+func TestHopModeSwitchKeepsCarrying(t *testing.T) {
+	src := &fakeHopSource{next: []*portEP{{ap(1000)}, {ap(1001)}, {ap(1002)}}}
+	peer := newHopTestPeer(3, src)
+
+	first := peer.hopCarrying()
+	if first.DstIPPort() != ap(1000) {
+		t.Fatalf("first carrying = %v", first.DstIPPort())
+	}
+
+	// proactive -> external: the carrying endpoint survives, budget stops
+	peer.SetHopExternal(src)
+	if cur := peer.hopCarrying(); cur.DstIPPort() != ap(1000) {
+		t.Fatalf("carrying after switch to external = %v, want %v", cur.DstIPPort(), ap(1000))
+	}
+	big := make([]conn.Endpoint, 32)
+	for i := range big {
+		big[i] = first
+	}
+	peer.hopAccountSend(big)
+	if len(src.retired) != 0 {
+		t.Fatalf("external accounting retired %v", src.retired)
+	}
+
+	// external -> proactive: budget accounting resumes from the carrying
+	peer.SetHop(src, 3)
+	if st, _ := peer.HopStatus(); st.External || st.Budget != 3 {
+		t.Fatalf("HopStatus after re-arming budget = %+v, want External=false Budget=3", st)
+	}
+	eps := []conn.Endpoint{first, first, first, first}
+	peer.hopAccountSend(eps)
+	// budget 3: the 4th buffer forces a rotation onto the next endpoint
+	if eps[3].DstIPPort() != ap(1001) {
+		t.Fatalf("eps[3] = %v after re-armed budget; want rotation to %v", eps[3].DstIPPort(), ap(1001))
+	}
+	if len(src.retired) != 1 || src.retired[0] != ap(1000) {
+		t.Fatalf("retired after re-armed budget = %v, want [%v]", src.retired, ap(1000))
+	}
+}

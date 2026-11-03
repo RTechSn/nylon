@@ -2,7 +2,9 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"slices"
@@ -21,6 +23,12 @@ import (
 // pure bookkeeping.
 const hopTombstoneGrace = 15 * time.Second
 
+// hopDrawnRegistryCap is the default size of a factory's drawn-port registry
+// (see portFactory.registerDrawn). ensurePortFactories raises it to
+// max(4 x recent_ports, this) so the registry comfortably covers the recent
+// ring plus the tombstone-grace horizon of the latest rotations.
+const hopDrawnRegistryCap = 64
+
 // hopProbeFraction scales LinkDeadThreshold into the probe interval for
 // factory-managed links: the stock 1s probe cadence would burn a port's whole
 // packet budget in seconds while idle. The interval stays below
@@ -33,6 +41,15 @@ const hopProbeFraction = 0.8
 // at Debug, and at most one Info line per interval summarises them
 // ("rotations" counts the rotations covered by the line).
 const hopRotationLogInterval = time.Second
+
+// hopReactiveProbeStreak is how many consecutive unanswered probe attempts
+// on the carrying endpoint trigger a reactive rotation. The peer's own
+// traffic (its probe pings riding the reverse flow) keeps the link IsActive
+// while OUR direction to the port is blackholed — liveness alone cannot
+// expose that, but our probes going unanswered does. Three consecutive
+// timeouts (at the relaxed probe cadence that is roughly 6-8s) tolerates a
+// single lost pong while still rotating inside a middlebox ban window.
+const hopReactiveProbeStreak = 3
 
 // hopPoolWarnInterval bounds how often the pool-exhaustion warning fires
 // while rotation is stalled (every candidate port cooling down).
@@ -75,8 +92,8 @@ type portFactory struct {
 	n    *Nylon
 	node state.NodeId
 
-	// mu guards current, prev, specs, bind and the log-rate-limit fields; the
-	// pool has its own locking.
+	// mu guards current, prev, specs, bind, the rotation-policy fields and
+	// the log-rate-limit fields; the pool has its own locking.
 	mu      sync.Mutex
 	specs   []state.EndpointSpec // range-form endpoints from the neighbour's config
 	pool    *state.PortPool
@@ -85,9 +102,50 @@ type portFactory struct {
 	// lastProbeAt is the last relaxed-cadence probe of the current link.
 	lastProbeAt time.Time
 
+	// rotation policy (refreshed by ensurePortFactories on every pass); the
+	// mode governs WHEN the carrying endpoint rotates (see state.HopMode*)
+	mode       string        // static | reactive | proactive | timed
+	period     time.Duration // timed: nominal rotation interval
+	jitterPct  uint32        // timed: jitter as a percentage of period
+	nextRotate time.Time     // timed: deadline of the next scheduled rotation (zero = not scheduled)
+	// rotateReason decorates the next rotation's log line when the rotation
+	// is externally driven (reactive/timed); consumed by logRotation.
+	rotateReason string
+
+	// devPeer is the device peer this factory serves, cached on the dispatch
+	// loop (device peers are recreated on config re-applies). External
+	// rotations (reactive/timed) are driven from the dispatch loop through
+	// it, never from the send path.
+	devPeer *device.Peer
+
 	// rotation log rate limiting
 	lastRotationLog time.Time
 	rotationCount   uint64
+
+	// recycle_seconds epoch bookkeeping (guarded by mu): how many carrying
+	// endpoints were drawn since the last clean-slate restart and when it
+	// happened; recycleMin (the resolved port_hopping.recycle_seconds) is
+	// the rate limit between restarts. Every recycle journal line carries
+	// the epoch as swept=/elapsed= so a restart is self-evidently preceded
+	// by a FULL re-exhaustion of the range (swept ≈ range size) —
+	// back-to-back lines without that context read like a recycle loop
+	// while a ~500-rotation sweep silently unfolded between them (the
+	// per-second rotation summary folds it away).
+	recycleMin        time.Duration
+	drawsSinceRecycle uint64
+	lastRecycleAt     time.Time
+
+	// drawnPort registry: every address this factory ever drew (bounded FIFO).
+	// Tombstoning and the remote-link learning guard consult it IN ADDITION to
+	// ownsEndpoint, whose address check re-resolves the range spec host
+	// through the live resolver — a DNS answer change (dual-stack A/AAAA
+	// round-robin, DDNS flip) would otherwise retroactively de-own every link
+	// drawn under the old address, leaving retired links never tombstoned:
+	// probed at the full 1s cadence and renewed by every pong forever (the
+	// "every port ever used still shows tx/rx on the router" zombie).
+	drawn      map[string]struct{}
+	drawnOrder []string
+	drawnCap   int
 
 	// pool-exhaustion warn rate limiting
 	lastPoolWarn time.Time
@@ -103,6 +161,54 @@ type portFactory struct {
 	bind conn.Bind
 }
 
+// registerDrawn records an address this factory drew as a carrying endpoint
+// (or pinned, in static mode). Bounded FIFO: the registry only needs to cover
+// the live link window plus the grace/probe-timeout horizon of the latest
+// rotations — tombstoning and stale-ping learning both concern links of the
+// recent past, not ports drawn an hour ago.
+func (f *portFactory) registerDrawn(ap netip.AddrPort) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drawnCap <= 0 {
+		f.drawnCap = hopDrawnRegistryCap
+	}
+	if f.drawn == nil {
+		f.drawn = make(map[string]struct{})
+	}
+	if _, ok := f.drawn[ap.String()]; !ok {
+		f.drawn[ap.String()] = struct{}{}
+		f.drawnOrder = append(f.drawnOrder, ap.String())
+	}
+	for len(f.drawnOrder) > f.drawnCap {
+		oldest := f.drawnOrder[0]
+		f.drawnOrder = f.drawnOrder[1:]
+		delete(f.drawn, oldest)
+	}
+}
+
+// drewEndpoint reports whether the addr:port was ever drawn by this factory
+// (see registerDrawn): such a link is by construction factory-owned, whatever
+// the resolver currently answers for the spec host.
+func (f *portFactory) drewEndpoint(ap netip.AddrPort) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drawn == nil {
+		return false
+	}
+	_, ok := f.drawn[ap.String()]
+	return ok
+}
+
+// ownsOrDrew reports whether the addr:port belongs to this factory's link
+// lifecycle: drawn by it at any point, or lying inside one of its currently
+// configured ranges (see ownsEndpoint). The union — never the intersection —
+// is what tombstoning and the learning guard need: a resolver flip must
+// never exempt a previously drawn port, and a spec range change must still
+// cover ports inside the new ranges.
+func (f *portFactory) ownsOrDrew(ap netip.AddrPort) bool {
+	return f.drewEndpoint(ap) || f.ownsEndpoint(ap)
+}
+
 // bindIfReady returns the cached device bind, or nil before the factory has
 // been wired on the dispatch loop.
 func (f *portFactory) bindIfReady() conn.Bind {
@@ -113,7 +219,28 @@ func (f *portFactory) bindIfReady() conn.Bind {
 
 // hopFactories returns (creating if needed) the factory for a peer. Must be
 // called on the dispatch loop.
-func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, policy state.PortHoppingPolicy) *portFactory {
+func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, policy state.PortHoppingPolicy, wgPeer *device.Peer) *portFactory {
+	// CAUTION: the device bind must be acquired BEFORE any factory lock. The
+	// packet send path (Peer.SendBuffers) holds the device net lock in READ
+	// mode across its whole body — including the factory mutex sections inside
+	// NextHopEndpoint — so acquiring the net WRITE lock (Device.Bind) while
+	// holding f.mu inverts the lock order against the send path:
+	//
+	//      dispatch loop:  f.mu -> net.WLock
+	//      send path:      net.RLock -> f.mu
+	//
+	// Whenever the two align, the dispatch loop parks waiting for the write
+	// lock that only the sender can grant (by dropping its read lock), while
+	// the sender parks waiting for f.mu that the dispatch loop holds: a
+	// permanent deadlock with an idle CPU. The window is microseconds in
+	// steady state, but anything that keeps a sender inside its net READ lock
+	// for longer (a pool-exhaustion scan, lock contention under a rotation
+	// storm) widens it to near-certainty — and every dispatch after the freeze
+	// is discarded, so no link is ever materialised again. Taking the bind
+	// first, with no factory lock held, removes the inversion: the sender can
+	// always finish its f.mu section and release the read lock.
+	bind := n.Device.Bind()
+
 	n.portHopping.mu.Lock()
 	defer n.portHopping.mu.Unlock()
 	if n.portHopping.factories == nil {
@@ -134,9 +261,31 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 	}
 	f.mu.Lock()
 	f.specs = slices.Clone(specs)
+	// Bounded drawn-port registry sized from the hop policy's recent ring (see
+	// registerDrawn): covers the live window plus the grace horizon.
+	f.drawnCap = max(4*int(policy.Recent), hopDrawnRegistryCap)
 	// Refresh the bind cache on the dispatch loop (see the field comment: the
-	// send path must never acquire the device net write lock).
-	f.bind = n.Device.Bind()
+	// send path must never acquire the device net write lock). The bind was
+	// acquired above, OUTSIDE every factory lock — see the CAUTION at the top
+	// of this function.
+	f.bind = bind
+	modeChanged := f.mode != policy.Mode
+	f.mode = policy.Mode
+	f.period = policy.Period
+	f.jitterPct = policy.JitterPct
+	f.recycleMin = policy.RecycleMinInterval
+	f.devPeer = wgPeer
+	// a live change of cooldown_seconds applies without a restart
+	f.pool.SetCooldown(policy.Cooldown)
+	if modeChanged {
+		if policy.Mode == state.HopModeTimed {
+			// entering timed mode: schedule the first rotation one period from
+			// now (± jitter)
+			f.nextRotate = time.Now().Add(jitterInterval(policy.Period, policy.JitterPct))
+		} else {
+			f.nextRotate = time.Time{}
+		}
+	}
 	f.mu.Unlock()
 	f.refreshGroups()
 	f.bootstrap()
@@ -198,31 +347,73 @@ func (f *portFactory) specStrings() []state.EndpointSpec {
 
 // drawAndMaterialize draws a fresh carrying endpoint (if the pool has usable
 // groups) and materialises its link, mirroring NextHopEndpoint without
-// retiring anything. Runs on the dispatch loop.
+// retiring anything. In static mode the draw is the pinned endpoint instead
+// of a pool selection. Runs on the dispatch loop.
 func (f *portFactory) drawAndMaterialize() {
 	f.mu.Lock()
+	mode := f.mode
 	avoid := make([]netip.AddrPort, 0, 1)
 	if f.current.IsValid() {
 		avoid = append(avoid, f.current)
 	}
 	f.mu.Unlock()
 
-	ap, err := f.pool.Select(avoid)
-	if err != nil {
-		// pool not ready (e.g. hostname still resolving): retried by the
-		// background resolve above and the next SyncApplicationState pass
-		return
+	var ap netip.AddrPort
+	if mode == state.HopModeStatic {
+		pinned, ok := f.pinnedEndpoint()
+		if !ok {
+			// no spec resolvable yet (hostname resolving): retried on the
+			// next SyncApplicationState pass
+			return
+		}
+		ap = pinned
+	} else {
+		drawn, err := f.pool.Select(avoid)
+		if err != nil {
+			// pool not ready (e.g. hostname still resolving): retried by the
+			// background resolve above and the next SyncApplicationState pass
+			return
+		}
+		ap = drawn
 	}
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
+	f.drawsSinceRecycle++
 	f.mu.Unlock()
+	f.registerDrawn(ap)
 	neigh := f.n.RouterState.GetNeighbour(f.node)
 	if neigh == nil {
 		return
 	}
 	f.materializeCarrying(neigh, ap, netip.AddrPort{})
-	f.n.Log.Info("port hop: initial carrying endpoint selected", "peer", f.node, "endpoint", ap.String())
+	if mode == state.HopModeStatic {
+		f.n.Log.Info("port hop: static carrying endpoint pinned", "peer", f.node, "endpoint", ap.String())
+	} else {
+		f.n.Log.Info("port hop: initial carrying endpoint selected", "peer", f.node, "endpoint", ap.String())
+	}
+}
+
+// pinnedEndpoint returns the static-mode carrying endpoint: the first port
+// of the first resolvable range spec. The listen half serves every port of
+// the range (sockets mode binds them all; nftables mode redirects them all),
+// so the first port is always a valid wire target.
+func (f *portFactory) pinnedEndpoint() (netip.AddrPort, bool) {
+	for _, spec := range f.specStrings() {
+		addr, ok := f.resolveSpecAddr(spec)
+		if !ok {
+			continue
+		}
+		return netip.AddrPortFrom(addr, spec.Ports.First), true
+	}
+	return netip.AddrPort{}, false
+}
+
+// hopMode returns the factory's active rotation mode.
+func (f *portFactory) hopMode() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mode
 }
 
 // dropPortFactory removes the factory for a peer whose config no longer
@@ -318,6 +509,12 @@ func (f *portFactory) probeReady(addr string) bool {
 // port in the pool (own locking), records the retired endpoint as prev, and
 // lets the next reconcileLinks pass sort out the links.
 func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpoint) (conn.Endpoint, error) {
+	// static mode: the carrying endpoint is pinned; there is nothing to
+	// retire and nothing to draw (also reached defensively from external
+	// rotations, which must not move a static pin).
+	if f.hopMode() == state.HopModeStatic {
+		return f.staticCarrying()
+	}
 	if exhausted != nil {
 		ap := exhausted.DstIPPort()
 		f.pool.Retire(ap)
@@ -364,13 +561,37 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 	ap, err := f.pool.Select(avoid)
 	if err != nil {
+		// recycle_seconds: every port is cooling down and the operator
+		// opted into clean-slate restarts — release the retired ports and
+		// draw again instead of stalling on the burned port until the
+		// cooldown elapses. The gate rate-limits restarts to once per the
+		// configured interval; the draw below still avoids the current
+		// endpoint.
+		if swept, elapsed, hadEpoch, ok := f.recycleGate(); ok {
+			cleared := f.pool.Recycle()
+			if cleared > 0 {
+				attrs := []any{"peer", f.node, "cleared", cleared, "swept", swept}
+				if hadEpoch {
+					attrs = append(attrs, "elapsed", elapsed)
+				}
+				f.n.Log.Info("port hop: pool exhausted, auto-recycle cleared the retired-port quarantine", attrs...)
+			}
+			// retry the draw regardless: a concurrent rotation may have
+			// won the recycle (cleared == 0) — the pool is on a clean
+			// slate either way
+			ap, err = f.pool.Select(avoid)
+		}
+	}
+	if err != nil {
 		f.warnPoolExhausted(err)
 		return nil, err
 	}
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
+	f.drawsSinceRecycle++
 	f.mu.Unlock()
+	f.registerDrawn(ap)
 
 	// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
 	// device.net READ lock. Never call n.Device.Bind() here — it takes the
@@ -387,25 +608,93 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	return ep, nil
 }
 
+// staticCarrying parses and returns the pinned static-mode carrying
+// endpoint, recording it as the factory's current. Never retires anything:
+// there is nothing to rotate to.
+func (f *portFactory) staticCarrying() (conn.Endpoint, error) {
+	ap, ok := f.pinnedEndpoint()
+	if !ok {
+		return nil, errors.New("port hop: no resolvable range spec for the static carrying endpoint")
+	}
+	// CAUTION: send path — use the cached bind (see the field comment).
+	bind := f.bindIfReady()
+	if bind == nil {
+		return nil, errors.New("port hop: device bind not wired yet")
+	}
+	ep, err := bind.ParseEndpoint(ap.String())
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.current = ap
+	f.lastProbeAt = time.Now()
+	f.mu.Unlock()
+	return ep, nil
+}
+
 // logRotation records a carrying-endpoint rotation: Debug per rotation, plus
 // a rate-limited Info line that counts how many rotations it covers, so a
 // rotation storm shows up as one "rotations=N" line per second instead of N
-// lines.
+// lines. Externally driven rotations (reactive/timed) annotate their line
+// with the reason. Reactive rotations are rare, decision-driven events (one
+// per detected carrying-link death) and always get their own immediate Info
+// line — the rate limiter only serves the storm-prone scheduled/budgeted
+// modes.
 func (f *portFactory) logRotation(ap netip.AddrPort) {
 	f.mu.Lock()
 	now := time.Now()
 	f.rotationCount++
-	if now.Sub(f.lastRotationLog) >= hopRotationLogInterval {
+	reason := f.rotateReason
+	f.rotateReason = ""
+	mode := f.mode
+	emit := mode == state.HopModeReactive || now.Sub(f.lastRotationLog) >= hopRotationLogInterval
+	if emit {
 		count := f.rotationCount
 		f.rotationCount = 0
 		f.lastRotationLog = now
 		f.mu.Unlock()
-		f.n.Log.Info("port hop: carrying endpoint rotated",
-			"peer", f.node, "endpoint", ap.String(), "rotations", count)
+		attrs := []any{"peer", f.node, "endpoint", ap.String(), "rotations", count}
+		if reason != "" {
+			attrs = append(attrs, "reason", reason)
+		}
+		f.n.Log.Info("port hop: carrying endpoint rotated", attrs...)
 		return
 	}
 	f.mu.Unlock()
 	f.n.Log.Debug("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String())
+}
+
+// recycleGate decides and atomically claims the opt-in auto-recycle
+// (port_hopping.recycle_seconds, resolved onto the factory as recycleMin):
+// when the pool has run dry and the configured interval has elapsed since
+// the previous restart, it consumes the recycle epoch — the swept=/elapsed=
+// journal context — under mu and reports ok; the caller then performs the
+// wholesale quarantine swap and retries the draw. A zero recycleMin never
+// grants (the stock stall-and-warn behaviour); a refusal inside the
+// interval leaves the epoch untouched, so the context is not lost.
+//
+// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
+// device.net READ lock. The granted swap itself is PortPool.Recycle — one
+// map replacement under the pool lock, O(1) — and the gate only takes f.mu
+// briefly. Never do per-port work, dispatch, resolve or touch the device
+// from here: a field-reported recycle that swept the quarantine per port
+// on the send path is long enough to wedge the factory against the
+// dispatch loop.
+func (f *portFactory) recycleGate() (swept uint64, elapsed time.Duration, hadEpoch, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now()
+	if f.recycleMin <= 0 || now.Sub(f.lastRecycleAt) < f.recycleMin {
+		return 0, 0, false, false
+	}
+	swept = f.drawsSinceRecycle
+	hadEpoch = !f.lastRecycleAt.IsZero()
+	if hadEpoch {
+		elapsed = now.Sub(f.lastRecycleAt)
+	}
+	f.drawsSinceRecycle = 0
+	f.lastRecycleAt = now
+	return swept, elapsed, hadEpoch, true
 }
 
 // warnPoolExhausted reports (rate-limited) that rotation is stalled because
@@ -445,6 +734,9 @@ func (f *portFactory) reconcileLinks() {
 	current := f.current
 	prev := f.prev
 	f.prev = netip.AddrPort{} // consumed
+	mode := f.mode
+	period := f.period
+	jitterPct := f.jitterPct
 	f.mu.Unlock()
 
 	if !current.IsValid() {
@@ -454,6 +746,48 @@ func (f *portFactory) reconcileLinks() {
 	neigh := f.n.RouterState.GetNeighbour(f.node)
 	if neigh == nil {
 		return
+	}
+
+	// static mode: the pin follows the configured ranges. A config change
+	// may have moved or invalidated it — retire the stale carrying link and
+	// let the next pass re-pin through bootstrap.
+	if mode == state.HopModeStatic && current.IsValid() {
+		if pinned, ok := f.pinnedEndpoint(); !ok || pinned != current {
+			for _, ep := range neigh.Eps {
+				if ep.IsRemote() || ep.IsExhausted() {
+					continue
+				}
+				nep := ep.AsNylonEndpoint()
+				if nep.Address != current.String() {
+					continue
+				}
+				nep.MarkExhausted()
+				f.scheduleTombstoneRemoval(nep.Address)
+			}
+			f.mu.Lock()
+			f.current = netip.AddrPort{}
+			f.mu.Unlock()
+			f.n.Log.Info("port hop: static pin moved, re-pinning", "peer", f.node, "old", current.String())
+			return
+		}
+	}
+
+	// External rotation triggers (reactive/timed) run here, at the head of
+	// the reconciliation pass, so a rotation triggered this pass is
+	// materialised by the same pass.
+	if mode == state.HopModeReactive || mode == state.HopModeTimed {
+		if reason, due := f.externalRotationDue(mode, current, neigh); due {
+			if err := f.externalRotate(mode, period, jitterPct, reason); err == nil {
+				f.mu.Lock()
+				current = f.current
+				prev = f.prev
+				f.prev = netip.AddrPort{} // consumed
+				f.mu.Unlock()
+			}
+			// on error the rotation is retried on the next pass: a timed
+			// schedule stays due (externalRotate only re-arms it on success)
+			// and a reactive trigger re-arms while the link stays dead
+		}
 	}
 
 	// A stalled rotation (pool exhausted) leaves the current endpoint cooling
@@ -484,26 +818,127 @@ func (f *portFactory) reconcileLinks() {
 
 	// Tombstone every other hop link of this peer: they belong to ports the
 	// factory has rotated away from. This includes the predecessor recorded by
-	// the latest rotation. Deferring the exhaustion to here (instead of
-	// marking it on the send path) is what keeps the neighbour continuously
-	// ranked: the predecessor stays the best endpoint until its successor is
-	// materialised, so routes never flap on rotation.
+	// the latest rotation, remote (learned) links whose address lies inside
+	// the factory's ranges, and anything a ping created before the factory was
+	// wired — a link on an owned port that is not the carrying endpoint is by
+	// construction retired (the local node owns port selection for its
+	// ranges). Deferring the exhaustion to here (instead of marking it on the
+	// send path) is what keeps the neighbour continuously ranked: the
+	// predecessor stays the best endpoint until its successor is materialised,
+	// so routes never flap on rotation.
 	for _, ep := range neigh.Eps {
 		nep := ep.AsNylonEndpoint()
-		if ep.IsRemote() || ep.IsExhausted() {
+		if ep.IsExhausted() {
 			continue
 		}
 		if nep.Address == curAddr {
 			continue
 		}
 		ap, err := netip.ParseAddrPort(nep.Address)
-		if err != nil || !f.ownsEndpoint(ap) {
+		if err != nil {
+			continue
+		}
+		// The union of the drawn registry and the resolver-based range check:
+		// a link on a port this factory DREW is retired by construction even
+		// when the resolver's answer for the spec host has since changed
+		// (dual-stack round-robin / DDNS) — the resolver alone de-owning it is
+		// exactly how the every-port-still-talking zombies were born.
+		if !f.ownsOrDrew(ap) {
 			continue
 		}
 		nep.MarkExhausted()
-		f.scheduleTombstoneRemoval(nep.Address)
+		f.n.scheduleExhaustedLinkRemoval(f.node, nep.Address)
 		f.n.Log.Debug("port hop: retired carrying link tombstoned", "peer", f.node, "endpoint", nep.Address)
 	}
+}
+
+// externalRotationDue reports whether an externally driven rotation
+// (reactive/timed) is due, and why. Must run on the dispatch loop.
+func (f *portFactory) externalRotationDue(mode string, current netip.AddrPort, neigh *state.Neighbour) (string, bool) {
+	if mode == state.HopModeTimed {
+		f.mu.Lock()
+		next := f.nextRotate
+		f.mu.Unlock()
+		if !next.IsZero() && !time.Now().Before(next) {
+			return "timed schedule", true
+		}
+		return "", false
+	}
+	// reactive: the carrying link is judged by the same liveness model the
+	// router uses for ranking — no traffic heard back for
+	// link_dead_threshold, or loss-dead probe statistics (Metric() == INF).
+	// A link younger than the liveness threshold is given time to prove
+	// itself first, so a cold bootstrap link is not rotated away before its
+	// first probe completes.
+	for _, ep := range neigh.Eps {
+		if ep.IsRemote() || ep.IsExhausted() {
+			continue
+		}
+		nep := ep.AsNylonEndpoint()
+		if nep.Address != current.String() {
+			continue
+		}
+		if time.Since(nep.FirstSeen()) <= f.n.RouterTunables.LinkDeadThreshold {
+			return "", false
+		}
+		if ep.Metric() >= state.INF {
+			return "dead carrying link", true
+		}
+		// liveness can be sustained by the PEER's traffic (its pings ride the
+		// reverse flow) while our own direction to the port is blackholed;
+		// only our probes going unanswered exposes that asymmetry
+		if nep.ProbeStreak() >= hopReactiveProbeStreak {
+			return "unanswered carrying probes", true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// externalRotate performs a controller-driven carrying-endpoint rotation
+// (reactive/timed): the device peer rotates immediately through its hop
+// source, and a timed schedule is re-armed for the next period ± jitter only
+// on success (a failed rotation stays due and is retried next pass). Must
+// run on the dispatch loop.
+func (f *portFactory) externalRotate(mode string, period time.Duration, jitterPct uint32, reason string) error {
+	f.mu.Lock()
+	peer := f.devPeer
+	f.rotateReason = reason
+	f.mu.Unlock()
+	if peer == nil {
+		f.mu.Lock()
+		f.rotateReason = ""
+		f.mu.Unlock()
+		return errors.New("port hop: device peer not wired yet")
+	}
+	if _, err := peer.HopExternalRotate(); err != nil {
+		f.mu.Lock()
+		f.rotateReason = "" // not consumed by logRotation on the failure path
+		f.mu.Unlock()
+		f.warnPoolExhausted(err)
+		return err
+	}
+	if mode == state.HopModeTimed {
+		f.mu.Lock()
+		f.nextRotate = time.Now().Add(jitterInterval(period, jitterPct))
+		f.mu.Unlock()
+	}
+	return nil
+}
+
+// jitterInterval draws one timed-mode rotation interval: the period plus a
+// uniform random jitter of jitterPct percent, so rotations do not
+// synchronise across nodes or align with any periodic pattern.
+func jitterInterval(period time.Duration, jitterPct uint32) time.Duration {
+	if period <= 0 {
+		return period
+	}
+	jitter := time.Duration(float64(period) * float64(jitterPct) / 100)
+	if jitter <= 0 {
+		return period
+	}
+	delta := time.Duration((rand.Float64()*2 - 1) * float64(jitter))
+	return period + delta
 }
 
 // materializeCarrying registers the current carrying endpoint as a regular
@@ -523,10 +958,20 @@ func (f *portFactory) materializeCarrying(neigh *state.Neighbour, ap netip.AddrP
 	addr := ap.String()
 	hadBest := neigh.BestEndpoint() != nil
 
-	for _, ep := range neigh.Eps {
-		if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-			return // already materialized
+	for i, ep := range neigh.Eps {
+		if ep.IsRemote() || ep.AsNylonEndpoint().Address != addr {
+			continue
 		}
+		if !ep.IsExhausted() {
+			return // already materialized and live
+		}
+		// a stale tombstone for this port still lingers inside its grace
+		// window (possible whenever a port is redrawn quickly — e.g. an
+		// auto_recycle restart): replace it with a fresh link so the
+		// carrying port is ranked again
+		neigh.Eps = slices.Delete(neigh.Eps, i, i+1)
+		f.n.Log.Debug("port hop: stale tombstoned link replaced on redraw", "peer", f.node, "endpoint", addr)
+		break
 	}
 	// the cached bind keeps the factory free of the device net lock even
 	// when re-materialising from the dispatch loop
@@ -595,28 +1040,11 @@ func (f *portFactory) findSeedLink(neigh *state.Neighbour, drawn netip.AddrPort,
 	return fallback
 }
 
-// scheduleTombstoneRemoval removes the exhausted link for addr after the
-// tombstone grace period (late pongs still match it until then). Safe to call
-// more than once for the same address: extra runs find nothing to delete.
+// scheduleTombstoneRemoval is the factory's shorthand for the shared
+// exhausted-link removal (grace window, still-exhausted-only safety, see
+// Nylon.scheduleExhaustedLinkRemoval).
 func (f *portFactory) scheduleTombstoneRemoval(addr string) {
-	time.AfterFunc(hopTombstoneGrace, func() {
-		if f.n.Context.Err() != nil {
-			return
-		}
-		f.n.Dispatch(func() error {
-			neigh := f.n.RouterState.GetNeighbour(f.node)
-			if neigh == nil {
-				return nil
-			}
-			for i, ep := range neigh.Eps {
-				if !ep.IsRemote() && ep.AsNylonEndpoint().Address == addr {
-					neigh.Eps = slices.Delete(neigh.Eps, i, i+1)
-					break
-				}
-			}
-			return nil
-		})
-	})
+	f.n.scheduleExhaustedLinkRemoval(f.node, addr)
 }
 
 // ensurePortFactories wires a HopSource into every device peer whose
@@ -626,7 +1054,32 @@ func (n *Nylon) ensurePortFactories() error {
 	if n.Device == nil {
 		return nil
 	}
-	policy := n.LocalCfg.PortHopping.Resolve()
+	policy, source := n.resolveHopPolicy()
+
+	// log the active policy whenever it changes (startup, config update,
+	// mode switch): the mode is a fleet-level decision and deserves its own
+	// line in the journal
+	sig := fmt.Sprintf("%s|%d|%s|%d|%s|%s", policy.Mode, policy.Budget, policy.Period, policy.JitterPct, policy.RecycleMinInterval, policy.Cooldown)
+	n.portHopping.mu.Lock()
+	policyChanged := sig != n.portHopping.appliedPolicy
+	n.portHopping.appliedPolicy = sig
+	n.portHopping.mu.Unlock()
+	if policyChanged {
+		attrs := []any{"mode", policy.Mode, "source", source}
+		switch policy.Mode {
+		case state.HopModeProactive:
+			attrs = append(attrs, "budget", policy.Budget,
+				"cooldown", policy.Cooldown.String(), "recycle_seconds", policy.RecycleMinInterval.String())
+		case state.HopModeTimed:
+			attrs = append(attrs, "period", policy.Period.String(),
+				"jitter_pct", policy.JitterPct, "cooldown", policy.Cooldown.String(),
+				"recycle_seconds", policy.RecycleMinInterval.String())
+		case state.HopModeReactive:
+			attrs = append(attrs, "cooldown", policy.Cooldown.String(),
+				"recycle_seconds", policy.RecycleMinInterval.String())
+		}
+		n.Log.Info("port hop policy applied", attrs...)
+	}
 
 	for _, peer := range n.GetPeers(n.Id) {
 		if !n.IsRouter(peer) {
@@ -657,10 +1110,29 @@ func (n *Nylon) ensurePortFactories() error {
 			}
 			continue
 		}
-		f := n.getPortFactory(peer, specs, policy)
-		wgPeer.SetHop(f, int(policy.Budget))
+		f := n.getPortFactory(peer, specs, policy, wgPeer)
+		if policy.Mode == state.HopModeProactive {
+			wgPeer.SetHop(f, int(policy.Budget))
+		} else {
+			// static/reactive/timed: the carrying endpoint never rotates on
+			// the send path; reactive/timed rotations are driven by the
+			// factory from the dispatch loop
+			wgPeer.SetHopExternal(f)
+		}
 	}
 	return nil
+}
+
+// resolveHopPolicy resolves this node's effective port rotation policy: the
+// central router entry wins wholesale over node.yaml, which wins over the
+// static default (see state.ResolveHopPolicy). Runs on the dispatch loop.
+func (n *Nylon) resolveHopPolicy() (state.PortHoppingPolicy, string) {
+	var rc *state.RouterCfg
+	if n.CentralCfg.IsRouter(n.LocalCfg.Id) {
+		router := n.CentralCfg.GetRouter(n.LocalCfg.Id)
+		rc = &router
+	}
+	return state.ResolveHopPolicy(rc, &n.LocalCfg)
 }
 
 func (n *Nylon) hasPortFactory(peer state.NodeId) bool {
@@ -668,6 +1140,22 @@ func (n *Nylon) hasPortFactory(peer state.NodeId) bool {
 	defer n.portHopping.mu.Unlock()
 	_, ok := n.portHopping.factories[peer]
 	return ok
+}
+
+// hopOwnedEndpoint reports whether the addr:port lies inside a port range
+// configured for the peer, i.e. a port whose link lifecycle the peer's port
+// factory owns — including every port the factory has EVER DRAWN (see
+// portFactory.ownsOrDrew): handleProbePing's remote-link learning must refuse
+// both, or a stale ping from a retired port re-learns an immortal zombie once
+// the retired link's grace removal has run.
+func (n *Nylon) hopOwnedEndpoint(peer state.NodeId, ap netip.AddrPort) bool {
+	n.portHopping.mu.Lock()
+	f, ok := n.portHopping.factories[peer]
+	n.portHopping.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return f.ownsOrDrew(ap)
 }
 
 // hopProbeReady reports whether the link with the given address is due for
