@@ -92,4 +92,4 @@ INF priority rules applied rules=2 source=node detail="udp/5405=high:0xb8;tcp/22
 INF priority rules cleared source=node
 ```
 
-`source` is `central`, `central-global` or `node` — the node's own central router entry, the central top-level mesh-wide list, or `node.yaml`. On Linux, `tc -s class show` on the shaped egress shows matched traffic leaving the EF class.
+`source` is `central`, `central-global` or `node` — the node's own central router entry, the central top-level mesh-wide list, or `node.yaml`. On Linux, `tc -s class show` on the shaped egress shows matched traffic leaving the EF class. `demo/qos-test.sh` builds on the journal: it refuses to measure a stand whose daemon shows no effective rule set, and fails the run when the EF band carries no packets under load.

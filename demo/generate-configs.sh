@@ -29,13 +29,16 @@ else
   info "reusing $ENV_FILE (mesh subnet $MESH_SUBNET)"
 fi
 
-# ── 2. Image (compose has to render before anything can be built) ────
-if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  info "reusing image $IMAGE"
-else
-  info "building image $IMAGE (first run, this takes a few minutes)"
-  dc build
-fi
+# ── 2. Image ─────────────────────────────────────────────────────────
+# Always build (dc() stamps the checkout's commit in): layer cache makes
+# an unchanged checkout a no-op, while a moved HEAD is exactly the case
+# where reusing the old image would silently run a stale daemon — and the
+# configs below would then be validated by that same stale binary, which
+# knows none of the newer config keys. Building here keeps image, configs
+# and checkout in lockstep, so the stand can only be as stale as the
+# checkout itself.
+info "building image $IMAGE (layer cache keeps an unchanged checkout fast)"
+dc build
 
 # ── 3. Keys + configs ────────────────────────────────────────────────
 if [ "$FORCE" = 1 ] || [ ! -f "$CONFIGS_DIR/central.yaml" ]; then
