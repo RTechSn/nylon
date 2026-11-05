@@ -68,7 +68,11 @@ func OpenBundle(data []byte, key []byte) ([]byte, error) {
 // BundleConfig first signs the config with the root private key, ensuring the authenticity, then encrypts the message using the bytes of the root public key as the shared key, offering some level of privacy. (assuming the root public key is not shared widely)
 func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	cfg := CentralCfg{}
-	err := yaml.Unmarshal([]byte(config), &cfg)
+	// Strict: a key CentralCfg does not model must fail the seal loudly, not
+	// silently vanish from the distributed bundle — a dropped section (e.g.
+	// priority_rules at an unsupported level) is indistinguishable from
+	// "applied" until traffic proves otherwise.
+	err := yaml.UnmarshalWithOptions([]byte(config), &cfg, yaml.Strict())
 	if err != nil {
 		return "", err
 	}
@@ -114,7 +118,11 @@ func UnbundleConfig(bundleStr string, pubKey NyPublicKey) (*CentralCfg, error) {
 	}
 
 	cfg := &CentralCfg{}
-	err = yaml.Unmarshal(bundle, cfg)
+	// Strict: a bundle carrying a field this binary does not know fails the
+	// poll loudly and the node keeps its last active config
+	// (core.checkForConfigUpdates), instead of half-applying a newer central
+	// config whose unknown section would silently drop.
+	err = yaml.UnmarshalWithOptions(bundle, cfg, yaml.Strict())
 	if err != nil {
 		return nil, err
 	}

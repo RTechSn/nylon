@@ -131,6 +131,7 @@ type CentralCfg struct {
 	ExcludeIPs          []netip.Prefix `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
 	DynamicPrefixRanges []netip.Prefix `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
 	Obf                 *ObfProfile    `yaml:"obf,omitempty"`                   // mesh-wide shared AWG 2.0 profile; nil = vanilla-compat
+	PriorityRules       []PriorityRule `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
 }
 
 // TunablesOverrides carries optional router tunable overrides from the local

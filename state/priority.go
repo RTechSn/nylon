@@ -191,20 +191,23 @@ func ValidatePriorityRules(rules []PriorityRule, where string) error {
 }
 
 // ResolvePriorityRules compiles the winning source's rule list. Like the hop
-// policy, the rule set is atomic per source: a central router entry with a
-// NON-EMPTY priority_rules list wins wholesale over node.yaml's
-// priority_rules; with no rules set anywhere none apply. An empty central
-// list is indistinguishable from an absent one (configs roundtrip through
-// yaml with omitempty, which drops empty lists) — clearing a node's local
-// rules is therefore not expressible centrally, exactly like the hop
-// policy. The second return names the winning source ("central", "node" or
-// "default") for the journal.
-func ResolvePriorityRules(central *RouterCfg, local *LocalCfg) ([]ResolvedPriorityRule, string, error) {
+// policy, the rule set is atomic per source: a central routers[] entry with a
+// NON-EMPTY priority_rules list wins wholesale over the central config's
+// top-level priority_rules (the mesh-wide default), which wins wholesale
+// over node.yaml's priority_rules; with no rules set anywhere none apply.
+// An empty list is indistinguishable from an absent one at every level
+// (configs roundtrip through yaml with omitempty, which drops empty lists)
+// — clearing a node's local rules is therefore not expressible centrally,
+// exactly like the hop policy. The second return names the winning source
+// ("central", "central-global", "node" or "default") for the journal.
+func ResolvePriorityRules(central *RouterCfg, global []PriorityRule, local *LocalCfg) ([]ResolvedPriorityRule, string, error) {
 	var rules []PriorityRule
 	source := "default"
 	switch {
 	case central != nil && len(central.PriorityRules) > 0:
 		rules, source = central.PriorityRules, "central"
+	case len(global) > 0:
+		rules, source = global, "central-global"
 	case local != nil && len(local.PriorityRules) > 0:
 		rules, source = local.PriorityRules, "node"
 	}

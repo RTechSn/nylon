@@ -96,11 +96,12 @@ func (n *Nylon) classifyPriority(elem *device.TCElement) {
 	}
 }
 
-// ensurePriorityRules resolves the effective in-tunnel QoS rule set — a
-// central router entry with priority_rules set wins wholesale over
-// node.yaml, which wins over none (state.ResolvePriorityRules) — and
-// publishes it to the classifier. Runs on the dispatch loop from
-// SyncApplicationState: immediately at start and after every config apply.
+// ensurePriorityRules resolves the effective in-tunnel QoS rule set — the
+// node's own central routers[] entry with priority_rules set wins wholesale
+// over the central config's top-level (mesh-wide) priority_rules, which wins
+// wholesale over node.yaml (state.ResolvePriorityRules) — and publishes it
+// to the classifier. Runs on the dispatch loop from SyncApplicationState:
+// immediately at start and after every config apply.
 func (n *Nylon) ensurePriorityRules() error {
 	if n.Device == nil {
 		return nil
@@ -110,7 +111,7 @@ func (n *Nylon) ensurePriorityRules() error {
 		router := n.CentralCfg.GetRouter(n.LocalCfg.Id)
 		rc = &router
 	}
-	rules, source, err := state.ResolvePriorityRules(rc, &n.LocalCfg)
+	rules, source, err := state.ResolvePriorityRules(rc, n.CentralCfg.PriorityRules, &n.LocalCfg)
 	if err != nil {
 		return fmt.Errorf("priority rules: %w", err)
 	}

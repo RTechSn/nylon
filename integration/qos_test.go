@@ -15,8 +15,10 @@ import (
 
 // qosRig builds a two-node rig: a sends inner traffic to b through the
 // tunnel; rules controls where a's priority_rules come from (node = node.yaml
-// side, central = the central router entry, centralEmpty = an empty central
-// list that must clear node rules wholesale, none = no rules anywhere).
+// side, central = the central router entry, centralGlobal = the mesh-wide
+// top-level list, centralRouterBeatsGlobal = both — the entry must win,
+// centralEmpty = an empty central list that must clear node rules wholesale,
+// none = no rules anywhere).
 func qosRig(t *testing.T, rules string, nodeRules []state.PriorityRule, centralRules []state.PriorityRule) (*VirtualHarness, string, chan error) {
 	t.Helper()
 	vh := &VirtualHarness{}
@@ -41,6 +43,19 @@ func qosRig(t *testing.T, rules string, nodeRules []state.PriorityRule, centralR
 	case "central":
 		aIdx := vh.IndexOf("a")
 		vh.Central.Routers[aIdx].PriorityRules = centralRules
+	case "centralGlobal":
+		vh.Central.PriorityRules = centralRules
+	case "centralRouterBeatsGlobal":
+		aIdx := vh.IndexOf("a")
+		dscp := 10
+		// the router's own list must win wholesale over the mesh-wide
+		// default: the entry marks udp/5405 with dscp 10 (TOS 0x28) while
+		// the global list would stamp EF (0xb8) — only the entry's marking
+		// may appear on the wire
+		vh.Central.Routers[aIdx].PriorityRules = []state.PriorityRule{
+			{Protocol: "udp", Port: "5405", Priority: state.PriorityHigh, Dscp: &dscp},
+		}
+		vh.Central.PriorityRules = centralRules
 	case "centralEmpty":
 		aIdx := vh.IndexOf("a")
 		vh.Central.Routers[aIdx].PriorityRules = []state.PriorityRule{}
@@ -185,5 +200,47 @@ func TestQoSNoRulesLeaveEverythingUnmarked(t *testing.T) {
 
 	if len(counts) != 1 || counts[0] == 0 {
 		t.Errorf("expected only unmarked outer datagrams toward %v, counts: %v", bEp, counts)
+	}
+}
+
+func TestQoSCentralGlobalRulesMarkOuterDatagrams(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// priority_rules at the TOP LEVEL of central.yaml — the mesh-wide
+	// default — must reach every node through the distributed config
+	vh, b1, errs := qosRig(t, "centralGlobal", nil, []state.PriorityRule{
+		{Protocol: "udp", Port: "5405", Priority: state.PriorityHigh},
+	})
+	defer vh.Stop()
+
+	bEp, counts := qosFlow(t, vh, b1, errs)
+
+	if counts[0xb8] == 0 {
+		t.Errorf("no EF-marked outer datagrams toward %v from mesh-wide rules (counts: %v)", bEp, counts)
+	}
+	if counts[0] == 0 {
+		t.Errorf("no unmarked outer datagrams toward %v (counts: %v)", bEp, counts)
+	}
+}
+
+func TestQoSRouterEntryBeatsCentralGlobalRules(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// the node's own routers[] entry (dscp 10 -> TOS 0x28) must win wholesale
+	// over the central top-level list (EF 0xb8): only the entry's marking
+	// may appear on the wire
+	vh, b1, errs := qosRig(t, "centralRouterBeatsGlobal", nil, []state.PriorityRule{
+		{Protocol: "udp", Port: "5405", Priority: state.PriorityHigh},
+	})
+	defer vh.Stop()
+
+	bEp, counts := qosFlow(t, vh, b1, errs)
+
+	if counts[0x28] == 0 {
+		t.Errorf("no dscp-10-marked outer datagrams toward %v from the router entry (counts: %v)", bEp, counts)
+	}
+	if counts[0xb8] != 0 {
+		t.Errorf("mesh-wide rules leaked past the router entry toward %v (counts: %v)", bEp, counts)
+	}
+	if counts[0] == 0 {
+		t.Errorf("no unmarked outer datagrams toward %v (counts: %v)", bEp, counts)
 	}
 }

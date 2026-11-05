@@ -6,7 +6,9 @@
 #   on restore) with a test harness:
 #
 #     band 1:1 (prio band 0)  DSCP EF 0xb8  -> netem 15ms, shallow queue
-#                              (empty until nylon learns to mark outer packets)
+#                              (carries the priority_rules-matched flows: the
+#                              rules mirror their classification onto the
+#                              outer datagrams as DSCP EF)
 #     band 1:3 (prio band 2)  dst = bob     -> netem 600ms, an anti route-flip
 #                              guard: via-bob must always lose against the
 #                              bloated direct path

@@ -201,6 +201,11 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			return fmt.Errorf("invalid obf profile: %w", err)
 		}
 	}
+	// mesh-wide default priority rules; each router's own list (validated
+	// below) wins wholesale over this one
+	if err := ValidatePriorityRules(cfg.PriorityRules, "central config"); err != nil {
+		return err
+	}
 	nodes := make([]string, 0)
 	for _, node := range cfg.Routers {
 		err := NameValidator(string(node.Id))

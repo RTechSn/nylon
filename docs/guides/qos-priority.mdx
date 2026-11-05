@@ -14,9 +14,15 @@ Priority rules fix it at both layers:
 
 ## Configuration
 
-Rules live in `priority_rules` — in `node.yaml` for one node, or in the router's entry in `central.yaml` for fleet-wide control (a non-empty central list wins wholesale over the node's own, exactly like the port hopping policy):
+Rules live in `priority_rules` at three levels, and the most specific non-empty list wins wholesale over the next (like the port hopping policy):
 
-```yaml title="node.yaml or central.yaml (router entry)"
+1. the router's own entry in `central.yaml` (`routers: → priority_rules`) — per-node fleet control;
+2. the **top level** of `central.yaml` — the mesh-wide default every node (routers and clients alike) receives through the distributed config;
+3. `node.yaml` — the node's own list.
+
+An empty list is indistinguishable from an absent one at every level (configs roundtrip through yaml, which drops empty lists), so a lower level cannot be "cleared" from a higher one — to remove rules, remove them where they are set.
+
+```yaml title="central.yaml (top level — the mesh-wide default)"
 priority_rules:
   - protocol: udp
     port: 5405 # corosync totem
@@ -24,6 +30,12 @@ priority_rules:
   - protocol: tcp
     port: 22 # ssh
     priority: high
+```
+
+The same rule shape is used at the other levels:
+
+```yaml title="node.yaml or a router's entry in central.yaml"
+priority_rules:
   - protocol: tcp
     port: "5000-5100" # a whole inclusive range
     priority: medium
@@ -80,4 +92,4 @@ INF priority rules applied rules=2 source=node detail="udp/5405=high:0xb8;tcp/22
 INF priority rules cleared source=node
 ```
 
-`source` is `central` or `node` (which side won). On Linux, `tc -s class show` on the shaped egress shows matched traffic leaving the EF class.
+`source` is `central`, `central-global` or `node` — the node's own central router entry, the central top-level mesh-wide list, or `node.yaml`. On Linux, `tc -s class show` on the shaped egress shows matched traffic leaving the EF class.
