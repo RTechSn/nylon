@@ -32,7 +32,7 @@
 #     TCP echo probe :22    — "ssh"
 #     ICMP ping             — control flow, never prioritized
 # Scenarios (in order):
-#     base       no bulk, one class           -> reference RTT (~30 ms)
+#     base       no bulk, one class           -> reference RTT (~16 ms)
 #     bloat      bulk, one deep-FIFO class    -> every flow shares the queue
 #     prio-port  bulk, 2 classes; dport 5405/22 -> priority class
 #     prio-dscp  bulk, 2 classes; DSCP EF 0xb8 -> priority class
@@ -117,14 +117,19 @@ exeA ping -c 2 -W 1 "$B_IP" >/dev/null
 info "topology up (bottleneck: $RATE, one-way $DELAY, bulk queue ${BULK_LIMIT} pkt)"
 
 # ── qdiscs ────────────────────────────────────────────────────────────
+# NOTE: htb does not support the change op, so `tc qdisc replace` on an
+# already-installed root fails with "Change operation not supported by
+# specified qdisc". Always rebuild from a clean slate: del root, then add.
 qdisc_bloat() {
-  tcA qdisc replace dev "$DEV_A" root handle 1: htb default 10
+  tcA qdisc del dev "$DEV_A" root 2>/dev/null || true
+  tcA qdisc add dev "$DEV_A" root handle 1: htb default 10
   tcA class add dev "$DEV_A" parent 1: classid 1:10 htb rate "$RATE" ceil "$RATE" burst 64k cburst 64k
   tcA qdisc add dev "$DEV_A" parent 1:10 handle 10: netem delay "$DELAY" limit "$BULK_LIMIT"
 }
 
 qdisc_prio() { # $1 = port | dscp
-  tcA qdisc replace dev "$DEV_A" root handle 1: htb default 20
+  tcA qdisc del dev "$DEV_A" root 2>/dev/null || true
+  tcA qdisc add dev "$DEV_A" root handle 1: htb default 20
   tcA class add dev "$DEV_A" parent 1: classid 1:10 htb rate "$PRIO_RATE" ceil "$RATE" burst 16k cburst 16k
   tcA class add dev "$DEV_A" parent 1: classid 1:20 htb rate 9750kbit ceil "$RATE" burst 64k cburst 64k
   tcA qdisc add dev "$DEV_A" parent 1:10 handle 10: netem delay "$DELAY" limit "$PRIO_LIMIT"
@@ -239,11 +244,14 @@ grep -h '^BULK' "$OUT/bulk-sink.log" 2>/dev/null || echo "  (none — see $OUT/b
 cat <<EOF
 
 How to read it:
-  base       ~30 ms everywhere (2 x $DELAY).
+  base       ~16 ms everywhere (one-way $DELAY on the shaped egress; the
+             return path is unshaped).
   bloat      bulk saturates the only class; every probe inflates to
-             hundreds of ms (up to BULK_LIMIT packets deep) and some
-             replies exceed the 1 s probe timeout -> loss%.
-  prio-port  udp5405 + ssh22 fall back to ~30 ms (port-matched priority
+             hundreds of ms (up to BULK_LIMIT packets deep). Lost replies
+             stall the lock-step probes for their full 1 s window, so 'sent'
+             collapses well below duration/interval — that is the same
+             lock-step collapse a lost totem token inflicts on corosync.
+  prio-port  udp5405 + ssh22 fall back to ~16 ms (port-matched priority
              class), udp7999 + icmp stay bloated. Bulk goodput unchanged
              (priority class borrows nothing while idle).
   prio-dscp same, but classification happens on the DSCP byte of the

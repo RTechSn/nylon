@@ -112,8 +112,15 @@ docker exec -d "$CC" iperf3 -s
 
 # ── test qdisc on alice ────────────────────────────────────────────────
 info "installing the test qdisc on alice's eth0 (rate $RATE, one-way $DELAY, queue ${BULK_LIMIT} pkt)"
+# Delete the root first: on the stand's existing prio root `tc qdisc replace`
+# resolves to a change op (prio supports change), which KEEPS the old children
+# and filters - the stand's own bob filter (flowid 1:2) would keep winning
+# over ours and the 600ms guard band would never engage. htb, by contrast,
+# does not support change at all - replacing an installed htb root fails
+# outright (tc-prio-demo.sh hit exactly that).
 docker exec "$AC" sh -c "
-  tc qdisc replace dev eth0 root handle 1: prio bands 4 priomap 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 &&
+  tc qdisc del dev eth0 root 2>/dev/null;
+  tc qdisc add dev eth0 root handle 1: prio bands 4 priomap 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 &&
   tc qdisc add dev eth0 parent 1:1 handle 10: netem delay ${DELAY} limit 100 &&
   tc qdisc add dev eth0 parent 1:3 handle 30: netem delay ${BOB_BAND_DELAY} &&
   tc qdisc add dev eth0 parent 1:4 handle 40: htb default 400 &&
@@ -204,13 +211,18 @@ grep -E 'class .* 1:1 ' -A3 "$OUT/tc-stats.txt" || echo "  (none — see $OUT/tc
 cat <<EOF
 
 How to read it:
-  idle    everything ~30 ms (2 x $DELAY) — the harness is healthy.
-  loaded  BEFORE the QoS feature: all four flows bloat together (hundreds
-          of ms) because the encrypted outer stream hides the inner ports;
-          nothing marks outer packets EF yet, so class 1:1 stays empty.
+  idle    everything ~16 ms (one-way $DELAY on alice's egress; the return
+          path through the bridge is unshaped) - the harness is healthy.
+  loaded  BEFORE the QoS feature: all four flows bloat together because
+          the encrypted outer stream hides the inner ports (udp5405 is
+          statistically identical to udp7999); nothing marks outer packets
+          EF yet, so class 1:1 stays empty. The UDP/TCP probes are
+          lock-step, so every lost reply stalls them a full 1 s - 'sent'
+          collapses to a fraction of duration/interval, exactly the way a
+          lost totem token stalls corosync.
           AFTER the feature (priority_ports + outer DSCP mirroring):
-          udp5405 + ssh22 fall back to ~30 ms, udp7999 + icmp stay bloated,
-          and class 1:1 packets > 0.
+          udp5405 + ssh22 fall back to ~16 ms, udp7999 and icmp stay
+          bloated, and class 1:1 packets > 0.
 
   Files: $OUT
 EOF
