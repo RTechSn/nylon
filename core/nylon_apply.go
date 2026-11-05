@@ -63,6 +63,9 @@ func (n *Nylon) SyncApplicationState() error {
 	if err := n.ensurePortFactories(); err != nil {
 		return err
 	}
+	if err := n.ensurePriorityRules(); err != nil {
+		return err
+	}
 	ComputeRoutes(n.RouterState, n)
 	// OS-level work is handed to the applier goroutine: this function runs on
 	// the dispatch loop, which must never fork/exec `ip`.

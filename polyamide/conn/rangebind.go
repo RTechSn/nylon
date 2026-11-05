@@ -150,20 +150,25 @@ func (b *MultiBind) bindFor(port uint16) *StdNetBind {
 	return b.primary
 }
 
-func (b *MultiBind) Send(bufs [][]byte, endpoint Endpoint) error {
+// bindForSend resolves the socket an outgoing batch to endpoint must
+// originate from: the range-listener port a TaggedEndpoint / port hint
+// names (port-hopping reply symmetry), or the primary bind.
+func (b *MultiBind) bindForSend(endpoint Endpoint) (*StdNetBind, Endpoint) {
 	b.mu.Lock()
-	var sb *StdNetBind
+	defer b.mu.Unlock()
 	switch e := endpoint.(type) {
 	case *TaggedEndpoint:
-		sb = b.bindFor(e.localPort)
-		endpoint = e.Endpoint
+		return b.bindFor(e.localPort), e.Endpoint
 	case interface{ PortHint() uint16 }:
-		sb = b.bindFor(e.PortHint())
+		return b.bindFor(e.PortHint()), endpoint
 	default:
-		sb = b.primary
+		return b.primary, endpoint
 	}
-	b.mu.Unlock()
-	return sb.Send(bufs, endpoint)
+}
+
+func (b *MultiBind) Send(bufs [][]byte, endpoint Endpoint) error {
+	sb, ep := b.bindForSend(endpoint)
+	return sb.Send(bufs, ep)
 }
 
 func (b *MultiBind) Close() error {

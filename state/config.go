@@ -74,6 +74,7 @@ type RouterCfg struct {
 	Endpoints       []string
 	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"` // client-side port rotation strategy for range endpoints (static|reactive|proactive|timed); wins wholesale over node.yaml
 	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`      // client-side rotation policy knobs (mode-dependent); wins wholesale over node.yaml
+	PriorityRules   []PriorityRule  `yaml:"priority_rules,omitempty"`    // in-tunnel QoS: inner protocol/port rules -> in-device priority + outer DSCP marking; wins wholesale over node.yaml (an empty list clears)
 }
 type ClientCfg struct {
 	NodeCfg `yaml:",inline"`
@@ -397,6 +398,7 @@ type LocalCfg struct {
 	ListenMode         string                `yaml:"listen_mode,omitempty"`          // how listen_ports is served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
 	PortHoppingMode    string                `yaml:"port_hopping_mode,omitempty"`    // client-side port rotation strategy for range endpoints: static (default) | reactive | proactive | timed
 	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints (mode-dependent knobs)
+	PriorityRules      []PriorityRule        `yaml:"priority_rules,omitempty"`       // in-tunnel QoS: inner protocol/port rules -> in-device priority + outer DSCP marking
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface
 	NoTun              bool                  `yaml:"no_tun,omitempty"`               // relay-only mode; requires no advertised addresses or prefixes

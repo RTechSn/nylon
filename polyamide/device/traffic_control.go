@@ -68,6 +68,11 @@ type TCElement struct {
 	FromPeer *Peer                 // which peer (if any) sent us this Packet
 	ToPeer   *Peer                 // which peer to send this Packet to
 	Priority TCPriority            // Priority, higher is better
+	// TOS is the TOS byte (DSCP << 2) to stamp on the outer datagram carrying
+	// this packet (0 = send unmarked). Set by the nylon QoS classifier
+	// (state.PriorityRule) and mirrored onto the encapsulating datagrams by
+	// the transport (conn.TOSBind).
+	TOS byte
 
 	// Padding is the AWG crypto padding (S4-class) prefixing the transport
 	// header in Buffer; it defines the wire layout [padding][header][packet].
@@ -193,6 +198,7 @@ func (device *Device) TCBatch(batch []*TCElement, tcs *TCState) {
 				obe.packet = elem.Packet
 				obe.buffer = elem.Buffer
 				obe.padding = elem.Padding
+				obe.tos = elem.TOS
 				obec.elems = append(obec.elems, obe)
 				device.PutTCElement(elem)
 				elems[i] = nil

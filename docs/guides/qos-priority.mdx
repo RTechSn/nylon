@@ -1,0 +1,83 @@
+---
+title: In-tunnel QoS
+description: Keep small interactive flows alive under bulk load with priority rules and outer DSCP marking.
+sidebar:
+  order: 11
+---
+
+A nylon tunnel encrypts everything into one outer UDP stream, so the WAN cannot tell an ssh session or a corosync totem ring from a bulk transfer riding the same tunnel. At a saturated bottleneck this is fatal for the small flows: a deep FIFO queue inflates their RTT to hundreds of milliseconds or seconds, and a lock-step protocol that loses one reply per second (a totem token has a ~1 s window) collapses entirely. `demo/qos-test.sh` demonstrates exactly this failure mode on the demo stand.
+
+Priority rules fix it at both layers:
+
+1. **In-device ordering** — matched flows are queued ahead of bulk within nylon's send batches (`polyamide` orders batches by priority).
+2. **Outer DSCP marking** — the classification is mirrored onto the **outer** (encrypted) datagrams as the DSCP byte, so a DSCP-aware WAN bottleneck — `tc` at your edge, or any DSCP-honouring path — carries the matched flows past the bulk queue even though the encryption hides everything else.
+
+## Configuration
+
+Rules live in `priority_rules` — in `node.yaml` for one node, or in the router's entry in `central.yaml` for fleet-wide control (a non-empty central list wins wholesale over the node's own, exactly like the port hopping policy):
+
+```yaml title="node.yaml or central.yaml (router entry)"
+priority_rules:
+  - protocol: udp
+    port: 5405 # corosync totem
+    priority: high
+  - protocol: tcp
+    port: 22 # ssh
+    priority: high
+  - protocol: tcp
+    port: "5000-5100" # a whole inclusive range
+    priority: medium
+    dscp: 34 # optional: override the level's default DSCP
+  - protocol: icmp # matches ICMP and ICMPv6; must not set a port
+    priority: max
+```
+
+Each rule carries:
+
+| field | meaning |
+| --- | --- |
+| `protocol` | inner L4 protocol to match: `tcp`, `udp` or `icmp` (icmp matches both ICMP and ICMPv6) |
+| `port` | a port (`5405`) or an inclusive range (`"5000-5100"`). Required for tcp/udp; icmp rules must not set one. The rule matches the port on **either side** of the flow — the destination port of requests to the service and the source port of its replies — so both directions of a session are protected |
+| `priority` | the level to assign: `medium`, `high` or `max` |
+| `dscp` | optional 6-bit override (`0`–`63`) of the level's default outer DSCP; `0` keeps the in-device ordering but stamps nothing on the wire |
+
+A `priority` of `normal` (or an omitted port on a tcp/udp rule) is a **config error**, not a silent no-op — an unmarked rule would do nothing and belongs out of the config.
+
+### Priority levels and default DSCP
+
+| level | in-device order | default outer DSCP | typical use |
+| --- | --- | --- | --- |
+| `medium` | ahead of bulk | AF41 (34) | important, but not emergency |
+| `high` | equal to the nylon control plane | EF (46) | interactive/keepalive traffic that must survive a saturated WAN |
+| `max` | above everything, including the nylon control plane | CS7 (56) | a level you control completely |
+
+Overlapping rules match in list order (first match wins); exact duplicates are rejected. At most 64 rules per source.
+
+## How the marking works
+
+The classifier runs as the first filter on **every** inner packet — node-originated, transit-forwarded, and received traffic alike — and stamps matching elements with the rule's in-device priority and TOS byte. The transport then groups outgoing batches by `(peer endpoint, TOS)` and sends each group through the socket with the TOS stamped as a per-datagram control message (`IP_TOS` for IPv4, `IPV6_TCLASS` for IPv6 — Linux only). Nothing is rewritten inside the tunnel: the inner packets reach the far side byte-identical, and each hop re-classifies, so **put the rules on every node whose egress matters** (including transit nodes — the marking is per-hop, not end-to-end).
+
+The mesh's own control traffic (route updates, probes, keepalives) stays unmarked; it already rides the in-device `high` level.
+
+### What is *not* classified
+
+- IPv4 fragments other than the first (the fragment offset hides the L4 header).
+- IPv6 packets with extension headers before the TCP/UDP header.
+- The inner packets' own DSCP byte is ignored — classification is by protocol/port only.
+
+## WAN prerequisites
+
+DSCP only helps if the bottleneck honours it. The marking survives your own `tc` (that is the demo's mechanism: `tc filter ... match ip tos 0xb8 0xfc flowid 1:1`) and DSCP-aware paths, but many consumer ISPs re-mark or drop the DSCP byte at their edge — measure, don't assume. See `hack/qos/tc-prio-demo.sh` for a standalone rig that validates both classification methods (L4 port and DSCP EF) without any nylon involvement, and `demo/qos-test.sh` for the full in-tunnel acceptance test: with the demo configs' rules, `udp5405` and `ssh22` stay at the base delay under a saturating iperf3 bulk while `udp7999` and ICMP bloat with it.
+
+Platform support: outer DSCP marking requires `sendmsg` control messages (Linux; on other platforms the rules still order in-device batches and the journal notes that marking is unavailable). The dscp value is stamped as the full TOS byte (`dscp << 2`).
+
+## Observability
+
+The journal names the effective rule set on every change (startup, config apply):
+
+```
+INF priority rules applied rules=2 source=node detail="udp/5405=high:0xb8;tcp/22=high:0xb8"
+INF priority rules cleared source=node
+```
+
+`source` is `central` or `node` (which side won). On Linux, `tc -s class show` on the shaped egress shows matched traffic leaving the EF class.

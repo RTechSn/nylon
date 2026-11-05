@@ -54,6 +54,7 @@ type QueueOutboundElement struct {
 	peer        *Peer                 // related peer
 	endpoint    conn.Endpoint         // if the element is bound for a specific endpoint
 	padding     uint32
+	tos         byte // TOS byte stamped on the outer datagrams (in-tunnel QoS; 0 = unmarked)
 	isKeepalive bool
 }
 
@@ -82,6 +83,7 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.keypair = nil
 	elem.peer = nil
 	elem.endpoint = nil
+	elem.tos = 0
 	elem.isKeepalive = false
 }
 
@@ -703,9 +705,10 @@ func (device *Device) RoutineEncryption(id int) {
 /*
 This function arranges buffers and endpoints by endpoint, into contiguous
 segments of endpoints. It ensures that packets within the same endpoint group
-are stable-ordered.
+are stable-ordered. Groups also split on TOS changes so each (endpoint, TOS)
+run can be sent as one marked/unmarked batch (in-tunnel QoS).
 */
-func partitionBuffersByEndpoint(bufs [][]byte, eps []conn.Endpoint, outBufs *[][]byte, outEps *[]conn.Endpoint, peer *Peer) error {
+func partitionBuffersByEndpoint(bufs [][]byte, eps []conn.Endpoint, tos []byte, outBufs *[][]byte, outEps *[]conn.Endpoint, outTos *[]byte, peer *Peer) error {
 	// use a naive O(n^2) algorithm since n is expected to be small
 
 	// replace nil endpoints with the first known endpoint
@@ -737,20 +740,30 @@ func partitionBuffersByEndpoint(bufs [][]byte, eps []conn.Endpoint, outBufs *[][
 		currentEp := eps[i]
 		*outBufs = append(*outBufs, bufs[i])
 		*outEps = append(*outEps, currentEp)
+		*outTos = append(*outTos, tosAt(tos, i))
 		eps[i] = nil // Mark as visited
 
 		// Scan the rest of the array for other items in this group
 		for j := i + 1; j < len(bufs); j++ {
-			// Check if it's the same endpoint
-			if eps[j] == currentEp {
+			// Check if it's the same endpoint group
+			if eps[j] == currentEp && tosAt(tos, j) == tosAt(tos, i) {
 				// It's part of the same group. Add it.
 				*outBufs = append(*outBufs, bufs[j])
 				*outEps = append(*outEps, currentEp)
+				*outTos = append(*outTos, tosAt(tos, j))
 				eps[j] = nil // Mark as visited
 			}
 		}
 	}
 	return nil
+}
+
+// tosAt reads the parallel TOS array, 0 when absent (unmarked).
+func tosAt(tos []byte, i int) byte {
+	if i < len(tos) {
+		return tos[i]
+	}
+	return 0
 }
 
 func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
@@ -765,12 +778,16 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	parBufs := make([][]byte, 0, maxBatchSize)
 	eps := make([]conn.Endpoint, 0)
 	parEps := make([]conn.Endpoint, 0)
+	tos := make([]byte, 0, maxBatchSize)
+	parTos := make([]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.outbound.c {
 		bufs = bufs[:0]
 		eps = eps[:0]
+		tos = tos[:0]
 		parBufs = parBufs[:0]
 		parEps = parEps[:0]
+		parTos = parTos[:0]
 		if elemsContainer == nil {
 			return
 		}
@@ -798,17 +815,18 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 
 			bufs = append(bufs, elem.packet)
 			eps = append(eps, elem.endpoint)
+			tos = append(tos, elem.tos)
 		}
 
 		peer.timersAnyAuthenticatedPacketTraversal(false)
 		peer.timersAnyAuthenticatedPacketSent()
 
-		err := partitionBuffersByEndpoint(bufs, eps, &parBufs, &parEps, peer)
+		err := partitionBuffersByEndpoint(bufs, eps, tos, &parBufs, &parEps, &parTos, peer)
 		if err != nil {
 			device.Log.Errorf("%v - Failed to send data packets: %v", peer, err)
 			continue
 		}
-		err = peer.SendBuffers(parBufs, parEps)
+		err = peer.sendBuffers(parBufs, parEps, parTos)
 		if dataSent {
 			peer.timersDataSent()
 		}

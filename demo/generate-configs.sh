@@ -80,6 +80,17 @@ if [ "$FORCE" = 1 ] || [ ! -f "$CONFIGS_DIR/central.yaml" ]; then
       echo "key: $private"
       echo "port: $PORT"
       echo "interface_name: nylon0"
+      # In-tunnel QoS (demo/qos-test.sh acceptance rules): corosync totem
+      # (udp/5405) and ssh (tcp/22) ride ahead of bulk both in-device and on
+      # the wire (outer DSCP EF). udp/7999 and icmp stay unmarked as the
+      # controls. Rules on every node so transit traffic keeps its marking.
+      echo "priority_rules:"
+      echo "  - protocol: udp"
+      echo "    port: 5405"
+      echo "    priority: high"
+      echo "  - protocol: tcp"
+      echo "    port: 22"
+      echo "    priority: high"
       if [ "$node" = "alice" ]; then
         # Deterministic topology. On a docker bridge every link measures the same
         # sub-millisecond latency with comparable jitter, so the mesh re-selects

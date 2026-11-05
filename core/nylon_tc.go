@@ -142,6 +142,21 @@ func (n *Nylon) InstallTC() {
 		}
 		return device.TcPass, nil
 	})
+
+	// in-tunnel QoS: classify inner packets by the configured protocol/port
+	// rules, raising their in-device batch priority and stamping their outer
+	// TOS byte (mirrored onto the encapsulating datagrams by the transport;
+	// see state.PriorityRule). The classification must see every element
+	// before any filter can consume
+	// it, including transit traffic that later leaves through another peer
+	// and locally delivered traffic that never reaches the wire. Installed
+	// LAST among InstallTC's filters — filters run in REVERSE installation
+	// order, so this is the first filter every element passes through
+	// (only the device's own terminal filters run after it).
+	n.Device.InstallFilter(func(dev *device.Device, packet *device.TCElement) (device.TCAction, error) {
+		n.classifyPriority(packet)
+		return device.TcPass, nil
+	})
 }
 
 // tcLocalExit reports whether dst terminates on this node: the longest match

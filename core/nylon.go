@@ -57,6 +57,18 @@ type Nylon struct {
 		hintSigs sync.Map // state.NodeId -> *hopAdoptionState
 	}
 
+	// in-tunnel QoS: the resolved priority rule set (atomic central > node
+	// precedence; see state.ResolvePriorityRules). Swapped by
+	// ensurePriorityRules on the dispatch loop (start + every config apply)
+	// and read lock-free on the TC hot path by the classifier filter
+	// installed in InstallTC.
+	priorityRules atomic.Pointer[[]state.ResolvedPriorityRule]
+
+	// priorityRulesSig is the last applied rule-set signature (change
+	// detection for the "priority rules applied" journal line); touched
+	// only on the dispatch loop.
+	priorityRulesSig string
+
 	// port hopping (server half, listen_mode: nftables): the daemon-owned
 	// netfilter redirect serving the listen range on the primary port. nil
 	// unless the mode is active; removed again on shutdown.

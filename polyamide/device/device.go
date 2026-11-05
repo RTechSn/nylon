@@ -48,6 +48,10 @@ type Device struct {
 		portRange     conn.PortRange // optional additional listen range (port hopping, server side)
 		fwmark        uint32         // mark value (0 = disabled)
 		brokenRoaming bool
+		// tosMarkFallback latches the one-time notice that the bind
+		// cannot stamp outer packets (no conn.TOSBind); in-tunnel QoS
+		// rules then apply to in-device batch ordering only.
+		tosMarkFallback atomic.Bool
 	}
 
 	staticIdentity struct {

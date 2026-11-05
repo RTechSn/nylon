@@ -57,6 +57,15 @@ type Bind interface {
 	BatchSize() int
 }
 
+// A TOSBind can stamp the IPv4 Type-of-Service / IPv6 Traffic Class byte on
+// the datagrams of a single Send call — per-packet DSCP marking of the outer
+// stream (in-tunnel QoS; see state.PriorityRule). Binds that do not implement
+// it send unmarked; callers detect the capability with a type assertion and
+// fall back to a plain Send.
+type TOSBind interface {
+	SendTOS(bufs [][]byte, ep Endpoint, tos byte) error
+}
+
 // BindSocketToInterface is implemented by Bind objects that support being
 // tied to a single network interface. Used by wireguard-windows.
 type BindSocketToInterface interface {

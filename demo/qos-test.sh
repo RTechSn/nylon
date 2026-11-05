@@ -15,18 +15,17 @@
 #
 #   Then, through the real nylon tunnel (alice -> charlie):
 #     - iperf3 TCP bulk (saturates the bottleneck)
-#     - UDP echo probe :5405  ("corosync")
+#     - UDP echo probe :5405  ("corosync" — priority_rules: udp/5405 high)
 #     - UDP echo probe :7999  (control, never prioritized)
-#     - TCP echo probe :22     ("ssh")
+#     - TCP echo probe :22     ("ssh" — priority_rules: tcp/22 high)
 #     - ICMP ping              (control)
 #
-#   All four flows ride the same encrypted outer UDP stream, so the WAN qdisc
-#   cannot tell them apart — that is the whole point. Today nothing in nylon
-#   mirrors inner priority onto the outer DSCP, so class 1:1 stays empty and
-#   every probe bloats together with the bulk. After the priority feature
-#   (config port match + outer DSCP marking) THIS SAME SCRIPT becomes the
-#   acceptance test: udp5405 and ssh22 fall back to ~30 ms while udp7999 and
-#   icmp stay bloated, and class 1:1 packets > 0 in tc -s class.
+#   All four flows ride the same encrypted outer UDP stream. With the demo
+#   configs' priority_rules (see generate-configs.sh) nylon classifies the
+#   inner packets by protocol/port, orders them first within in-device
+#   batches, and mirrors the classification onto the OUTER packets as DSCP
+#   (EF for high) — so the WAN qdisc's class 1:1 carries the matched flows
+#   past the bulk queue while the unmarked controls bloat with it.
 #
 # Requirements: the demo stand up (./demo/up.sh), docker, kernel with
 # sch_netem/sch_prio/sch_htb/cls_u32 (the stand itself already needs netem).
@@ -213,16 +212,15 @@ cat <<EOF
 How to read it:
   idle    everything ~16 ms (one-way $DELAY on alice's egress; the return
           path through the bridge is unshaped) - the harness is healthy.
-  loaded  BEFORE the QoS feature: all four flows bloat together because
-          the encrypted outer stream hides the inner ports (udp5405 is
-          statistically identical to udp7999); nothing marks outer packets
-          EF yet, so class 1:1 stays empty. The UDP/TCP probes are
-          lock-step, so every lost reply stalls them a full 1 s - 'sent'
-          collapses to a fraction of duration/interval, exactly the way a
-          lost totem token stalls corosync.
-          AFTER the feature (priority_ports + outer DSCP mirroring):
-          udp5405 + ssh22 fall back to ~16 ms, udp7999 and icmp stay
-          bloated, and class 1:1 packets > 0.
+  loaded  WITH the demo configs' priority_rules: udp5405 + ssh22 fall back
+          to ~16 ms (inner port match -> outer DSCP EF -> class 1:1),
+          udp7999 and icmp stay bloated with the bulk (unmarked), and
+          class 1:1 packets > 0. Without the rules all four flows bloat
+          together because the encrypted outer stream hides the inner
+          ports. The UDP/TCP probes are lock-step, so every lost reply
+          stalls them a full 1 s - 'sent' collapses to a fraction of
+          duration/interval, exactly the way a lost totem token stalls
+          corosync.
 
   Files: $OUT
 EOF
