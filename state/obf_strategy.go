@@ -163,7 +163,10 @@ func StrategyPortRangeOf(m map[string]*ObfStrategy, name string) (PortRange, err
 
 // EndpointStrategyTags expands an endpoint's strategy tag list into concrete
 // strategy names. An untagged endpoint (or the "*" wildcard) means "all
-// strategies defined in the mesh": the default is everything available. A
+// strategies defined in the mesh" — the default is everything available, in
+// sorted (map) order. Explicit tags expand in the operator's WRITTEN order:
+// the tag list is the preference order, and the strategy selection modes
+// read it (fixed uses the first, the random/trial draws follow it). A
 // concrete tag that names no defined strategy is a config error.
 func EndpointStrategyTags(spec EndpointSpec, m map[string]*ObfStrategy) ([]string, error) {
 	all := StrategyNames(m)
@@ -182,7 +185,6 @@ func EndpointStrategyTags(spec EndpointSpec, m map[string]*ObfStrategy) ([]strin
 		}
 		out = append(out, tag)
 	}
-	slices.Sort(out)
 	return out, nil
 }
 
@@ -359,6 +361,25 @@ func ValidateStrategyJunk(s *ObfStrategy, name string) error {
 	return nil
 }
 
+// validateDefaultJunk checks the obf-level default junk trio for internal
+// coherence — the same contract ValidateStrategyJunk holds each strategy to,
+// applied to the obf defaults (per-field inheritance can only produce a
+// complete trio from a coherent default; an incomplete default is dead config
+// wherever it ends up).
+func validateDefaultJunk(o *CentralObf) error {
+	jcSet := o.Jc != nil && *o.Jc > 0
+	if jcSet && (o.Jmin == nil || o.Jmax == nil) {
+		return fmt.Errorf("obf defaults: jc requires the jmin/jmax junk size range (datagram sizes are drawn from [jmin, jmax))")
+	}
+	if !jcSet && (o.Jmin != nil || o.Jmax != nil) {
+		return fmt.Errorf("obf defaults: jmin/jmax are set but jc is not positive — no junk datagrams are emitted without a count; set jc, or drop the size range")
+	}
+	if o.Jmin != nil && o.Jmax != nil && *o.Jmin > *o.Jmax {
+		return fmt.Errorf("obf defaults: jmin (%d) must not exceed jmax (%d)", *o.Jmin, *o.Jmax)
+	}
+	return nil
+}
+
 // NodeUsedStrategies computes the strategies a node may speak, in stable
 // order: every strategy named by its own advertised endpoints (the listen
 // half) or by any router's advertised endpoints (the connect half — a
@@ -407,13 +428,49 @@ func NodeUsedStrategies(central *CentralCfg, node NodeId) []string {
 	return out
 }
 
-// ValidateObfStrategies checks the central strategy map: names, ports,
-// per-strategy rotation policy and junk trio, and the junk/i-set coherence
-// across every strategy any endpoint may name.
+// ValidateObfStrategies checks the central strategy map and the strategy
+// selection mode: names, ports, per-strategy rotation policy and junk trio,
+// the junk/i-set coherence across every strategy any endpoint may name, and
+// the obf.strategy_mode value (required when the mesh defines more than one
+// strategy, rejected when the mesh defines none).
 func ValidateObfStrategies(cfg *CentralCfg) error {
 	m := cfg.ObfStrategies()
+	// the strategy selection mode governs every node's connect half; it is
+	// dead config without strategies and an ambiguous choice with more than
+	// one (this build replaced the former implicit behaviour — rotations drew
+	// across all strategies uniformly — with an explicit mode, like
+	// port_hopping_mode before it)
+	if cfg.Obf != nil && cfg.Obf.StrategyMode != "" {
+		if err := ValidateStrategyMode(cfg.Obf.StrategyMode); err != nil {
+			return fmt.Errorf("obf: %w", err)
+		}
+		if len(m) == 0 {
+			return fmt.Errorf("obf: strategy_mode is set but no obf strategies are defined — the mode selects among obf.strategy entries; define at least one, or drop the key")
+		}
+	}
+	if len(m) > 1 && (cfg.Obf == nil || cfg.Obf.StrategyMode == "") {
+		return fmt.Errorf("obf: strategy_mode is required when the mesh defines more than one obf strategy (this build no longer rotates implicitly across all strategies): fixed (every connection uses the first strategy of the endpoint's list) | random (a random strategy per connection) | trial (iterate randomly until a connection establishes, then prefer the confirmed strategy; re-search on failure)")
+	}
 	if len(m) == 0 {
 		return nil
+	}
+	// The obf-level defaults (ObfDefaults) are validated as a virtual
+	// strategy: they materialize into every strategy that leaves a
+	// parameter unset, so a bogus default must fail loudly even when
+	// every defined strategy overrides it (dead config is dead config,
+	// wherever it sits).
+	if o := cfg.Obf; o.DefaultsSet() {
+		if strings.TrimSpace(o.Ports) != "" {
+			if _, err := ParsePortRange(strings.TrimSpace(o.Ports)); err != nil {
+				return fmt.Errorf("obf: default ports: %w", err)
+			}
+		}
+		if err := ValidateHopPolicyCfg(o.PortHoppingMode, o.PortHopping, "obf defaults"); err != nil {
+			return err
+		}
+		if err := validateDefaultJunk(o); err != nil {
+			return err
+		}
 	}
 	for _, name := range StrategyNames(m) {
 		s := m[name]

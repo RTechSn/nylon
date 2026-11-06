@@ -194,7 +194,9 @@ func TestHopFactoryAdoptionSkipsCoolingEndpoint(t *testing.T) {
 	n := newHopFixturesNylon(t, time.Hour)
 	ip := netip.MustParseAddr("192.168.1.2")
 	pool := hopTestPool(ip, 30000, 30009)
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind()}
+	cands := hopTestCandidates(ip.String(), 30000, 30009)
+	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		candidates: cands, policies: candidatePolicies(cands)}
 
 	cur, err := pool.Select(nil)
 	if err != nil {
@@ -311,7 +313,9 @@ func TestHopRotationLogRateLimited(t *testing.T) {
 	ip := netip.MustParseAddr("192.168.1.2")
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30999}}},
 		state.PortPoolConfig{Recent: 16, Cooldown: time.Hour, Samples: 4})
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind()}
+	cands := hopTestCandidates(ip.String(), 30000, 30999)
+	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		candidates: cands, policies: candidatePolicies(cands)}
 
 	cur, err := f.bind.ParseEndpoint("192.168.1.2:30001")
 	if err != nil {
@@ -348,7 +352,9 @@ func TestHopPoolExhaustionWarnRateLimited(t *testing.T) {
 	ip := netip.MustParseAddr("192.168.1.2")
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30001}}},
 		state.PortPoolConfig{Recent: 1, Cooldown: time.Hour, Samples: 2})
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind()}
+	cands := hopTestCandidates(ip.String(), 30000, 30001)
+	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		candidates: cands, policies: candidatePolicies(cands)}
 
 	cur, err := f.bind.ParseEndpoint("192.168.1.2:30000")
 	if err != nil {

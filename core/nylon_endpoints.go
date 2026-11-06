@@ -201,6 +201,12 @@ func handleProbePing(n *Nylon, node state.NodeId, wgEndpoint conn.Endpoint) {
 					return
 				}
 
+				// strategy selection (obf.strategy_mode): hearing from the
+				// peer on this addr:port confirms the connection attempt when
+				// it is the factory's current carrying endpoint — the trial
+				// memory pins the confirmed strategy
+				n.noteHopHeardBack(node, wgEndpoint.DstIPPort())
+
 				// refresh wireguard ep
 				dep.WgEndpoint = wgEndpoint
 
@@ -466,6 +472,12 @@ func handleProbePong(n *Nylon, node state.NodeId, token uint64, ep conn.Endpoint
 				if dpLink.IsExhausted() {
 					return
 				}
+
+				// strategy selection (obf.strategy_mode): the pong came back
+				// on this addr:port — when it is the factory's current
+				// carrying endpoint, the connection attempt is confirmed and
+				// the trial memory pins the carrying strategy
+				n.noteHopHeardBack(node, ep.DstIPPort())
 
 				dpLink.Renew()
 				dpLink.UpdatePing(latency)

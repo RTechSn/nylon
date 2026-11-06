@@ -119,7 +119,9 @@ port_hopping:
 
 ### Rotation modes
 
-`port_hopping_mode` on a strategy decides **when** the carrying endpoint drawn from that strategy's ports changes. It governs outgoing connections only — the listen half (the union served per `listen_mode`) is orthogonal, so a hub may serve a wide union while itself drawing from strategies of any mode. A peer whose endpoints tag several strategies rotates across all their ports; the policy in effect is the one of the CURRENT carrying candidate's strategy (journalled as `port hop: carrying strategy switched` when it changes).
+`port_hopping_mode` on a strategy decides **when** the carrying endpoint drawn from that strategy's ports changes. It governs outgoing connections only — the listen half (the union served per `listen_mode`) is orthogonal, so a hub may serve a wide union while itself drawing from strategies of any mode. The policy in effect is the one of the CURRENT carrying candidate's strategy (journalled as `port hop: carrying strategy switched` when it changes).
+
+Which strategy a peer draws from is a separate axis: `obf.strategy_mode` in the global `obf:` block decides **which** strategy carries each new connection — `fixed` (the first of the endpoint's tag list, as written), `random` (a random strategy per connection), or `trial` (iterate randomly until a connection establishes, then prefer the confirmed strategy; a carrying-link death condemns it and a second death without a confirmation demotes it — the random iteration resumes). `rated` is reserved for a future release. Rotations stay within the selected strategy's ports: a peer whose endpoints tag several strategies no longer rotates across all their ports implicitly — pick `random` or `trial` to spread connections across strategies, or `fixed` to pin the first (the mode is required when the mesh defines more than one strategy). See [Configuration Reference — Obf Strategies](/reference/config#obf-strategies).
 
 | Mode | Rotates | Required knobs | When to use |
 | --- | --- | --- | --- |

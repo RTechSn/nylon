@@ -243,6 +243,23 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+  # obf-level DEFAULTS for the strategy parameters: every parameter a
+  # strategy may set can also be set here, and a strategy that leaves it
+  # unset inherits this value (per parameter — a strategy that sets only
+  # `jc` still inherits the default `jmin`/`jmax`; a set value always wins).
+  # The defaults below would let the three strategies drop their shared
+  # ports/junk entirely. Validation holds the defaults to the same
+  # contracts as a strategy (ports spec, junk trio, hop policy).
+  ports: "40000-50000"   # default port spec for strategies that set no ports
+  jc: 5                  # default junk trio
+  jmin: 250
+  jmax: 800
+  # Strategy selection for new connections (which obf strategy carries each
+  # connection): fixed (the first strategy of the endpoint's list) | random
+  # (a random strategy per connection) | trial (iterate randomly until a
+  # connection establishes, then prefer the confirmed strategy; re-search on
+  # failure). REQUIRED when the mesh defines more than one strategy.
+  strategy_mode: trial
   # Named obf strategies: each entry bundles the ports a node listens on /
   # connects through, the client-side rotation policy for those ports, and the
   # sender-local junk (jc/jmin/jmax and i1-i5). Endpoints reference strategies
@@ -303,9 +320,22 @@ Strategies are the multi-level named list inside the global `obf:` block (`obf.s
 | `port_hopping_mode` | string | `static`   | rotation strategy for the strategy's ports: `static` \| `reactive` \| `proactive` \| `timed`                                 |
 | `port_hopping`       | map    | omitted    | rotation knobs (`budget_packets`, `period_seconds`, `period_jitter_pct`, `recent_ports`, `cooldown_seconds`, `candidate_samples`, `recycle_seconds`) — same semantics as the pre-reform node-level block |
 
+**Obf-level defaults**: every parameter of the field table above can also be set directly under `obf:` (sibling of `s1`-`s4`/`h1`-`h4` and `strategy:`) as a mesh-wide default. A strategy that leaves the parameter unset inherits the obf-level value; a strategy that sets it wins — per parameter, so a strategy that sets only `jc` still inherits the default `jmin`/`jmax`, and a strategy that sets only `i1` inherits the default `i2`-`i5` slot by slot. The defaults resolve everywhere strategy VALUES are consumed (validation, the listen union, the junk resolution, the connect-half candidates); the file keeps the operator's shape — the seal, the distributed bundle and the daemon's local cache serialize the defaults at the obf level and the strategies exactly as written. Validation holds the defaults block to the same contracts as a strategy: a bogus default fails loudly even when every strategy overrides it (dead config is dead config, wherever it sits).
+
 **Listen half**: a node binds the union of `ports` over every strategy its OWN advertised endpoints name (untagged = all strategies), served per `listen_mode`. The primary port (`node.yaml`'s `port`) is always bound.
 
 **Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
+
+**Strategy selection** (`obf.strategy_mode`): decides WHICH strategy carries each new connection — every drawn carrying endpoint is one connection (one UDP flow through the middleboxes), so the mode applies on every draw. Orthogonal to `port_hopping_mode`, which decides WHEN the carrying endpoint rotates *within* the selected strategy's ports.
+
+| Value    | Behavior                                                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `fixed`  | every connection uses the FIRST strategy of the endpoint's list (config order: endpoints first, then the tag order as written) |
+| `random` | every connection draws a random strategy, preferring one other than the outgoing connection's when the endpoint names more than one |
+| `trial`  | iterate randomly until a connection establishes (the carrying endpoint is heard back on — the handshake completed); the confirmed strategy is remembered, and every later connection — reconnects and rotations alike — first uses it. A carrying-link death (the same liveness model that drives reactive rotation) condemns the memory: the reconnect still retries the strategy first, and only a second death without a confirmation in between demotes it — the random iteration resumes |
+| `rated`  | reserved: strategy rating by measured connection performance — parses, but validation rejects it as not implemented yet                              |
+
+The mode is required when the mesh defines more than one strategy (this build replaced the former implicit behavior — rotations drew across all strategies uniformly — with an explicit choice, like `port_hopping_mode` before it), and dead config when the mesh defines none. An explicit tag list is the operator's preference order: `fixed` pins the first as written, while untagged hosts and `[*]` use the strategies in sorted (map) order.
 
 **Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (the mesh-wide S/H inline in `obf:`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
 
@@ -321,7 +351,7 @@ Three forms exist (IPv6 hosts bracketed as usual: `[2001:db8::1]:51820`, `[2001:
 | --------------------- | ------------------------------------------------------------------------------------------------ |
 | `host:port`           | raw fixed-port endpoint, no strategy; a stock configured link                                     |
 | `host`                | bare host: every strategy's ports when the mesh defines any, else the default port (57175)          |
-| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies; `host[*]` is the same as untagged        |
+| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies, in the written order (the preference order `strategy_mode: fixed` pins); `host[*]` is the same as untagged |
 
 Inline port ranges (`host:30000-40000`) moved into strategies and are rejected with a migration error; combining an explicit port with tags (`host:9000[s1]`) is a contradiction and is rejected too.
 

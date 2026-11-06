@@ -409,3 +409,62 @@ func TestPortPoolSelectFindsLastEligiblePort(t *testing.T) {
 		}
 	}
 }
+
+// TestPortPoolSelectFromRestrictsToGroups pins the strategy-restricted draw:
+// SelectFrom draws only from the GIVEN group subset (one obf strategy's
+// resolved groups), never from the pool's wider group set.
+func TestPortPoolSelectFromRestrictsToGroups(t *testing.T) {
+	stratA := []PortGroup{testGroup("10.0.0.1", 40000, 40009)}
+	stratB := []PortGroup{testGroup("10.0.1.1", 50000, 50009)}
+	pool := NewPortPool(append(append([]PortGroup{}, stratA...), stratB...),
+		PortPoolConfig{Recent: 8, Cooldown: time.Minute, Samples: 16})
+
+	for i := 0; i < 100; i++ {
+		ap, err := pool.SelectFrom(stratA, nil)
+		if err != nil {
+			t.Fatalf("SelectFrom: %v", err)
+		}
+		if ap.Addr() != netip.MustParseAddr("10.0.0.1") || ap.Port() < 40000 || ap.Port() > 40009 {
+			t.Fatalf("draw %d outside strategy A's groups: %v", i, ap)
+		}
+	}
+}
+
+// TestPortPoolSelectFromExhaustionIsSubsetScoped pins that exhaustion is
+// scoped to the GIVEN groups: a strategy whose ports are all cooling fails
+// the draw while other strategies' ports stay selectable — and the shared
+// cooldown retires a port for every strategy that reaches it.
+func TestPortPoolSelectFromExhaustionIsSubsetScoped(t *testing.T) {
+	stratA := []PortGroup{testGroup("10.0.0.1", 40000, 40000)} // sole port
+	stratB := []PortGroup{testGroup("10.0.1.1", 50000, 50009)}
+	pool := NewPortPool(append(append([]PortGroup{}, stratA...), stratB...),
+		PortPoolConfig{Recent: 1, Cooldown: time.Hour, Samples: 4})
+
+	// burn strategy A's sole port: drawn, then retired (the exhaustion path —
+	// NextHopEndpoint retires the exhausted endpoint), so it cools down
+	if ap, err := pool.SelectFrom(stratA, nil); err != nil {
+		t.Fatalf("first SelectFrom: %v", err)
+	} else {
+		pool.Retire(ap)
+	}
+	if _, err := pool.SelectFrom(stratA, nil); err == nil {
+		t.Fatalf("exhausted strategy A must fail its own draws")
+	}
+	// ...while strategy B still serves, from the SAME pool
+	if _, err := pool.SelectFrom(stratB, nil); err != nil {
+		t.Fatalf("strategy B must stay selectable: %v", err)
+	}
+
+	// the shared cooldown: strategy B cannot reach A's burned port either
+	burned := netip.MustParseAddrPort("10.0.0.1:40000")
+	if !pool.IsCooling(burned) {
+		t.Fatalf("the burned port must be cooling pool-wide")
+	}
+	poolBwithA := append([]PortGroup{}, stratB...)
+	poolBwithA = append(poolBwithA, stratA...)
+	if ap, err := pool.SelectFrom(poolBwithA, nil); err != nil {
+		t.Fatalf("combined draw must fall back to B's ports: %v", err)
+	} else if ap == burned {
+		t.Fatalf("combined draw must not select the cooling port")
+	}
+}

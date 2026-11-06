@@ -62,28 +62,159 @@ type ObfPeerParams struct {
 	I5       string `yaml:",omitempty"`
 }
 
+// ObfDefaults is the defaultable subset of the obf strategy parameters, set
+// inline at the `obf:` level (sibling of the mesh-wide S/H dialect and the
+// named strategy map). Every parameter a strategy may set can also be set
+// here as a mesh-wide default: a strategy that leaves the parameter unset
+// inherits the obf-level value, a strategy that sets it wins (per parameter —
+// a strategy that sets only `i1` inherits the obf default `i2`..`i5` slot by
+// slot). The defaults resolve where the strategy VALUES are consumed —
+// CentralCfg.ObfStrategies() returns the resolved (materialized) map — while
+// serialization keeps the operator's shape: the defaults stay at the obf
+// level and the strategies stay as written, in the seal, in the distributed
+// bundle and in the daemon's local cache alike.
+// (The fields live directly on CentralObf rather than in a second inline
+// embed: goccy/go-yaml v1.19.1 silently drops the whole section when a
+// struct carries TWO inline embeds and the second marshals to nothing —
+// the single ObfProfile inline plus direct fields marshal correctly.)
+
 // CentralObf is the global `obf` block of the central config — the
 // network-wide obfuscation half (upstream keeps the same naming: a `obf`
 // block on a node holds per-node parameters, the central `obf` block holds
 // the parameters for the whole network). It carries the mesh-wide S/H
-// handshake dialect inline (the wire contract, uniform by construction) and
-// the named strategy map under `strategy:` — ports, rotation policy and the
-// sender-local junk emission, selected per endpoint (host[<strategy>,...]).
+// handshake dialect inline (the wire contract, uniform by construction), the
+// named strategy map under `strategy:` — ports, rotation policy and the
+// sender-local junk emission, selected per endpoint (host[<strategy>,...]) —
+// and the obf-level DEFAULTS for the strategy parameters (ObfDefaults): a
+// strategy inherits every parameter it does not set of its own.
 // A nil CentralObf (no `obf:` key at all) is the vanilla-compat default.
 type CentralObf struct {
 	ObfProfile `yaml:",inline"`
+
+	// The obf-level DEFAULTS for the strategy parameters (see the
+	// ObfDefaults comment above): inherited per field by every strategy
+	// that leaves the parameter unset.
+	Ports           string          `yaml:"ports,omitempty"`             // default port spec: "40000" or "40000-50000"
+	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"` // static (default) | reactive | proactive | timed
+	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`      // default rotation policy block
+	Jc              *uint32         `yaml:"jc,omitempty"`                // default junk datagram count
+	Jmin            *uint32         `yaml:"jmin,omitempty"`              // default junk size range low
+	Jmax            *uint32         `yaml:"jmax,omitempty"`              // default junk size range high
+	I1              string          `yaml:"i1,omitempty"`
+	I2              string          `yaml:"i2,omitempty"`
+	I3              string          `yaml:"i3,omitempty"`
+	I4              string          `yaml:"i4,omitempty"`
+	I5              string          `yaml:"i5,omitempty"`
+
 	// Strategy is the named obf strategy map; referenced per endpoint as
 	// host[strategy1,strategy2] (untagged / "[*]" = all strategies).
 	Strategy map[string]*ObfStrategy `yaml:"strategy,omitempty"`
+	// StrategyMode is the strategy selection principle for new connections
+	// (obf.strategy_mode): fixed (default) | random | trial; `rated` is
+	// reserved. Required when the mesh defines more than one strategy —
+	// see ValidateObfStrategies.
+	StrategyMode string `yaml:"strategy_mode,omitempty"`
 }
 
-// ObfStrategies returns the named obf strategy map of the global `obf` block
-// (nil when the block or the map is absent).
+// DefaultsSet reports whether the obf block carries any strategy default.
+func (o *CentralObf) DefaultsSet() bool {
+	if o == nil {
+		return false
+	}
+	return o.Ports != "" ||
+		o.PortHoppingMode != "" || o.PortHopping != nil ||
+		o.Jc != nil || o.Jmin != nil || o.Jmax != nil ||
+		o.I1 != "" || o.I2 != "" || o.I3 != "" || o.I4 != "" || o.I5 != ""
+}
+
+// applyDefaults returns a copy of the strategy with every unset parameter
+// inherited from the obf-level defaults (per field — the strategy's own
+// value always wins). The receiver is never mutated; s is returned as-is
+// when nothing is inherited.
+func (o *CentralObf) applyDefaults(s *ObfStrategy) *ObfStrategy {
+	if !o.DefaultsSet() || s == nil {
+		return s
+	}
+	out := *s
+	if out.Ports == "" {
+		out.Ports = o.Ports
+	}
+	if out.PortHoppingMode == "" {
+		out.PortHoppingMode = o.PortHoppingMode
+	}
+	if out.PortHopping == nil {
+		out.PortHopping = o.PortHopping
+	}
+	if out.Jc == nil {
+		out.Jc = o.Jc
+	}
+	if out.Jmin == nil {
+		out.Jmin = o.Jmin
+	}
+	if out.Jmax == nil {
+		out.Jmax = o.Jmax
+	}
+	if out.I1 == "" {
+		out.I1 = o.I1
+	}
+	if out.I2 == "" {
+		out.I2 = o.I2
+	}
+	if out.I3 == "" {
+		out.I3 = o.I3
+	}
+	if out.I4 == "" {
+		out.I4 = o.I4
+	}
+	if out.I5 == "" {
+		out.I5 = o.I5
+	}
+	return &out
+}
+
+// ObfStrategies returns the RESOLVED named obf strategy map of the global
+// `obf` block: every strategy with each unset parameter inherited from the
+// obf-level defaults (see ObfDefaults). The returned entries are fresh
+// copies whenever defaults are set (the raw map is never handed out then);
+// with no defaults configured the raw map is returned unchanged. Consumers
+// reading strategy VALUES (validation, the listen union, the junk
+// resolution, the connect-half candidates, the policy journal) must go
+// through this accessor — direct `Obf.Strategy` access reads the RAW
+// operator shape and misses the defaults. Serialization (seal, the local
+// config cache) deliberately uses the raw shape.
+// Nil when the block or the map is absent.
 func (c *CentralCfg) ObfStrategies() map[string]*ObfStrategy {
 	if c == nil || c.Obf == nil {
 		return nil
 	}
-	return c.Obf.Strategy
+	m := c.Obf.Strategy
+	if len(m) == 0 {
+		return nil
+	}
+	if !c.Obf.DefaultsSet() {
+		return m
+	}
+	out := make(map[string]*ObfStrategy, len(m))
+	for name, s := range m {
+		out[name] = c.Obf.applyDefaults(s)
+	}
+	return out
+}
+
+// ObfStrategyMode returns the resolved strategy selection mode of the global
+// `obf` block: an absent block or value resolves to fixed. Unknown values
+// (a live-swapped config that slipped past validation) also resolve to fixed —
+// validation owns the loud error; the runtime never wedges on a bad value.
+func (c *CentralCfg) ObfStrategyMode() string {
+	if c == nil || c.Obf == nil {
+		return StrategyModeFixed
+	}
+	switch c.Obf.StrategyMode {
+	case StrategyModeRandom, StrategyModeTrial:
+		return c.Obf.StrategyMode
+	default:
+		return StrategyModeFixed
+	}
 }
 
 // Profile returns the mesh-wide AWG 2.0 S/H handshake dialect from the global
@@ -255,6 +386,60 @@ func ValidateHopMode(mode string) error {
 		return fmt.Errorf("port_hopping_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, HopModes())
 	}
 	return fmt.Errorf("unknown port_hopping_mode %q (want one of %v)", mode, HopModes())
+}
+
+// Strategy selection modes (obf.strategy_mode) decide WHICH obf strategy a
+// new connection uses — the connect half of the strategy model. Where
+// port_hopping_mode governs WHEN the carrying endpoint rotates (within the
+// strategy's ports), strategy_mode governs the strategy choice per
+// connection: every drawn carrying endpoint is one connection (one UDP flow
+// through the middleboxes), so the mode applies on every draw.
+const (
+	// StrategyModeFixed uses the FIRST strategy of the endpoint's list
+	// (config order: endpoints first, then the tag order as written) for
+	// every connection. Default; the deterministic, predictable pin.
+	StrategyModeFixed = "fixed"
+	// StrategyModeRandom draws a random strategy for every connection,
+	// preferring one other than the outgoing connection's when the peer
+	// names more than one.
+	StrategyModeRandom = "random"
+	// StrategyModeTrial iterates randomly until a connection establishes
+	// (the carrying endpoint is heard back on — the handshake completed);
+	// the confirmed strategy is remembered, and every later connection
+	// (reconnects and rotations alike) first uses it. When an attempt on the
+	// remembered strategy exhausts without confirmation, the memory is
+	// demoted and the random iteration resumes.
+	StrategyModeTrial = "trial"
+
+	// StrategyModeRated is a reserved mode name: strategy rating by measured
+	// connection performance. Parseable, but rejected by validation until
+	// the implementing branch lands (same contract as the reserved hop
+	// modes).
+	StrategyModeRated = "rated" // rating by measured performance — not implemented yet
+)
+
+// StrategyModes lists the implemented obf.strategy_mode values.
+func StrategyModes() []string {
+	return []string{StrategyModeFixed, StrategyModeRandom, StrategyModeTrial}
+}
+
+// ReservedStrategyModes lists the obf.strategy_mode values reserved for
+// future branches.
+func ReservedStrategyModes() []string {
+	return []string{StrategyModeRated}
+}
+
+// ValidateStrategyMode checks an obf.strategy_mode value: implemented modes
+// pass, reserved names get a dedicated not-yet-implemented error, anything
+// else is unknown.
+func ValidateStrategyMode(mode string) error {
+	if slices.Contains(StrategyModes(), mode) {
+		return nil
+	}
+	if slices.Contains(ReservedStrategyModes(), mode) {
+		return fmt.Errorf("strategy_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, StrategyModes())
+	}
+	return fmt.Errorf("unknown strategy_mode %q (want one of %v)", mode, StrategyModes())
 }
 
 // PortHoppingCfg is the client-side port rotation policy for peers whose

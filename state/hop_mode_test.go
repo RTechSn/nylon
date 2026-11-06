@@ -365,7 +365,7 @@ func TestStrategyJunkCoherence(t *testing.T) {
 
 	// the central validator catches it across every router endpoint
 	central := &CentralCfg{
-		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
+		Obf: &CentralObf{StrategyMode: StrategyModeFixed, Strategy: map[string]*ObfStrategy{
 			"awg":  {Ports: "40000", I1: "aabb"},
 			"awg2": {Ports: "40001", I1: "ccdd"},
 		}},
@@ -379,7 +379,7 @@ func TestStrategyJunkCoherence(t *testing.T) {
 	}
 
 	central = &CentralCfg{
-		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
+		Obf: &CentralObf{StrategyMode: StrategyModeFixed, Strategy: map[string]*ObfStrategy{
 			"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
 			"awg2": {Ports: "40001", Jc: hopStr(6), Jmin: hopStr(250), Jmax: hopStr(800)},
 		}},
@@ -454,5 +454,199 @@ func TestNodeUsedStrategies(t *testing.T) {
 	used = NodeUsedStrategies(&CentralCfg{Routers: []RouterCfg{{NodeCfg: NodeCfg{Id: "hub"}, Endpoints: []string{"hub.example.com"}}}}, "hub")
 	if len(used) != 0 {
 		t.Errorf("strategyless mesh must yield no used set, got %v", used)
+	}
+}
+
+// TestValidateStrategyModeMatrix walks the obf.strategy_mode validation:
+// implemented modes pass, the reserved `rated` gets the not-implemented
+// error, unknown values are rejected, and the mode is REQUIRED when the mesh
+// defines more than one strategy and dead config when it defines none.
+func TestValidateStrategyModeMatrix(t *testing.T) {
+	// the value validator itself
+	for _, mode := range StrategyModes() {
+		if err := ValidateStrategyMode(mode); err != nil {
+			t.Errorf("mode %q must validate: %v", mode, err)
+		}
+	}
+	if err := ValidateStrategyMode(StrategyModeRated); err == nil || !strings.Contains(err.Error(), "reserved for a future release") {
+		t.Errorf("rated must carry the reserved error, got: %v", err)
+	}
+	if err := ValidateStrategyMode("round-robin"); err == nil || !strings.Contains(err.Error(), "unknown strategy_mode") {
+		t.Errorf("unknown mode must be rejected, got: %v", err)
+	}
+
+	twoStrats := func(mode string) *CentralCfg {
+		return &CentralCfg{
+			Obf: &CentralObf{StrategyMode: mode, Strategy: map[string]*ObfStrategy{
+				"awg":  {Ports: "40000"},
+				"awg2": {Ports: "40001"},
+			}},
+		}
+	}
+
+	// required when the mesh defines more than one strategy
+	if err := ValidateObfStrategies(twoStrats("")); err == nil || !strings.Contains(err.Error(), "strategy_mode is required") {
+		t.Errorf("two strategies without a mode must be rejected, got: %v", err)
+	}
+	for _, mode := range StrategyModes() {
+		if err := ValidateObfStrategies(twoStrats(mode)); err != nil {
+			t.Errorf("two strategies with mode %q must validate: %v", mode, err)
+		}
+	}
+	if err := ValidateObfStrategies(twoStrats(StrategyModeRated)); err == nil || !strings.Contains(err.Error(), "reserved for a future release") {
+		t.Errorf("rated must be rejected even with two strategies, got: %v", err)
+	}
+
+	// one strategy: the mode is optional (every mode reduces to the one)
+	oneStrat := func(mode string) *CentralCfg {
+		return &CentralCfg{
+			Obf: &CentralObf{StrategyMode: mode, Strategy: map[string]*ObfStrategy{
+				"awg": {Ports: "40000"},
+			}},
+		}
+	}
+	if err := ValidateObfStrategies(oneStrat("")); err != nil {
+		t.Errorf("one strategy without a mode must validate: %v", err)
+	}
+	for _, mode := range StrategyModes() {
+		if err := ValidateObfStrategies(oneStrat(mode)); err != nil {
+			t.Errorf("one strategy with mode %q must validate: %v", mode, err)
+		}
+	}
+
+	// dead config: a mode without any strategies
+	noStrats := &CentralCfg{Obf: &CentralObf{StrategyMode: StrategyModeRandom}}
+	if err := ValidateObfStrategies(noStrats); err == nil || !strings.Contains(err.Error(), "strategy_mode is set but no obf strategies") {
+		t.Errorf("mode without strategies must be rejected, got: %v", err)
+	}
+}
+
+// TestObfStrategyModeResolution pins the runtime resolution: absent → fixed,
+// and unknown/reserved values (a live-swapped config that slipped past
+// validation) also resolve to fixed — the runtime never wedges on a bad
+// value; validation owns the loud error.
+func TestObfStrategyModeResolution(t *testing.T) {
+	var nilCfg *CentralCfg
+	if mode := nilCfg.ObfStrategyMode(); mode != StrategyModeFixed {
+		t.Errorf("nil central config: mode = %q, want fixed", mode)
+	}
+	cases := []struct {
+		set  string
+		want string
+	}{
+		{"", StrategyModeFixed},
+		{StrategyModeFixed, StrategyModeFixed},
+		{StrategyModeRandom, StrategyModeRandom},
+		{StrategyModeTrial, StrategyModeTrial},
+		{StrategyModeRated, StrategyModeFixed},
+		{"nonsense", StrategyModeFixed},
+	}
+	for _, tc := range cases {
+		cfg := &CentralCfg{Obf: &CentralObf{StrategyMode: tc.set, Strategy: map[string]*ObfStrategy{
+			"awg": {Ports: "40000"}, "awg2": {Ports: "40001"},
+		}}}
+		if mode := cfg.ObfStrategyMode(); mode != tc.want {
+			t.Errorf("set %q: mode = %q, want %q", tc.set, mode, tc.want)
+		}
+	}
+}
+
+// TestStrategyModeRoundtrip pins the YAML surface: strategy_mode nests under
+// the global obf block next to the strategy map and survives the
+// marshal/unmarshal roundtrip.
+func TestStrategyModeRoundtrip(t *testing.T) {
+	const in = `
+obf:
+  s1: 32
+  strategy_mode: trial
+  strategy:
+    awg:
+      ports: "40000"
+    awg2:
+      ports: 50000-50100
+`
+	var central CentralCfg
+	if err := yaml.UnmarshalWithOptions([]byte(in), &central, yaml.Strict()); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if central.Obf == nil || central.Obf.StrategyMode != StrategyModeTrial {
+		t.Fatalf("strategy_mode not parsed: %+v", central.Obf)
+	}
+	if err := CentralConfigValidator(&central); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if mode := central.ObfStrategyMode(); mode != StrategyModeTrial {
+		t.Fatalf("resolved mode = %q, want trial", mode)
+	}
+	out, err := yaml.Marshal(&central)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var central2 CentralCfg
+	if err := yaml.UnmarshalWithOptions(out, &central2, yaml.Strict()); err != nil {
+		t.Fatalf("re-unmarshal: %v (yaml: %s)", err, out)
+	}
+	if central2.Obf == nil || central2.Obf.StrategyMode != StrategyModeTrial {
+		t.Fatalf("strategy_mode lost in roundtrip (yaml: %s): %+v", out, central2.Obf)
+	}
+}
+
+// TestEndpointStrategyTagOrder pins the tag list as the operator's preference
+// order: explicit tags expand in the WRITTEN order (the fixed mode pins the
+// first as written), while untagged and wildcard endpoints expand to every
+// defined strategy in sorted (map) order.
+func TestEndpointStrategyTagOrder(t *testing.T) {
+	m := map[string]*ObfStrategy{
+		"alpha": {Ports: "40000"},
+		"beta":  {Ports: "41000"},
+		"gamma": {Ports: "42000"},
+	}
+
+	// written order preserved, not sorted
+	spec, err := ParseEndpointSpec("hub.example.com[gamma,alpha,beta]")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tags, err := EndpointStrategyTags(spec, m)
+	if err != nil {
+		t.Fatalf("tags: %v", err)
+	}
+	if len(tags) != 3 || tags[0] != "gamma" || tags[1] != "alpha" || tags[2] != "beta" {
+		t.Fatalf("written order must be preserved, got %v", tags)
+	}
+
+	// untagged: every strategy, sorted
+	spec, err = ParseEndpointSpec("hub.example.com")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tags, err = EndpointStrategyTags(spec, m)
+	if err != nil {
+		t.Fatalf("tags: %v", err)
+	}
+	if len(tags) != 3 || tags[0] != "alpha" || tags[1] != "beta" || tags[2] != "gamma" {
+		t.Fatalf("untagged must expand sorted, got %v", tags)
+	}
+
+	// wildcard: same as untagged
+	spec, err = ParseEndpointSpec("hub.example.com[*]")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tags, err = EndpointStrategyTags(spec, m)
+	if err != nil {
+		t.Fatalf("tags: %v", err)
+	}
+	if len(tags) != 3 || tags[0] != "alpha" || tags[1] != "beta" || tags[2] != "gamma" {
+		t.Fatalf("wildcard must expand sorted, got %v", tags)
+	}
+
+	// unknown tag: rejected with the defined names
+	spec, err = ParseEndpointSpec("hub.example.com[alpha,nope]")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := EndpointStrategyTags(spec, m); err == nil || !strings.Contains(err.Error(), "undefined obf strategy \"nope\"") {
+		t.Fatalf("unknown tag must be rejected, got: %v", err)
 	}
 }

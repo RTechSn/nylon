@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/goccy/go-yaml"
@@ -67,20 +68,20 @@ func OpenBundle(data []byte, key []byte) ([]byte, error) {
 
 // BundleConfig first signs the config with the root private key, ensuring the authenticity, then encrypts the message using the bytes of the root public key as the shared key, offering some level of privacy. (assuming the root public key is not shared widely)
 //
-// Comments survive the seal: the comments of the hand-written central.yaml are
-// captured during the strict decode (yaml.CommentToMap) and reattached to the
-// sealed plaintext at marshal time (yaml.WithComment), so `nylon open` shows
-// the bundle exactly as the operator documented it. Comment positions map by
-// path; the seal only mutates `timestamp`, which keeps its path, so every
-// captured comment reattaches.
+// Comments are STRIPPED from the sealed plaintext: the operator's raw
+// central.yaml keeps its documentation (the daemon preserves the comments
+// of the local file it refreshes — see MarshalPreservingComments), while the
+// distributed central.nybundle is clean config. The comment lifecycle is
+// therefore: raw central.yaml (comments live here, forever) → seal strips →
+// bundle (clean) → poll → the daemon's local cache (whatever the local file
+// already carried).
 func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	cfg := CentralCfg{}
-	comments := yaml.CommentMap{}
 	// Strict: a key CentralCfg does not model must fail the seal loudly, not
 	// silently vanish from the distributed bundle — a dropped section (e.g.
 	// priority_rules at an unsupported level) is indistinguishable from
 	// "applied" until traffic proves otherwise.
-	err := yaml.UnmarshalWithOptions([]byte(config), &cfg, yaml.Strict(), yaml.CommentToMap(comments))
+	err := yaml.UnmarshalWithOptions([]byte(config), &cfg, yaml.Strict())
 	if err != nil {
 		return "", err
 	}
@@ -93,7 +94,7 @@ func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	}
 	cfg.Timestamp = time.Now().UnixNano()
 
-	plainText, err := yaml.MarshalWithOptions(cfg, yaml.WithComment(comments))
+	plainText, err := yaml.Marshal(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -112,10 +113,12 @@ func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 }
 
 // UnbundleConfigText verifies and opens a bundle and returns both the parsed
-// config and the sealed plaintext — the exact YAML the seal produced, comments
-// included. `nylon open` prints the plaintext so an audited bundle reads like
-// the operator's central.yaml; nodes on the poll path use UnbundleConfig and
-// never need the text.
+// config and the sealed plaintext — the exact YAML the seal produced (clean
+// of comments; the operator's documentation lives in the raw central.yaml,
+// which the seal strips and the daemon's local cache preserves — see
+// MarshalPreservingComments). `nylon open` prints the plaintext so an
+// audited bundle reads like the config the nodes will run; nodes on the
+// poll path use UnbundleConfig and never need the text.
 func UnbundleConfigText(bundleStr string, pubKey NyPublicKey) (string, *CentralCfg, error) {
 	bundle, err := base64.StdEncoding.DecodeString(bundleStr)
 	if err != nil {
@@ -149,4 +152,40 @@ func UnbundleConfigText(bundleStr string, pubKey NyPublicKey) (string, *CentralC
 func UnbundleConfig(bundleStr string, pubKey NyPublicKey) (*CentralCfg, error) {
 	_, cfg, err := UnbundleConfigText(bundleStr, pubKey)
 	return cfg, err
+}
+
+// MarshalPreservingComments renders cfg as YAML carrying over the comments
+// of the file at existingPath (when it exists and parses): the daemon
+// refreshes its local central.yaml cache on every applied config update,
+// and the file it overwrites may be the operator's hand-written, documented
+// central.yaml — the values change, the documentation must not. Comments
+// map by YAML path, so comments of paths that still exist reattach; a
+// removed section's comments drop with it. When the existing file cannot be
+// read or parsed (absent, unreadable, stale), the result is a plain
+// comment-free marshal — a machine-written cache carries no comments anyway.
+func MarshalPreservingComments(cfg *CentralCfg, existingPath string) []byte {
+	plain, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil
+	}
+	file, err := os.ReadFile(existingPath)
+	if err != nil {
+		return plain
+	}
+	// non-strict on purpose: the existing file may carry keys this binary no
+	// longer models (a stale cache being replaced by a fresh fetch); the
+	// comments of the paths that still match are what we keep.
+	comments := yaml.CommentMap{}
+	throwaway := CentralCfg{}
+	if err := yaml.UnmarshalWithOptions(file, &throwaway, yaml.CommentToMap(comments)); err != nil {
+		return plain
+	}
+	if len(comments) == 0 {
+		return plain
+	}
+	out, err := yaml.MarshalWithOptions(cfg, yaml.WithComment(comments))
+	if err != nil {
+		return plain
+	}
+	return out
 }

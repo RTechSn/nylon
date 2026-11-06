@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/encodeous/nylon/state"
-	"github.com/goccy/go-yaml"
 )
 
 // configFetchTimeout bounds a single config repo fetch. Without it a
@@ -35,9 +34,20 @@ func fetchConfig(repoStr string, key state.NyPublicKey, maxSize int64, resolver 
 
 	switch repo.Scheme {
 	case "file":
-		file, err := os.ReadFile(repo.Opaque)
+		// the historical repo form is relative ("file:central.nybundle" —
+		// the path lands in Opaque); "file:///abs/path" carries the path in
+		// Path instead, and reading Opaque would silently fetch "" — accept
+		// both.
+		filePath := repo.Opaque
+		if filePath == "" {
+			filePath = repo.Path
+		}
+		if filePath == "" {
+			return nil, fmt.Errorf("file repo %s carries no path", repoStr)
+		}
+		file, err := os.ReadFile(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read file %s: %w", repo.Opaque, err)
+			return nil, fmt.Errorf("failed to read file %s: %w", filePath, err)
 		}
 		cfgBody = file
 	case "http", "https":
@@ -122,9 +132,14 @@ func checkForConfigUpdates(n *Nylon) error {
 						n.Log.Warn("central config applied with incomplete runtime reconciliation; will retry", "repo", repo, "err", err)
 					}
 					if n.ConfigPath != "" {
-						bytes, err := yaml.Marshal(config)
-						if err != nil {
-							n.Log.Error("Error marshalling new config", "err", err.Error())
+						// the local central.yaml refresh preserves the
+						// comments of the file being overwritten (the
+						// file may be the operator's hand-written,
+						// documented central.yaml — values change,
+						// documentation must not)
+						bytes := state.MarshalPreservingComments(config, n.ConfigPath)
+						if bytes == nil {
+							n.Log.Error("Error marshalling new config", "err", "marshal returned nil")
 							return nil
 						}
 						err = os.WriteFile(n.ConfigPath, bytes, 0600)

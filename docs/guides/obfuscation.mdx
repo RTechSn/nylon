@@ -22,7 +22,7 @@ Obfuscation is configured at two levels in `central.yaml` (see [Configuration Re
 
 | Level | Fields | Scope |
 | --- | --- | --- |
-| Central `obf` block (S/H inline) | `s1`–`s4`, `h1`–`h4` | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node |
+| Central `obf` block (S/H inline) | `s1`–`s4`, `h1`–`h4`, `strategy_mode`, obf-level defaults (`ports`, `jc`/`jmin`/`jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping`) | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node — the strategy selection principle for new connections (`fixed` \| `random` \| `trial`), and the mesh-wide DEFAULTS the strategies inherit per field (a strategy's own value always wins; see [Configuration Reference](/reference/config)) |
 | Named strategies (the `obf.strategy` map) | `ports`, `jc`, `jmin`, `jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; the junk is sender-local, endpoints select by name |
 
 The naming follows the upstream convention: the **central** `obf` block holds the parameters for the whole network (the mesh-wide S/H dialect, inline), while an `obf` block **on a node** (node.yaml) holds per-node parameters. In this fork the per-node block is retired — everything that used to be per-node lives in the named strategies and is selected per endpoint. A minimal dialect with a QUIC-template strategy:
