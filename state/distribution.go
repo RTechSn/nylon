@@ -66,13 +66,21 @@ func OpenBundle(data []byte, key []byte) ([]byte, error) {
 }
 
 // BundleConfig first signs the config with the root private key, ensuring the authenticity, then encrypts the message using the bytes of the root public key as the shared key, offering some level of privacy. (assuming the root public key is not shared widely)
+//
+// Comments survive the seal: the comments of the hand-written central.yaml are
+// captured during the strict decode (yaml.CommentToMap) and reattached to the
+// sealed plaintext at marshal time (yaml.WithComment), so `nylon open` shows
+// the bundle exactly as the operator documented it. Comment positions map by
+// path; the seal only mutates `timestamp`, which keeps its path, so every
+// captured comment reattaches.
 func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	cfg := CentralCfg{}
+	comments := yaml.CommentMap{}
 	// Strict: a key CentralCfg does not model must fail the seal loudly, not
 	// silently vanish from the distributed bundle — a dropped section (e.g.
 	// priority_rules at an unsupported level) is indistinguishable from
 	// "applied" until traffic proves otherwise.
-	err := yaml.UnmarshalWithOptions([]byte(config), &cfg, yaml.Strict())
+	err := yaml.UnmarshalWithOptions([]byte(config), &cfg, yaml.Strict(), yaml.CommentToMap(comments))
 	if err != nil {
 		return "", err
 	}
@@ -85,7 +93,7 @@ func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	}
 	cfg.Timestamp = time.Now().UnixNano()
 
-	plainText, err := yaml.Marshal(cfg)
+	plainText, err := yaml.MarshalWithOptions(cfg, yaml.WithComment(comments))
 	if err != nil {
 		return "", err
 	}
@@ -103,18 +111,23 @@ func BundleConfig(config string, rootKey NyPrivateKey) (string, error) {
 	return base64.StdEncoding.EncodeToString(bundle), nil
 }
 
-func UnbundleConfig(bundleStr string, pubKey NyPublicKey) (*CentralCfg, error) {
+// UnbundleConfigText verifies and opens a bundle and returns both the parsed
+// config and the sealed plaintext — the exact YAML the seal produced, comments
+// included. `nylon open` prints the plaintext so an audited bundle reads like
+// the operator's central.yaml; nodes on the poll path use UnbundleConfig and
+// never need the text.
+func UnbundleConfigText(bundleStr string, pubKey NyPublicKey) (string, *CentralCfg, error) {
 	bundle, err := base64.StdEncoding.DecodeString(bundleStr)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	bundle, err = OpenBundle(bundle, pubKey[:])
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	bundle, err = VerifyBundle(bundle, pubKey)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	cfg := &CentralCfg{}
@@ -124,11 +137,16 @@ func UnbundleConfig(bundleStr string, pubKey NyPublicKey) (*CentralCfg, error) {
 	// config whose unknown section would silently drop.
 	err = yaml.UnmarshalWithOptions(bundle, cfg, yaml.Strict())
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	err = CentralConfigValidator(cfg)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	return cfg, nil
+	return string(bundle), cfg, nil
+}
+
+func UnbundleConfig(bundleStr string, pubKey NyPublicKey) (*CentralCfg, error) {
+	_, cfg, err := UnbundleConfigText(bundleStr, pubKey)
+	return cfg, err
 }

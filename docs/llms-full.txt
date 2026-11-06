@@ -418,7 +418,7 @@ Despite being called a "public" key, the distribution key also acts as the share
      interval: "6h" # optional
    ```
 
-   Nylon polls for updates on the resolved cadence — the `interval` from `central.yaml` takes precedence, then the `interval` from `node.yaml`, then the built-in default of 10 seconds — and applies a bundle only when its timestamp is strictly newer than the active config. Interval changes distributed inside a config update take effect live, without a restart. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout.
+   Nylon polls for updates on the resolved cadence — the `interval` from `central.yaml` takes precedence, then the `interval` from `node.yaml`, then the built-in default of 10 seconds — and applies a bundle only when its timestamp is strictly newer than the active config. Interval changes distributed inside a config update take effect live, without a restart. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout. Comments in the sealed `central.yaml` survive the seal: they are captured on the way in and reattached to the sealed text, so `nylon open` prints the bundle exactly as it was documented.
 
    **Observing the poll loop**
 

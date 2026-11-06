@@ -46,6 +46,8 @@ Despite being called a "public" key, the distribution key also acts as the share
 
    `nylon seal` parses the central config **strictly**: a key the schema does not model (a typo, or a section at an unsupported level) fails the seal with an error instead of silently vanishing from the distributed bundle. The receiving side applies the same guarantee — a bundle carrying a field the binary does not know fails the poll loudly and the node keeps its last active config rather than half-applying the update.
 
+   Comments in your `central.yaml` survive the seal: they are captured on the way in and reattached to the sealed text, so `nylon open` prints the bundle exactly as you documented it — head comments, trailing notes, everything.
+
 3. ### Publish the Bundle
 
    Host `central.nybundle` on any HTTP/HTTPS server (e.g., GitHub Pages, S3, or Nginx).

@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"github.com/encodeous/nylon/state"
-	"github.com/goccy/go-yaml"
 	"github.com/spf13/cobra"
 )
 
@@ -45,7 +44,7 @@ var sealCmd = &cobra.Command{
 
 var openCmd = &cobra.Command{
 	Use:   "open [central public key]",
-	Short: "Bundles provided bundle against the public key. Outputs the parsed configuration",
+	Short: "Bundles provided bundle against the public key. Outputs the sealed configuration text (comments preserved)",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
 			_ = cmd.Usage()
@@ -62,17 +61,16 @@ var openCmd = &cobra.Command{
 		if err != nil {
 			panic(err)
 		}
-		config, err := state.UnbundleConfig(string(bundleStr), *pkey)
+		// the plaintext is the exact YAML the seal produced — comments
+		// included (BundleConfig reattaches them) — so an audited bundle
+		// reads like the operator's central.yaml, not like a re-marshalled
+		// struct dump
+		bundleText, _, err := state.UnbundleConfigText(string(bundleStr), *pkey)
 		if err != nil {
 			panic(err)
 		}
 
-		cfgYaml, err := yaml.Marshal(config)
-		if err != nil {
-			panic(err)
-		}
-
-		_, err = fmt.Fprint(os.Stderr, string(cfgYaml))
+		_, err = fmt.Fprint(os.Stderr, bundleText)
 		if err != nil {
 			return
 		}
