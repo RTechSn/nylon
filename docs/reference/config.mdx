@@ -243,6 +243,17 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+  # obf-level DEFAULTS for the strategy parameters: every parameter a
+  # strategy may set can also be set here, and a strategy that leaves it
+  # unset inherits this value (per parameter — a strategy that sets only
+  # `jc` still inherits the default `jmin`/`jmax`; a set value always wins).
+  # The defaults below would let the three strategies drop their shared
+  # ports/junk entirely. Validation holds the defaults to the same
+  # contracts as a strategy (ports spec, junk trio, hop policy).
+  ports: "40000-50000"   # default port spec for strategies that set no ports
+  jc: 5                  # default junk trio
+  jmin: 250
+  jmax: 800
   # Strategy selection for new connections (which obf strategy carries each
   # connection): fixed (the first strategy of the endpoint's list) | random
   # (a random strategy per connection) | trial (iterate randomly until a
@@ -308,6 +319,8 @@ Strategies are the multi-level named list inside the global `obf:` block (`obf.s
 | `i1`-`i5`           | string | omitted    | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted to the device                        |
 | `port_hopping_mode` | string | `static`   | rotation strategy for the strategy's ports: `static` \| `reactive` \| `proactive` \| `timed`                                 |
 | `port_hopping`       | map    | omitted    | rotation knobs (`budget_packets`, `period_seconds`, `period_jitter_pct`, `recent_ports`, `cooldown_seconds`, `candidate_samples`, `recycle_seconds`) — same semantics as the pre-reform node-level block |
+
+**Obf-level defaults**: every parameter of the field table above can also be set directly under `obf:` (sibling of `s1`-`s4`/`h1`-`h4` and `strategy:`) as a mesh-wide default. A strategy that leaves the parameter unset inherits the obf-level value; a strategy that sets it wins — per parameter, so a strategy that sets only `jc` still inherits the default `jmin`/`jmax`, and a strategy that sets only `i1` inherits the default `i2`-`i5` slot by slot. The defaults resolve everywhere strategy VALUES are consumed (validation, the listen union, the junk resolution, the connect-half candidates); the file keeps the operator's shape — the seal, the distributed bundle and the daemon's local cache serialize the defaults at the obf level and the strategies exactly as written. Validation holds the defaults block to the same contracts as a strategy: a bogus default fails loudly even when every strategy overrides it (dead config is dead config, wherever it sits).
 
 **Listen half**: a node binds the union of `ports` over every strategy its OWN advertised endpoints name (untagged = all strategies), served per `listen_mode`. The primary port (`node.yaml`'s `port`) is always bound.
 

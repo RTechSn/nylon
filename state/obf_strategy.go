@@ -361,6 +361,25 @@ func ValidateStrategyJunk(s *ObfStrategy, name string) error {
 	return nil
 }
 
+// validateDefaultJunk checks the obf-level default junk trio for internal
+// coherence — the same contract ValidateStrategyJunk holds each strategy to,
+// applied to the obf defaults (per-field inheritance can only produce a
+// complete trio from a coherent default; an incomplete default is dead config
+// wherever it ends up).
+func validateDefaultJunk(o *CentralObf) error {
+	jcSet := o.Jc != nil && *o.Jc > 0
+	if jcSet && (o.Jmin == nil || o.Jmax == nil) {
+		return fmt.Errorf("obf defaults: jc requires the jmin/jmax junk size range (datagram sizes are drawn from [jmin, jmax))")
+	}
+	if !jcSet && (o.Jmin != nil || o.Jmax != nil) {
+		return fmt.Errorf("obf defaults: jmin/jmax are set but jc is not positive — no junk datagrams are emitted without a count; set jc, or drop the size range")
+	}
+	if o.Jmin != nil && o.Jmax != nil && *o.Jmin > *o.Jmax {
+		return fmt.Errorf("obf defaults: jmin (%d) must not exceed jmax (%d)", *o.Jmin, *o.Jmax)
+	}
+	return nil
+}
+
 // NodeUsedStrategies computes the strategies a node may speak, in stable
 // order: every strategy named by its own advertised endpoints (the listen
 // half) or by any router's advertised endpoints (the connect half — a
@@ -434,6 +453,24 @@ func ValidateObfStrategies(cfg *CentralCfg) error {
 	}
 	if len(m) == 0 {
 		return nil
+	}
+	// The obf-level defaults (ObfDefaults) are validated as a virtual
+	// strategy: they materialize into every strategy that leaves a
+	// parameter unset, so a bogus default must fail loudly even when
+	// every defined strategy overrides it (dead config is dead config,
+	// wherever it sits).
+	if o := cfg.Obf; o.DefaultsSet() {
+		if strings.TrimSpace(o.Ports) != "" {
+			if _, err := ParsePortRange(strings.TrimSpace(o.Ports)); err != nil {
+				return fmt.Errorf("obf: default ports: %w", err)
+			}
+		}
+		if err := ValidateHopPolicyCfg(o.PortHoppingMode, o.PortHopping, "obf defaults"); err != nil {
+			return err
+		}
+		if err := validateDefaultJunk(o); err != nil {
+			return err
+		}
 	}
 	for _, name := range StrategyNames(m) {
 		s := m[name]
