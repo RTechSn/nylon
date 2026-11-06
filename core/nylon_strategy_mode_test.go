@@ -299,6 +299,53 @@ func TestStrategyModeTrialConfirmationRedeems(t *testing.T) {
 	}
 }
 
+// TestStrategyModeRandomDeathIsNotATrialEvent pins the verdict gate: the
+// two-strike machinery (condemn, then demote) is trial-mode consumption. In
+// random a confirmed connection's link death is the mode's own business —
+// random draws a fresh strategy per connection, nothing retries the fallen
+// one first — so the journal stays free of trial events and the verdict
+// state never engages; the memory itself stays recorded (a live mode switch
+// starts with the knowledge in hand).
+func TestStrategyModeRandomDeathIsNotATrialEvent(t *testing.T) {
+	var buf bytes.Buffer
+	// a tiny liveness threshold so the materialised links age past it
+	n := newHopFixturesNylonWithLog(t, 2*time.Millisecond, &buf)
+	n.CentralCfg.Obf = &state.CentralObf{
+		StrategyMode: state.StrategyModeRandom,
+		Strategy: map[string]*state.ObfStrategy{
+			"alpha": {Ports: "30000-30009"},
+			"beta":  {Ports: "31000-31009"},
+		},
+	}
+	f := strategyModeFactory(t, n, "alpha")
+	neigh := n.RouterState.GetNeighbour("b")
+	if neigh == nil {
+		t.Fatal("fixture neighbour missing")
+	}
+
+	// a confirmed connection on alpha (random records the memory too), then
+	// its carrying link dies — the sequence that in trial condemns and then
+	// demotes
+	f.mu.Lock()
+	f.current = netip.MustParseAddrPort("192.168.1.2:30001")
+	f.lastGoodStrategy = "alpha"
+	f.mu.Unlock()
+	neigh.Eps = append(neigh.Eps, state.NewEndpoint("192.168.1.2:30001", false, nil, &n.RouterTunables))
+	time.Sleep(8 * time.Millisecond)
+	f.reconcileLinks() // would-be death verdict #1 (condemn)
+	time.Sleep(8 * time.Millisecond)
+	f.reconcileLinks() // would-be death verdict #2 (demote)
+	f.mu.Lock()
+	condemned, lastGood := f.lastGoodCondemned, f.lastGoodStrategy
+	f.mu.Unlock()
+	if condemned || lastGood != "alpha" {
+		t.Fatalf("random must not run trial verdicts: condemned=%v lastGood=%q, want false/alpha (the memory only records)", condemned, lastGood)
+	}
+	if out := buf.String(); strings.Contains(out, "trial strategy condemned") || strings.Contains(out, "trial strategy demoted") {
+		t.Fatalf("random must not journal trial verdicts:\n%s", out)
+	}
+}
+
 // TestStrategyModeExhaustionSwitchesStrategy pins the cross-strategy retry
 // on exhaustion: random (and trial's iteration) fall through to the next
 // strategy when the chosen strategy's ports are all cooling, while fixed

@@ -116,18 +116,21 @@ type portFactory struct {
 	// lastGoodStrategy is the trial-mode memory — the strategy of the last
 	// CONFIRMED connection (the peer was heard back on a carrying endpoint
 	// of it; see noteHeardBack). Trial-mode draws prefer it — reconnects
-	// and rotations alike first use the proven one. It is maintained in
+	// and rotations alike first use the proven one. It is RECORDED in
 	// every mode (a live mode switch starts with the knowledge already in
 	// hand) and only consumed by trial.
 	//
-	// lastGoodCondemned carries the two-strike verdict toward demotion
+	// lastGoodCondemned carries trial's two-strike verdict toward demotion
 	// (reconcileLinks): the carrying link of the remembered strategy died —
 	// the reconnect still retries the strategy first; a second death while
 	// condemned, without a confirmation in between (noteHeardBack redeems),
 	// demotes the memory and the selection returns to the random
 	// iteration. A budget rotation that exhausts its endpoint before a
 	// pong arrives is NOT a death: only the liveness model (the same
-	// signals that drive reactive rotation) condemns.
+	// signals that drive reactive rotation) condemns. The verdict — like
+	// every consumer of the memory — is TRIAL-ONLY: outside trial the
+	// memory is recorded but never judged, so a random/fixed journal never
+	// reports trial events no mode is running.
 	lastGoodStrategy  string
 	lastGoodCondemned bool
 
@@ -1237,8 +1240,17 @@ func (f *portFactory) reconcileLinks() {
 // 12-packet budget burns faster than any RTT, and demoting on it would turn
 // trial into random exactly when rotation storms run. Runs on the dispatch
 // loop (reconcileLinks).
+//
+// Trial-only: the verdict is CONSUMPTION of the trial memory. The
+// retry-first contract it enforces exists in no other mode — random draws
+// a fresh strategy per connection, fixed never leaves its first — so a
+// random/fixed link death must not journal trial events; the memory
+// itself stays recorded for a live mode switch (see lastGoodStrategy).
 func (f *portFactory) judgeTrialStrategy(curLink state.Endpoint) {
 	if curLink == nil || curLink.IsExhausted() {
+		return
+	}
+	if f.n.ObfStrategyMode() != state.StrategyModeTrial {
 		return
 	}
 	f.mu.Lock()
