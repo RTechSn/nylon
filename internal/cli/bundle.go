@@ -44,7 +44,7 @@ var sealCmd = &cobra.Command{
 
 var openCmd = &cobra.Command{
 	Use:   "open [central public key]",
-	Short: "Bundles provided bundle against the public key. Outputs the sealed configuration text (comments preserved)",
+	Short: "Unseals the provided bundle against the public key. Outputs the sealed configuration text (clean of comments — the operator's raw central.yaml keeps them)",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
 			_ = cmd.Usage()
@@ -61,10 +61,11 @@ var openCmd = &cobra.Command{
 		if err != nil {
 			panic(err)
 		}
-		// the plaintext is the exact YAML the seal produced — comments
-		// included (BundleConfig reattaches them) — so an audited bundle
-		// reads like the operator's central.yaml, not like a re-marshalled
-		// struct dump
+		// the plaintext is the exact YAML the seal produced — comment-free,
+		// the same text the nodes parse on the poll path — so an audited
+		// bundle reads like the config the mesh will run; the operator's
+		// documentation lives in the raw central.yaml, which the seal
+		// strips and the daemon's local cache preserves
 		bundleText, _, err := state.UnbundleConfigText(string(bundleStr), *pkey)
 		if err != nil {
 			panic(err)
