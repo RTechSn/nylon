@@ -44,13 +44,13 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	// the listen union now derives from central obf strategies; enforce the
 	// in-daemon ceiling on the DERIVED set in sockets mode, and require a
 	// meaningful nftables mode (a redirect with nothing to redirect)
-	if central != nil && len(central.ObfStrategies) > 0 {
+	if central != nil && len(central.ObfStrategies()) > 0 {
 		var mine *RouterCfg
 		if central.IsRouter(node.Id) {
 			r := central.GetRouter(node.Id)
 			mine = &r
 		}
-		ranges, err := ListenUnionRanges(mine, central.ObfStrategies)
+		ranges, err := ListenUnionRanges(mine, central.ObfStrategies())
 		if err != nil {
 			return err
 		}
@@ -137,9 +137,9 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 		}
 		// the node's used-strategy junk must be coherent (the AWG 2.0 device
 		// emits one junk configuration; see EffectiveStrategyJunk)
-		if len(central.ObfStrategies) > 0 {
+		if len(central.ObfStrategies()) > 0 {
 			used := NodeUsedStrategies(central, node.Id)
-			if _, _, err := EffectiveStrategyJunk(central.ObfStrategies, used); err != nil {
+			if _, _, err := EffectiveStrategyJunk(central.ObfStrategies(), used); err != nil {
 				return fmt.Errorf("node %s: %w", node.Id, err)
 			}
 		}
@@ -205,9 +205,9 @@ func AddrToPrefix(addr netip.Addr) netip.Prefix {
 }
 
 func CentralConfigValidator(cfg *CentralCfg) error {
-	if cfg.AwgProfile != nil {
-		if err := cfg.AwgProfile.Validate(); err != nil {
-			return fmt.Errorf("invalid awg_profile: %w", err)
+	if profile := cfg.Profile(); profile != nil {
+		if err := profile.Validate(); err != nil {
+			return fmt.Errorf("invalid obf profile: %w", err)
 		}
 	}
 	// named obf strategies: names, ports, per-strategy rotation policy and

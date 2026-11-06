@@ -8,20 +8,27 @@ import (
 
 // The obf strategy model (config reform):
 //
-//      obf:                      # central top level — named strategies, mesh-wide
-//        awg_main:
-//          ports: "40000"        # required: one port or an inclusive range "40000-50000"
-//          jc: 5                 # sender-local junk: jc datagrams of size [jmin, jmax)
-//          jmin: 250             #   ahead of every handshake initiation (per strategy)
-//          jmax: 800
-//          i1: ... i5: ...       # optional sender junk packets (see the note below)
-//        hopping:
-//          ports: "40000-50000"
-//          port_hopping_mode: timed     # rotation policy moved INTO the strategy
-//          port_hopping:
-//            period_seconds: 30
-//        vanilla:
-//          ports: "51820"
+//      obf:                      # the global obf block — network-wide (upstream naming:
+//        s1: 32                  #   central obf = whole-mesh params, node obf = per-node)
+//        s2: 28
+//        s3: 20
+//        s4: 16
+//        h1: {min: 100, max: 5000000}     # mesh-wide AWG 2.0 S/H handshake
+//        h2: ...                          # dialect, uniform by construction
+//        strategy:                 # the named strategy map
+//          awg_main:
+//            ports: "40000"      # required: one port or an inclusive range "40000-50000"
+//            jc: 5                # sender-local junk: jc datagrams of size [jmin, jmax)
+//            jmin: 250            #   ahead of every handshake initiation (per strategy)
+//            jmax: 800
+//            i1: ... i5: ...       # optional sender junk packets (see the note below)
+//          hopping:
+//            ports: "40000-50000"
+//            port_hopping_mode: timed     # rotation policy lives IN the strategy
+//            port_hopping:
+//              period_seconds: 30
+//          vanilla:
+//            ports: "51820"
 //
 //      routers:
 //        - id: hub
@@ -37,14 +44,14 @@ import (
 //
 // WIRE REALITY (documented, not negotiable by config): the AWG 2.0 device
 // speaks exactly ONE handshake dialect — the S/H profile is mesh-wide
-// (awg_profile) — and emits ONE junk configuration: the jc/jmin/jmax junk
-// stream and the I-packets are device-global, sent toward EVERY peer, not
-// per strategy. The strategies a node uses must therefore agree on the
-// whole junk set (see EffectiveStrategyJunk). Receivers discard junk
-// unclassified, so two nodes may still draw their junk from different
+// (inline in the global obf block) — and emits ONE junk configuration: the
+// jc/jmin/jmax junk stream and the I-packets are device-global, sent toward
+// EVERY peer, not per strategy. The strategies a node uses must therefore
+// agree on the whole junk set (see EffectiveStrategyJunk). Receivers discard
+// junk unclassified, so two nodes may still draw their junk from different
 // strategies without breaking interop.
 
-// ObfStrategy is one named entry of the central top-level `obf` map: a
+// ObfStrategy is one named entry of the central `obf.strategy` map: a
 // wire-reachability definition (ports) plus, optionally, the client-side
 // rotation policy for those ports and the sender-local junk emission (the
 // AWG J trio and the I-packets). The strategy NAME is its identity.
@@ -362,7 +369,7 @@ func NodeUsedStrategies(central *CentralCfg, node NodeId) []string {
 	if central == nil {
 		return nil
 	}
-	m := central.ObfStrategies
+	m := central.ObfStrategies()
 	if len(m) == 0 {
 		return nil
 	}
@@ -404,7 +411,7 @@ func NodeUsedStrategies(central *CentralCfg, node NodeId) []string {
 // per-strategy rotation policy and junk trio, and the junk/i-set coherence
 // across every strategy any endpoint may name.
 func ValidateObfStrategies(cfg *CentralCfg) error {
-	m := cfg.ObfStrategies
+	m := cfg.ObfStrategies()
 	if len(m) == 0 {
 		return nil
 	}

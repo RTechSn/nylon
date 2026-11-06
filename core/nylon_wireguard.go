@@ -76,7 +76,7 @@ func obfDeviceIPC(obf *state.ObfProfile, junk state.StrategyJunk) string {
 // stream and one I-packet set toward every peer.
 func (n *Nylon) strategyJunkSet() (state.StrategyJunk, []string, string, error) {
 	used := state.NodeUsedStrategies(&n.CentralCfg, n.LocalCfg.Id)
-	junk, source, err := state.EffectiveStrategyJunk(n.CentralCfg.ObfStrategies, used)
+	junk, source, err := state.EffectiveStrategyJunk(n.ObfStrategies(), used)
 	if err != nil {
 		return state.StrategyJunk{}, nil, "", fmt.Errorf("obf strategies: %w", err)
 	}
@@ -92,14 +92,14 @@ func (n *Nylon) applyObfDeviceIPC() error {
 	if err != nil {
 		return err
 	}
-	sig := fmt.Sprintf("%p|%v|%s", n.AwgProfile, used, source)
-	if err := n.Device.IpcSet(obfDeviceIPC(n.AwgProfile, junk)); err != nil {
+	sig := fmt.Sprintf("%p|%v|%s", n.Profile(), used, source)
+	if err := n.Device.IpcSet(obfDeviceIPC(n.Profile(), junk)); err != nil {
 		return fmt.Errorf("failed to apply obf profile: %v", err)
 	}
 	if sig != n.obfAppliedSig {
 		n.obfAppliedSig = sig
 		n.Log.Info("obf strategies applied",
-			"strategies", len(n.CentralCfg.ObfStrategies),
+			"strategies", len(n.ObfStrategies()),
 			"used", len(used),
 			"junk", source)
 	}
@@ -128,7 +128,7 @@ func (n *Nylon) hopDeviceIPC() (string, []state.PortRange, error) {
 // listenUnionRanges derives this node's server-side listen union from the
 // obf strategies its own advertised endpoints name (untagged = all).
 func (n *Nylon) listenUnionRanges() ([]state.PortRange, error) {
-	if len(n.CentralCfg.ObfStrategies) == 0 {
+	if len(n.ObfStrategies()) == 0 {
 		return nil, nil
 	}
 	var mine *state.RouterCfg
@@ -136,7 +136,7 @@ func (n *Nylon) listenUnionRanges() ([]state.PortRange, error) {
 		r := n.CentralCfg.GetRouter(n.LocalCfg.Id)
 		mine = &r
 	}
-	return state.ListenUnionRanges(mine, n.CentralCfg.ObfStrategies)
+	return state.ListenUnionRanges(mine, n.ObfStrategies())
 }
 
 // installNftRedirect installs the daemon-owned netfilter redirect serving the

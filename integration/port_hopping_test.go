@@ -54,7 +54,7 @@ func TestPortAsEndpointHoppingGate(t *testing.T) {
 
 	// the hopping strategy: rotate after 12 wire packets, short cooldown
 	// so the test range never runs dry
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hop": {
 			Ports:           hopTestRange.String(),
 			PortHoppingMode: state.HopModeProactive,
@@ -65,7 +65,7 @@ func TestPortAsEndpointHoppingGate(t *testing.T) {
 				CandidateSamples: uint32ptr(16),
 			},
 		},
-	}
+	}}
 
 	// client -> server: any port of the range reaches the server; the
 	// middlebox bans each (client, server:port) flow after 16 packets
@@ -165,7 +165,7 @@ func TestPortAsEndpointRangeOnlyHoppingGate(t *testing.T) {
 
 	// the hopping strategy: rotate after 12 wire packets, short cooldown
 	// so the test range never runs dry
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hop": {
 			Ports:           hopTestRange.String(),
 			PortHoppingMode: state.HopModeProactive,
@@ -176,7 +176,7 @@ func TestPortAsEndpointRangeOnlyHoppingGate(t *testing.T) {
 				CandidateSamples: uint32ptr(16),
 			},
 		},
-	}
+	}}
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, hopTestRange).WithFlowBudget(hopTestFlowBudget)
 	rev := vh.AddLinkFromAddr(bRange, a1).WithFlowBudget(hopTestFlowBudget)
@@ -350,7 +350,7 @@ func TestPortAsEndpointNoGhostLinks(t *testing.T) {
 
 	// the hopping strategy: rotate after 12 wire packets, short cooldown
 	// so the test range never runs dry
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hop": {
 			Ports:           bPorts.String(),
 			PortHoppingMode: state.HopModeProactive,
@@ -361,7 +361,7 @@ func TestPortAsEndpointNoGhostLinks(t *testing.T) {
 				CandidateSamples: uint32ptr(16),
 			},
 		},
-	}
+	}}
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, bPorts)
 	vh.AddLinkFromAddr(bRange, a1)

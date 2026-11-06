@@ -28,8 +28,9 @@ The strategies live in `central.yaml`; the server's `node.yaml` keeps the defaul
 
 ```yaml title="central.yaml (excerpt)"
 obf:
-  hopping:
-    ports: "57175-57575" # the union of your advertised strategies; max 4096 ports in sockets mode
+  strategy:
+    hopping:
+      ports: "57175-57575" # the union of your advertised strategies; max 4096 ports in sockets mode
 ```
 
 ```yaml title="node.yaml (server)"
@@ -45,8 +46,9 @@ For wide unions, `listen_mode: nftables` keeps the daemon on its single primary-
 
 ```yaml title="central.yaml (excerpt)"
 obf:
-  hopping:
-    ports: "1024-65535" # no width ceiling in this mode
+  strategy:
+    hopping:
+      ports: "1024-65535" # no width ceiling in this mode
 ```
 
 ```yaml title="node.yaml (server)"
@@ -85,11 +87,12 @@ Two config entries enable hopping on the client:
 
 ```yaml title="central.yaml (excerpt)"
 obf:
-  hopping:
-    ports: "30000-40000"        # any port in [30000, 40000]
-    port_hopping_mode: proactive # static | reactive | proactive | timed
-    port_hopping:
-      budget_packets: 12
+  strategy:
+    hopping:
+      ports: "30000-40000"        # any port in [30000, 40000]
+      port_hopping_mode: proactive # static | reactive | proactive | timed
+      port_hopping:
+        budget_packets: 12
 
 routers:
   - id: server
@@ -100,9 +103,9 @@ routers:
       # used by the stock failover machinery as usual
 ```
 
-2. The client needs nothing in `node.yaml`: every strategy the peer's endpoints name contributes its candidate ports, and the carrying endpoint's strategy supplies the effective rotation policy (per-strategy — see the mode table below):
+2. The client needs nothing in `node.yaml`: every strategy the peer's endpoints name contributes its candidate ports, and the carrying endpoint's strategy supplies the effective rotation policy (per-strategy — see the mode table below). The knob block itself lives on the strategy, with these defaults:
 
-```yaml title="node.yaml (client)"
+```yaml title="central.yaml — the rotation knobs live on the strategy"
 port_hopping_mode: proactive    # static | reactive | proactive | timed
 port_hopping:
   budget_packets: 12   # proactive: rotate the carrying port after N wire packets (default 12)

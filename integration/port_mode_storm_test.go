@@ -42,9 +42,9 @@ func stormRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink, *VirtualLi
 	}
 
 	bIdx := vh.IndexOf("b")
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hop": {Ports: stormTestRange.String()},
-	}
+	}}
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
 		bRange+"[hop]")
 
@@ -68,7 +68,7 @@ func stormRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink, *VirtualLi
 func TestProactiveStormKeepsDispatchHealthy(t *testing.T) {
 	vh, aIdx, bIdx, fwd, rev := stormRig(t)
 
-	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy := vh.Central.Obf.Strategy["hop"]
 	hopPolicy.PortHoppingMode = state.HopModeProactive
 	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:   uint32ptr(2),
@@ -207,7 +207,7 @@ func TestProactiveStormKeepsDispatchHealthy(t *testing.T) {
 func TestStormSurvivesDispatchBlackout(t *testing.T) {
 	vh, aIdx, bIdx, fwd, rev := stormRig(t)
 
-	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy := vh.Central.Obf.Strategy["hop"]
 	hopPolicy.PortHoppingMode = state.HopModeProactive
 	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		BudgetPackets:   uint32ptr(1),

@@ -12,34 +12,35 @@ func hopStr(v uint32) *uint32 { return &v }
 
 func hopBool(v bool) *bool { return &v }
 
-// TestHopModeStrategyParsingRoundtrip pins the YAML surface of the per-strategy
-// rotation policy in the central `obf:` block, and its marshal/unmarshal
-// roundtrip through CentralCfg.
+// TestHopModeStrategyParsingRoundtrip pins the YAML surface of the global
+// `obf:` block — the named strategy map nested under `obf.strategy` — and
+// its marshal/unmarshal roundtrip through CentralCfg.
 func TestHopModeStrategyParsingRoundtrip(t *testing.T) {
 	const centralYaml = `
 obf:
-  hopping:
-    ports: 40000-50000
-    port_hopping_mode: timed
-    port_hopping:
-      period_seconds: 300
-      period_jitter_pct: 15
-      cooldown_seconds: 60
-  awg_main:
-    ports: "40000"
-    jc: 5
-    jmin: 250
-    jmax: 800
-    i1: "aabbcc"
+  strategy:
+    hopping:
+      ports: 40000-50000
+      port_hopping_mode: timed
+      port_hopping:
+        period_seconds: 300
+        period_jitter_pct: 15
+        cooldown_seconds: 60
+    awg_main:
+      ports: "40000"
+      jc: 5
+      jmin: 250
+      jmax: 800
+      i1: "aabbcc"
 `
 	var central CentralCfg
 	if err := yaml.UnmarshalWithOptions([]byte(centralYaml), &central, yaml.Strict()); err != nil {
 		t.Fatalf("central yaml: %v", err)
 	}
-	if len(central.ObfStrategies) != 2 {
-		t.Fatalf("strategies = %d, want 2", len(central.ObfStrategies))
+	if len(central.ObfStrategies()) != 2 {
+		t.Fatalf("strategies = %d, want 2", len(central.ObfStrategies()))
 	}
-	h := central.ObfStrategies["hopping"]
+	h := central.ObfStrategies()["hopping"]
 	if h.PortHoppingMode != HopModeTimed {
 		t.Errorf("hopping port_hopping_mode = %q, want %q", h.PortHoppingMode, HopModeTimed)
 	}
@@ -49,7 +50,7 @@ obf:
 	if h.PortHopping.PeriodJitterPct == nil || *h.PortHopping.PeriodJitterPct != 15 {
 		t.Fatalf("period_jitter_pct not parsed: %+v", h.PortHopping)
 	}
-	a := central.ObfStrategies["awg_main"]
+	a := central.ObfStrategies()["awg_main"]
 	if a.Ports != "40000" || a.I1 != "aabbcc" {
 		t.Errorf("awg_main not parsed: %+v", a)
 	}
@@ -66,11 +67,11 @@ obf:
 	if err := yaml.UnmarshalWithOptions(out, &central2, yaml.Strict()); err != nil {
 		t.Fatalf("re-unmarshal: %v (yaml: %s)", err, out)
 	}
-	h2 := central2.ObfStrategies["hopping"]
+	h2 := central2.ObfStrategies()["hopping"]
 	if h2.PortHoppingMode != HopModeTimed || h2.PortHopping == nil || h2.PortHopping.PeriodSeconds == nil || *h2.PortHopping.PeriodSeconds != 300 {
 		t.Errorf("hop policy lost in roundtrip: %+v", h2)
 	}
-	a2 := central2.ObfStrategies["awg_main"]
+	a2 := central2.ObfStrategies()["awg_main"]
 	if a2.Ports != "40000" || a2.I1 != "aabbcc" || a2.Jc == nil || *a2.Jc != 5 || a2.Jmin == nil || *a2.Jmin != 250 || a2.Jmax == nil || *a2.Jmax != 800 {
 		t.Errorf("strategy fields lost in roundtrip: %+v", a2)
 	}
@@ -233,18 +234,19 @@ func TestValidateHopMode(t *testing.T) {
 func TestStrategyRecycleSeconds(t *testing.T) {
 	const centralYaml = `
 obf:
-  hop:
-    ports: 30000-30010
-    port_hopping_mode: proactive
-    port_hopping:
-      budget_packets: 24
-      recycle_seconds: 7
+  strategy:
+    hop:
+      ports: 30000-30010
+      port_hopping_mode: proactive
+      port_hopping:
+        budget_packets: 24
+        recycle_seconds: 7
 `
 	var central CentralCfg
 	if err := yaml.UnmarshalWithOptions([]byte(centralYaml), &central, yaml.Strict()); err != nil {
 		t.Fatalf("central yaml: %v", err)
 	}
-	hop := central.ObfStrategies["hop"]
+	hop := central.ObfStrategies()["hop"]
 	if hop.PortHopping == nil || hop.PortHopping.RecycleSeconds == nil || *hop.PortHopping.RecycleSeconds != 7 {
 		t.Fatalf("recycle_seconds not parsed: %+v", hop.PortHopping)
 	}
@@ -271,6 +273,35 @@ obf:
 	err := ValidateHopPolicyCfg(HopModeProactive, &PortHoppingCfg{BudgetPackets: hopStr(12), AutoRecycle: hopBool(true)}, "obf strategy hop")
 	if err == nil || !strings.Contains(err.Error(), "auto_recycle was replaced by recycle_seconds") {
 		t.Fatalf("legacy auto_recycle must fail validation with the replacement named, got: %v", err)
+	}
+}
+
+// TestObfBlockRejectsLegacyShapes pins the migration contract at the YAML
+// surface: the first reform draft's top-level `awg_profile:` key, and strategy
+// entries placed directly under `obf:` (without the `strategy:` nesting), fail
+// strict central decoding loudly instead of silently dropping.
+func TestObfBlockRejectsLegacyShapes(t *testing.T) {
+	for name, src := range map[string]string{
+		"round-1 top-level awg_profile key": `
+awg_profile:
+  s1: 32
+  h1:
+    min: 100
+    max: 5000000
+`,
+		"strategy directly under obf": `
+obf:
+  hopping:
+    ports: "40000"
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cfg CentralCfg
+			err := yaml.UnmarshalWithOptions([]byte(src), &cfg, yaml.Strict())
+			if err == nil {
+				t.Fatalf("legacy shape must fail strict decoding, got nil (cfg=%+v)", cfg)
+			}
+		})
 	}
 }
 
@@ -334,10 +365,10 @@ func TestStrategyJunkCoherence(t *testing.T) {
 
 	// the central validator catches it across every router endpoint
 	central := &CentralCfg{
-		ObfStrategies: map[string]*ObfStrategy{
+		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
 			"awg":  {Ports: "40000", I1: "aabb"},
 			"awg2": {Ports: "40001", I1: "ccdd"},
-		},
+		}},
 		Routers: []RouterCfg{
 			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
 			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
@@ -348,10 +379,10 @@ func TestStrategyJunkCoherence(t *testing.T) {
 	}
 
 	central = &CentralCfg{
-		ObfStrategies: map[string]*ObfStrategy{
+		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
 			"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
 			"awg2": {Ports: "40001", Jc: hopStr(6), Jmin: hopStr(250), Jmax: hopStr(800)},
-		},
+		}},
 		Routers: []RouterCfg{
 			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
 			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
@@ -366,7 +397,7 @@ func TestStrategyJunkCoherence(t *testing.T) {
 // the size range travels with the count, and the range must be ordered.
 func TestValidateStrategyJunkMatrix(t *testing.T) {
 	viaValidator := func(s *ObfStrategy) error {
-		return ValidateObfStrategies(&CentralCfg{ObfStrategies: map[string]*ObfStrategy{"hop": s}})
+		return ValidateObfStrategies(&CentralCfg{Obf: &CentralObf{Strategy: map[string]*ObfStrategy{"hop": s}}})
 	}
 	cases := []struct {
 		name    string
@@ -403,11 +434,11 @@ func TestValidateStrategyJunkMatrix(t *testing.T) {
 // endpoint (own + peers'), untagged endpoints expanding to all strategies.
 func TestNodeUsedStrategies(t *testing.T) {
 	central := &CentralCfg{
-		ObfStrategies: map[string]*ObfStrategy{
+		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
 			"awg":     {Ports: "40000"},
 			"hopping": {Ports: "40000-50000"},
 			"vanilla": {Ports: "51820"},
-		},
+		}},
 		Routers: []RouterCfg{
 			{NodeCfg: NodeCfg{Id: "hub"}, Endpoints: []string{"hub.example.com[hopping,vanilla]"}},
 			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"r2.example.com"}},

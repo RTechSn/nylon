@@ -252,14 +252,14 @@ func TestJitterIntervalBounds(t *testing.T) {
 func TestPeerCandidatesExpansion(t *testing.T) {
 	n := newHopFixturesNylon(t, time.Hour)
 	secs := uint32(90)
-	n.CentralCfg.ObfStrategies = map[string]*state.ObfStrategy{
+	n.CentralCfg.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hopping": {
 			Ports:           "30000-30009",
 			PortHoppingMode: state.HopModeTimed,
 			PortHopping:     &state.PortHoppingCfg{PeriodSeconds: &secs},
 		},
 		"fixed": {Ports: "40000"},
-	}
+	}}
 	cfg := state.RouterCfg{
 		NodeCfg:   state.NodeCfg{Id: "b"},
 		Endpoints: []string{"192.168.1.2[hopping]", "192.168.1.3:51820"},

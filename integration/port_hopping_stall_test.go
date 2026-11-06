@@ -46,7 +46,7 @@ func TestPortAsEndpointIdleActorStall(t *testing.T) {
 
 	bIdx := vh.IndexOf("b")
 	// the hopping policy from the rig (recent=64, cooldown=180)
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 		"hop": {
 			Ports:           bPorts.String(),
 			PortHoppingMode: state.HopModeProactive,
@@ -57,7 +57,7 @@ func TestPortAsEndpointIdleActorStall(t *testing.T) {
 				CandidateSamples: uint32ptr(16),
 			},
 		},
-	}
+	}}
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
 		bRange+"[hop]")
 	aIdx := vh.IndexOf("a")
@@ -207,28 +207,29 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 	}
 
 	// AWG profile so handshake initiations are 11-buffer batches (5 junk + 5
-	// I-packets + the init itself), like the field rig
-	prof := hopDeadlockObfProfile
-	vh.Central.AwgProfile = &prof
+	// I-packets + the init itself), like the field rig; the per-node distinct
+	// junk draws retired with the strategy model: one strategy carries one
+	// shared junk configuration — the jc/jmin/jmax trio and the I-set (the
+	// deadlock shape needs the I-packets' size)
 	bIdx := vh.IndexOf("b")
-	// the per-node distinct junk draws retired with the strategy model:
-	// one strategy carries one shared junk configuration — the jc/jmin/jmax
-	// trio and the I-set (the deadlock shape needs the I-packets' size)
-	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
-		"hop": {
-			Ports:           bPorts.String(),
-			PortHoppingMode: state.HopModeProactive,
-			PortHopping: &state.PortHoppingCfg{
-				BudgetPackets:    uint32ptr(12),
-				CooldownSeconds:  uint32ptr(180),
-				RecentPorts:      uint32ptr(64),
-				CandidateSamples: uint32ptr(16),
+	vh.Central.Obf = &state.CentralObf{
+		ObfProfile: hopDeadlockObfProfile,
+		Strategy: map[string]*state.ObfStrategy{
+			"hop": {
+				Ports:           bPorts.String(),
+				PortHoppingMode: state.HopModeProactive,
+				PortHopping: &state.PortHoppingCfg{
+					BudgetPackets:    uint32ptr(12),
+					CooldownSeconds:  uint32ptr(180),
+					RecentPorts:      uint32ptr(64),
+					CandidateSamples: uint32ptr(16),
+				},
+				Jc:   uint32ptr(5),
+				Jmin: uint32ptr(250),
+				Jmax: uint32ptr(800),
+				I1:   hopDeadlockISetA[0], I2: hopDeadlockISetA[1], I3: hopDeadlockISetA[2],
+				I4: hopDeadlockISetA[3], I5: hopDeadlockISetA[4],
 			},
-			Jc:   uint32ptr(5),
-			Jmin: uint32ptr(250),
-			Jmax: uint32ptr(800),
-			I1:   hopDeadlockISetA[0], I2: hopDeadlockISetA[1], I3: hopDeadlockISetA[2],
-			I4: hopDeadlockISetA[3], I5: hopDeadlockISetA[4],
 		},
 	}
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,

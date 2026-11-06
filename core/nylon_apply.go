@@ -218,7 +218,7 @@ func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, cand
 // with obf strategies. Raw host:port endpoints — and bare hosts in a
 // strategyless mesh — stay stock configured links.
 func (n *Nylon) endpointFactoryOwned(addr string) bool {
-	if len(n.CentralCfg.ObfStrategies) == 0 {
+	if len(n.ObfStrategies()) == 0 {
 		return false
 	}
 	spec, err := state.ParseEndpointSpec(addr)

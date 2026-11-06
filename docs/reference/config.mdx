@@ -217,13 +217,16 @@ dynamic_prefix_ranges:
   - 10.0.0.0/8
 
 # --- Obfuscation ---
-# Mesh-wide AmneziaWG 2.0 handshake dialect (S/H) — the wire contract every
-# pair of nodes must speak identically, so it cannot vary from node to node.
-# Central placement keeps S/H identical on every node by construction. The
-# sender-local junk (jc/jmin/jmax and the i1-i5) lives on the obf strategies
-# below. Omit the whole block for vanilla WireGuard-compatible behavior.
-# The values below are examples; generate one with `nylon-genesis`.
-awg_profile:
+# The global obf block — the network-wide obfuscation half (upstream naming:
+# the central obf block serves the whole network; a per-node obf block would
+# hold per-node parameters, and in this fork everything per-node lives in
+# the named strategies instead). It carries the mesh-wide AmneziaWG 2.0
+# handshake dialect (S/H) inline — the wire contract every pair of nodes
+# must speak identically, so it cannot vary from node to node — plus the
+# named strategy map under `strategy:`. Omit the whole block for vanilla
+# WireGuard-compatible behavior. The values below are examples; generate
+# one with `nylon-genesis`.
+obf:
   s1: 32
   s2: 28
   s3: 20
@@ -240,29 +243,28 @@ awg_profile:
   h4:
     min: 1000000000
     max: 2100000000
-
-# Named obf strategies: each entry bundles the ports a node listens on /
-# connects through, the client-side rotation policy for those ports, and the
-# sender-local junk (jc/jmin/jmax and i1-i5). Endpoints reference strategies
-# by name — the strategy name is its identity:
-#   endpoints:
-#     - "hub.example.com[hopping,vanilla]"
-# Untagged endpoints (or "[*]") mean "every defined strategy".
-obf:
-  awg_main:
-    ports: "40000"      # required: one port or an inclusive range "40000-50000"
-    jc: 5               # sender-local junk: 5 datagrams of size [250, 800)
-    jmin: 250           # ahead of every handshake initiation
-    jmax: 800
-    i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
-  hopping:
-    ports: "40000-50000"
-    port_hopping_mode: timed   # static (default) | reactive | proactive | timed
-    port_hopping:              # knobs; which matter depends on the mode
-      period_seconds: 30
-      period_jitter_pct: 1
-  vanilla:
-    ports: "51820"
+  # Named obf strategies: each entry bundles the ports a node listens on /
+  # connects through, the client-side rotation policy for those ports, and the
+  # sender-local junk (jc/jmin/jmax and i1-i5). Endpoints reference strategies
+  # by name — the strategy name is its identity:
+  #   endpoints:
+  #     - "hub.example.com[hopping,vanilla]"
+  # Untagged endpoints (or "[*]") mean "every defined strategy".
+  strategy:
+    awg_main:
+      ports: "40000"      # required: one port or an inclusive range "40000-50000"
+      jc: 5               # sender-local junk: 5 datagrams of size [250, 800)
+      jmin: 250           # ahead of every handshake initiation
+      jmax: 800
+      i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
+    hopping:
+      ports: "40000-50000"
+      port_hopping_mode: timed   # static (default) | reactive | proactive | timed
+      port_hopping:              # knobs; which matter depends on the mode
+        period_seconds: 30
+        period_jitter_pct: 1
+    vanilla:
+      ports: "51820"
 
 # --- Graph ---
 # Defines which nodes will peer with each other. Only nodes connected in the graph
@@ -284,13 +286,13 @@ timestamp: 1740832962209309000
 
 A `metric` override behaves differently per check type. On a `ping` entry the value is advertised unconditionally from startup and suppresses failure retraction, so the prefix stays announced even when the probe target is down; leave it unset if you want health-driven withdrawal. On an `http` entry the override replaces only the healthy request-duration metric, and failures still retract. See [Dynamic Prefixes](/reference/dynamic-prefixes) for the full behavior.
 
-The `awg_profile` dialect and the strategies' `jc`/`i1`–`i5` junk params are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
+The mesh-wide S/H dialect (inline in `obf:`) and the strategies' `jc`/`i1`–`i5` junk params are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
 
 ---
 
 ## Obf Strategies
 
-Strategies are the multi-level named list at the top level of `central.yaml` (`obf:`). They are mesh-wide definitions; endpoints select among them per-host.
+Strategies are the multi-level named list inside the global `obf:` block (`obf.strategy:` in `central.yaml`). They are mesh-wide definitions; endpoints select among them per-host.
 
 | Field               | Type   | Default    | Notes                                                                                                                      |
 | ------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -305,9 +307,9 @@ Strategies are the multi-level named list at the top level of `central.yaml` (`o
 
 **Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
 
-**Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (`awg_profile`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
+**Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (the mesh-wide S/H inline in `obf:`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
 
-**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message. The strategy `protocol` label and the `jc`/`jmin`/`jmax` trio on `awg_profile` were dropped in the same reform — the strategy NAME is the identifier, and the junk trio moved onto the strategy itself.
+**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message. The strategy `protocol` label and the `jc`/`jmin`/`jmax` trio on the mesh-wide profile were dropped in the same reform — the strategy NAME is the identifier, and the junk trio moved onto the strategy itself. The intermediate `awg_profile:` top-level key (the first reform draft) folded into `obf:` — nest `s1`–`s4`/`h1`–`h4` directly under `obf:` and strategies under `obf.strategy:`; strict decoding rejects the old placement with an unknown-field error.
 
 ---
 

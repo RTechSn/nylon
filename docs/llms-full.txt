@@ -246,7 +246,7 @@ url: /guides/wg-clients
 One of nylon's key features is compatibility with standard WireGuard clients (iOS, Android, Windows, etc.). These are called **Passive Nodes/Clients**.
 
 :::caution
-Stock WireGuard clients interoperate with a nylon mesh **only** when it uses a vanilla-compatible obfuscation profile (the default). Without an `awg_profile` section in `central.yaml`, nylon pins the handshake headers to `h1=1-1` through `h4=4-4` — the vanilla WireGuard message types — so the mesh speaks byte-compatible vanilla WireGuard. The same byte-compatibility can be pinned explicitly with `nylon-genesis --compat`. If your mesh enables a dialect that deviates from these vanilla-pinned values, stock WireGuard clients cannot complete handshakes with nylon peers. See [Obfuscation](/guides/obfuscation) for how profiles work.
+Stock WireGuard clients interoperate with a nylon mesh **only** when it uses a vanilla-compatible obfuscation profile (the default). Without an `obf:` section in `central.yaml`, nylon pins the handshake headers to `h1=1-1` through `h4=4-4` — the vanilla WireGuard message types — so the mesh speaks byte-compatible vanilla WireGuard. The same byte-compatibility can be pinned explicitly with `nylon-genesis --compat`. If your mesh enables a dialect that deviates from these vanilla-pinned values, stock WireGuard clients cannot complete handshakes with nylon peers. See [Obfuscation](/guides/obfuscation) for how profiles work.
 :::
 
 ## How it Works
@@ -799,13 +799,13 @@ Obfuscation is configured at two levels in `central.yaml` (see [Configuration Re
 
 | Level | Fields | Scope |
 | --- | --- | --- |
-| Central `awg_profile` | `s1`–`s4`, `h1`–`h4` | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node |
-| Named obf strategies (top-level `obf:` map) | `ports`, `jc`, `jmin`, `jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; the junk is sender-local, endpoints select by name |
+| Central `obf` block (S/H inline) | `s1`–`s4`, `h1`–`h4` | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node |
+| Named strategies (the `obf.strategy` map) | `ports`, `jc`, `jmin`, `jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; the junk is sender-local, endpoints select by name |
 
-A minimal dialect with a QUIC-template strategy:
+The naming follows the upstream convention: the **central** `obf` block holds the parameters for the whole network (the mesh-wide S/H dialect, inline), while an `obf` block **on a node** (node.yaml) holds per-node parameters. In this fork the per-node block is retired — everything that used to be per-node lives in the named strategies and is selected per endpoint. A minimal dialect with a QUIC-template strategy:
 
 ```yaml title="central.yaml"
-awg_profile:
+obf:
   s1: 32
   s2: 28
   s3: 20
@@ -822,8 +822,8 @@ awg_profile:
   h4:
     min: 1000000000
     max: 2100000000
-obf:
-  quic:
+  strategy:
+    quic:
     ports: "51820"
     jc: 5
     jmin: 250
@@ -836,7 +836,7 @@ obf:
 
 ### The Central Profile Must Match Mesh-Wide
 
-The `s1`–`s4` and `h1`–`h4` values are a wire contract between every pair of nodes:
+The `s1`–`s4` and `h1`–`h4` values live directly in the central `obf` block and are a wire contract between every pair of nodes:
 
 - A **sender** picks each outgoing message's type word from its own `h` ranges and pads the message by its own `s` values.
 - A **receiver** classifies incoming packets using **its own** `s`/`h` values.
@@ -851,7 +851,7 @@ One wire reality remains: the AWG 2.0 device emits its junk stream and I-packets
 
 ## The Default Profile Is Vanilla-Compatible
 
-If you omit the `awg_profile` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
+If you omit the `obf` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
 
 ::::caution
 This is deliberately **not** the AmneziaWG "all zeros" default, which would produce a type word of 0 and break interoperability with vanilla WireGuard. The converse also holds: any dialect that deviates from these vanilla-pinned values breaks stock-client handshakes. To pin the vanilla-compatible values explicitly — for example across a version-skew window during a rollout — [nylon-genesis](/guides/genesis) `--compat` emits a dialect with exactly these ranges (and zero padding, no junk packets, no I-patterns). The vanilla-compatible dialect is the **only** mode in which a stock WireGuard client (iOS, Android, Windows, …) can complete a handshake with a nylon peer. See [WireGuard Clients](/guides/wg-clients).
@@ -897,7 +897,7 @@ Nylon rejects invalid profiles at apply time rather than producing a broken mesh
 
 Hand-writing a mesh-consistent profile is error-prone: one wrong `h` range on a single node blackholes that node's traffic. [nylon-genesis](/guides/genesis) is the recommended way to produce obfuscation config:
 
-- It generates the central `awg_profile` dialect and one named strategy (ports plus the junk trio and the I-patterns) together, so the mesh-uniform values match by construction.
+- It generates the mesh-wide S/H dialect (inline in the central `obf` block) and one named strategy (ports plus the junk trio and the I-patterns) together, so the mesh-uniform values match by construction.
 - It offers named protocol templates (for example `quic`) that fill in realistic `i1`–`i4` patterns like the ones shown above.
 - Empty I-specs are never emitted, and `i5` stays empty for the named templates.
 
@@ -919,7 +919,7 @@ See [Development](/guides/development) for the harness tags and how to run the i
 url: /guides/genesis
 ---
 # Config Genesis
-`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared dialect, generates the handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: a top-level `awg_profile:` block plus ONE named entry of the top-level `obf:` strategy map.
+`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared dialect, generates the handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: the global `obf:` block — the mesh-wide S/H dialect inline plus ONE named entry of the `obf.strategy` map.
 
 The tool generates obfuscation parameters only. WireGuard keys are a separate concern handled by `nylon key` — see [Getting started](/guides/getting-started).
 
@@ -927,15 +927,15 @@ The tool generates obfuscation parameters only. WireGuard keys are a separate co
 
 Every run emits one fragment with two parts:
 
-- A mesh-wide shared handshake dialect under `awg_profile:` — the padding sizes (`s1`–`s4`) and message-type header ranges (`h1`–`h4`) that every node in the mesh must share. The junk (`jc`, `jmin`, `jmax`) is NOT here: it is sender-local, so it rides the strategy like the I-packets.
-- One named obf **strategy** under `obf:` carrying the sender-local junk — the `jc`/`jmin`/`jmax` trio and the `i1`–`i5` CPS strings — and the strategy's `ports` (adjust them to your deployment; the default is a single port). The strategy name is its identifier; no `protocol` field is emitted.
+- A mesh-wide shared handshake dialect inline in the central `obf:` block — the padding sizes (`s1`–`s4`) and message-type header ranges (`h1`–`h4`) that every node in the mesh must share. The junk (`jc`, `jmin`, `jmax`) is NOT here: it is sender-local, so it rides the strategy like the I-packets.
+- One named obf **strategy** under `obf.strategy:` carrying the sender-local junk — the `jc`/`jmin`/`jmax` trio and the `i1`–`i5` CPS strings — and the strategy's `ports` (adjust them to your deployment; the default is a single port). The strategy name is its identifier; no `protocol` field is emitted.
 
 The fragment unmarshals cleanly into the central config structure, but it does not merge itself — you paste it into `central.yaml` by hand (see [Generate a profile](#generate-a-profile)). The dialect is mesh-uniform by construction: one oracle call fixes S/H for the whole mesh. The strategy's junk rides on every handshake the nodes that use the strategy send (the AWG 2.0 device emits one junk configuration toward every peer — see [Obfuscation](/guides/obfuscation) for the wire reality).
 
 The following output shape is what the command shown in [Step 5](#step-5-run-the-tool) produces:
 
 ```yaml title="nylon-genesis output fragment"
-awg_profile:
+obf:
   s1: 32
   s2: 28
   s3: 20
@@ -952,8 +952,8 @@ awg_profile:
   h4:
     min: 1000000000
     max: 2100000000
-obf:
-  quic:
+  strategy:
+    quic:
     ports: "51820"
     jc: 5
     jmin: 250
@@ -1013,17 +1013,17 @@ bin/nylon-genesis --protocol quic --strategy awg_main --strategy-ports 40000-500
 
 ### Step 6. Merge the fragment into central.yaml
 
-Paste the `awg_profile:` block and the `obf:` entry at the top level of `central.yaml` (merge into your existing `obf:` map if you already have strategies), then tag the endpoints that should use the strategy:
+Paste the `obf:` block at the top level of `central.yaml` (merge the generated strategy into your existing `obf.strategy` map if you already have strategies), then tag the endpoints that should use the strategy:
 
 ```yaml title="central.yaml (excerpt after merging)"
-# Top level: paste the generated blocks verbatim.
-awg_profile:
+# Top level: paste the generated obf: block verbatim.
+obf:
   s1: 32
   # ... rest of the generated dialect ...
-obf:
-  quic:
-    ports: "40000" # adjusted to your deployment
-    # ... jc/jmin/jmax + i1..i4 from the generated fragment ...
+  strategy:
+    quic:
+      ports: "40000" # adjusted to your deployment
+      # ... jc/jmin/jmax + i1..i4 from the generated fragment ...
 
 routers:
   - id: hub
@@ -1034,7 +1034,7 @@ routers:
 The full field semantics — what S/H do on receive, why they must match mesh-wide, and the one-junk-set-per-device wire reality — are covered in [Obfuscation](/guides/obfuscation), and the complete field reference lives in [Configuration reference](/reference/config).
 
 ::::caution
-The fragment does not merge itself. If your `central.yaml` already defines strategies, merge the generated entry into the existing `obf:` map instead of pasting over it, and remember that the strategies a node uses must share one junk set (`jc`/`jmin`/`jmax` and `i1`–`i5`).
+The fragment does not merge itself. If your `central.yaml` already defines strategies, merge the generated entry into the existing `obf.strategy` map instead of pasting over it, and remember that the strategies a node uses must share one junk set (`jc`/`jmin`/`jmax` and `i1`–`i5`).
 ::::
 
 ### Step 7. Distribute and reload
@@ -1066,7 +1066,7 @@ Print the stamped build version with the `--version` flag: `nylon-genesis --vers
 Pass `--compat` to generate the vanilla-compat dialect instead of an obfuscated one. It pins `h1`–`h4` to the exact vanilla WireGuard message types and leaves everything else at zero — no junk, no padding, and no `i`-params on the strategy. This is the dialect that keeps stock WireGuard clients working against your mesh during a version-skew window:
 
 ```yaml title="nylon-genesis --compat output"
-awg_profile:
+obf:
   h1:
     min: 1
     max: 1
@@ -1079,9 +1079,9 @@ awg_profile:
   h4:
     min: 4
     max: 4
-obf:
-  compat:
-    ports: "51820"
+  strategy:
+    compat:
+      ports: "51820"
 ```
 
 Two things to know about this mode:
@@ -1089,7 +1089,7 @@ Two things to know about this mode:
 - The compat output does not depend on `--preset` or `--protocol`, but they are still validated: an unknown value fails before any output is produced.
 - It deliberately skips the header-range viability checks that normal generation runs, because pinning headers to 1–4 is exactly what those checks reject: obfuscated ranges must stay clear of the vanilla message types.
 
-If your whole mesh speaks vanilla WireGuard anyway, you can also omit `awg_profile` from `central.yaml` altogether — a mesh with no dialect pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the dialect semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
+If your whole mesh speaks vanilla WireGuard anyway, you can also omit `obf` from `central.yaml` altogether — a mesh with no dialect pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the dialect semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
 
 ## Validation and failure behavior
 
@@ -1682,13 +1682,16 @@ dynamic_prefix_ranges:
   - 10.0.0.0/8
 
 # --- Obfuscation ---
-# Mesh-wide AmneziaWG 2.0 handshake dialect (S/H) — the wire contract every
-# pair of nodes must speak identically, so it cannot vary from node to node.
-# Central placement keeps S/H identical on every node by construction. The
-# sender-local junk (jc/jmin/jmax and the i1-i5) lives on the obf strategies
-# below. Omit the whole block for vanilla WireGuard-compatible behavior.
-# The values below are examples; generate one with `nylon-genesis`.
-awg_profile:
+# The global obf block — the network-wide obfuscation half (upstream naming:
+# the central obf block serves the whole network; a per-node obf block would
+# hold per-node parameters, and in this fork everything per-node lives in
+# the named strategies instead). It carries the mesh-wide AmneziaWG 2.0
+# handshake dialect (S/H) inline — the wire contract every pair of nodes
+# must speak identically, so it cannot vary from node to node — plus the
+# named strategy map under `strategy:`. Omit the whole block for vanilla
+# WireGuard-compatible behavior. The values below are examples; generate
+# one with `nylon-genesis`.
+obf:
   s1: 32
   s2: 28
   s3: 20
@@ -1713,21 +1716,21 @@ awg_profile:
 #   endpoints:
 #     - "hub.example.com[hopping,vanilla]"
 # Untagged endpoints (or "[*]") mean "every defined strategy".
-obf:
-  awg_main:
-    ports: "40000"      # required: one port or an inclusive range "40000-50000"
-    jc: 5               # sender-local junk: 5 datagrams of size [250, 800)
-    jmin: 250           # ahead of every handshake initiation
-    jmax: 800
-    i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
-  hopping:
-    ports: "40000-50000"
-    port_hopping_mode: timed   # static (default) | reactive | proactive | timed
-    port_hopping:              # knobs; which matter depends on the mode
-      period_seconds: 30
-      period_jitter_pct: 1
-  vanilla:
-    ports: "51820"
+  strategy:
+    awg_main:
+      ports: "40000"      # required: one port or an inclusive range "40000-50000"
+      jc: 5               # sender-local junk: 5 datagrams of size [250, 800)
+      jmin: 250           # ahead of every handshake initiation
+      jmax: 800
+      i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
+    hopping:
+      ports: "40000-50000"
+      port_hopping_mode: timed   # static (default) | reactive | proactive | timed
+      port_hopping:              # knobs; which matter depends on the mode
+        period_seconds: 30
+        period_jitter_pct: 1
+    vanilla:
+      ports: "51820"
 
 # --- Graph ---
 # Defines which nodes will peer with each other. Only nodes connected in the graph
@@ -1749,13 +1752,13 @@ timestamp: 1740832962209309000
 
 A `metric` override behaves differently per check type. On a `ping` entry the value is advertised unconditionally from startup and suppresses failure retraction, so the prefix stays announced even when the probe target is down; leave it unset if you want health-driven withdrawal. On an `http` entry the override replaces only the healthy request-duration metric, and failures still retract. See [Dynamic Prefixes](/reference/dynamic-prefixes) for the full behavior.
 
-The `awg_profile` dialect and the strategies' `jc`/`i1`–`i5` junk params are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
+The mesh-wide S/H dialect (inline in `obf:`) and the strategies' `jc`/`i1`–`i5` junk params are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
 
 ---
 
 ## Obf Strategies
 
-Strategies are the multi-level named list at the top level of `central.yaml` (`obf:`). They are mesh-wide definitions; endpoints select among them per-host.
+Strategies are the multi-level named list inside the global `obf:` block (`obf.strategy:` in `central.yaml`). They are mesh-wide definitions; endpoints select among them per-host.
 
 | Field               | Type   | Default    | Notes                                                                                                                      |
 | ------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -1770,9 +1773,9 @@ Strategies are the multi-level named list at the top level of `central.yaml` (`o
 
 **Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
 
-**Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (`awg_profile`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
+**Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (the mesh-wide S/H inline in `obf:`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
 
-**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message. The strategy `protocol` label and the `jc`/`jmin`/`jmax` trio on `awg_profile` were dropped in the same reform — the strategy NAME is the identifier, and the junk trio moved onto the strategy itself.
+**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message. The strategy `protocol` label and the `jc`/`jmin`/`jmax` trio on the mesh-wide profile were dropped in the same reform — the strategy NAME is the identifier, and the junk trio moved onto the strategy itself. The intermediate `awg_profile:` top-level key (the first reform draft) folded into `obf:` — nest `s1`–`s4`/`h1`–`h4` directly under `obf:` and strategies under `obf.strategy:`; strict decoding rejects the old placement with an unknown-field error.
 
 ---
 
@@ -2066,7 +2069,7 @@ A curated list of traps that bite operators and config authors — surprising de
 
 - **`port` is mandatory in `node.yaml` — `57175` is a convention, not a default.** `port: 0` fails validation with `port must be greater than 0`. The resolver default (`57175`) applies only when an endpoint string carries no port: a bare hostname or IP in `routers[].endpoints` silently gets `57175`, so a mismatched forwarded port fails with no diagnostic. Scheme URLs are rejected explicitly, and a non-numeric port fails with `invalid port`. See [Configuration Reference](/reference/config).
 
-- **Sample keys are illustrative, not deployable.** The keys in the overview snippet and `example/` are public sample keypairs — the snippet's five keys decode and verify, which makes them copy-pasteable, but every node needs its own `nylon key` keypair, and the mesh-wide `awg_profile` dialect must match across all nodes. The shipped `example/sample-central.yaml` does not even pass validation: `nylon verify example/sample-central.yaml` exits 1 with `failed to decode public key (...): illegal base64 data at input byte 44`, and the `port` comment in `example/sample-node.yaml` (claiming `Default: 57175`) is convention, not a code default.
+- **Sample keys are illustrative, not deployable.** The keys in the overview snippet and `example/` are public sample keypairs — the snippet's five keys decode and verify, which makes them copy-pasteable, but every node needs its own `nylon key` keypair, and the mesh-wide S/H dialect (inline in `obf:`) must match across all nodes. The shipped `example/sample-central.yaml` does not even pass validation: `nylon verify example/sample-central.yaml` exits 1 with `failed to decode public key (...): illegal base64 data at input byte 44`, and the `port` comment in `example/sample-node.yaml` (claiming `Default: 57175`) is convention, not a code default.
 
 - **YAML parsing is silent about most mistakes — and keys are worse.** In `node.yaml`, unknown fields are ignored (lax decoding), so a typo'd field name silently drops the setting. `central.yaml` is strictly decoded — an unknown key (including AWG 3.x-only keys inside `obf`) fails the parse/seal with an unknown-field error. Floats truncate into integer fields (`tun_queues: 2.5` becomes `2`), while duration fields reject bare numbers (`cannot unmarshal uint64 ... time.Duration`). An explicit `key: ""` panics during YAML decode instead of failing validation, and any base64 key that decodes to fewer than 32 bytes panics the same way; longer values are silently truncated to 32 bytes. Omitting the key entirely is the one form caught cleanly (`private key must not be empty`). Two knobs that never apply: `mtu` is not range-validated (an explicit `0` reaches TUN creation unchanged; omitting it means `1420`), and `tun_txqueuelen` only takes effect with more than one TUN queue.
 

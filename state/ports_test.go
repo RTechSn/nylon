@@ -149,9 +149,9 @@ func TestEndpointSpecStringRoundTrip(t *testing.T) {
 func TestEndpointSpecValidationCentral(t *testing.T) {
 	// tagged endpoints must reference defined strategies
 	cfg := &CentralCfg{
-		ObfStrategies: map[string]*ObfStrategy{
+		Obf: &CentralObf{Strategy: map[string]*ObfStrategy{
 			"hopping": {Ports: "30000-40000"},
-		},
+		}},
 		Routers: []RouterCfg{
 			{NodeCfg: NodeCfg{Id: "a"}, Endpoints: []string{"1.2.3.4[hopping]"}},
 		},

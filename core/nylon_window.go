@@ -1214,7 +1214,7 @@ func (f *portFactory) policyOf(strategy string) state.PortHoppingPolicy {
 // ports and resolved rotation policy. Raw host:port endpoints contribute
 // nothing (stock configured links).
 func (n *Nylon) peerCandidates(cfg *state.RouterCfg) ([]hopCandidate, error) {
-	m := n.CentralCfg.ObfStrategies
+	m := n.ObfStrategies()
 	if len(m) == 0 {
 		return nil, nil
 	}
@@ -1307,7 +1307,7 @@ func (n *Nylon) ensurePortFactories() error {
 // whenever a policy changes (startup, config update). The knobs moved into
 // the strategies, so the journal names the strategy instead of a source.
 func (n *Nylon) logStrategyHopPolicies() {
-	m := n.CentralCfg.ObfStrategies
+	m := n.ObfStrategies()
 	if len(m) == 0 {
 		return
 	}

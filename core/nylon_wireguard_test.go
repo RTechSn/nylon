@@ -105,8 +105,9 @@ func TestResolveMTU(t *testing.T) {
 	}
 }
 
-func TestCentralCfgAwgProfileYAMLShape(t *testing.T) {
-	cfg := state.CentralCfg{AwgProfile: testObfProfile()}
+func TestCentralCfgObfYAMLShape(t *testing.T) {
+	prof := testObfProfile()
+	cfg := state.CentralCfg{Obf: &state.CentralObf{ObfProfile: *prof}}
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -117,38 +118,38 @@ func TestCentralCfgAwgProfileYAMLShape(t *testing.T) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("unmarshal marshaled CentralCfg into map: %v", err)
 	}
-	obf, ok := doc["awg_profile"].(map[string]any)
+	obf, ok := doc["obf"].(map[string]any)
 	if !ok {
-		t.Fatalf("marshaled YAML lacks an awg_profile mapping:\n%s", data)
+		t.Fatalf("marshaled YAML lacks the global obf mapping:\n%s", data)
 	}
 
 	wantKeys := []string{"s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4"}
 	for _, k := range []string{"jc", "jmin", "jmax"} {
 		if _, ok := obf[k]; ok {
-			t.Errorf("awg_profile mapping must not carry %q (the junk trio moved onto obf strategies)", k)
+			t.Errorf("the obf mapping must not carry %q (the junk trio moved onto obf strategies)", k)
 		}
 	}
 	if len(obf) != len(wantKeys) {
-		t.Errorf("awg_profile mapping has %d keys, want %d: %v", len(obf), len(wantKeys), obf)
+		t.Errorf("obf mapping has %d keys, want %d: %v", len(obf), len(wantKeys), obf)
 	}
 	for _, k := range wantKeys {
 		if _, ok := obf[k]; !ok {
-			t.Errorf("awg_profile mapping missing key %q", k)
+			t.Errorf("obf mapping missing key %q", k)
 		}
 	}
 	for _, k := range []string{"h1", "h2", "h3", "h4"} {
 		h, ok := obf[k].(map[string]any)
 		if !ok {
-			t.Fatalf("awg_profile.%s is not a mapping: %v", k, obf[k])
+			t.Fatalf("obf.%s is not a mapping: %v", k, obf[k])
 		}
 		if len(h) != 2 {
-			t.Errorf("awg_profile.%s has %d keys, want exactly min and max: %v", k, len(h), h)
+			t.Errorf("obf.%s has %d keys, want exactly min and max: %v", k, len(h), h)
 		}
 		if _, ok := h["min"]; !ok {
-			t.Errorf("awg_profile.%s missing key %q", k, "min")
+			t.Errorf("obf.%s missing key %q", k, "min")
 		}
 		if _, ok := h["max"]; !ok {
-			t.Errorf("awg_profile.%s missing key %q", k, "max")
+			t.Errorf("obf.%s missing key %q", k, "max")
 		}
 	}
 
@@ -156,10 +157,10 @@ func TestCentralCfgAwgProfileYAMLShape(t *testing.T) {
 	if err := yaml.Unmarshal(data, &round); err != nil {
 		t.Fatalf("unmarshal marshaled CentralCfg: %v", err)
 	}
-	if round.AwgProfile == nil {
-		t.Fatalf("round-trip lost the awg_profile:\n%s", data)
+	if round.Profile() == nil {
+		t.Fatalf("round-trip lost the obf profile:\n%s", data)
 	}
-	if *round.AwgProfile != *cfg.AwgProfile {
-		t.Errorf("round-trip mismatch: got %+v, want %+v", *round.AwgProfile, *cfg.AwgProfile)
+	if *round.Profile() != *cfg.Profile() {
+		t.Errorf("round-trip mismatch: got %+v, want %+v", *round.Profile(), *cfg.Profile())
 	}
 }

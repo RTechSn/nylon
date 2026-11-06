@@ -44,15 +44,16 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "nylon-genesis",
 		Short: "Generate an AWG 2.0 obfuscation fragment for a nylon central config",
-		Long: `Generates a paste-ready YAML fragment: the mesh-wide shared awg_profile
-(S/H handshake dialect, uniform by construction — wire compatibility
-requires it) plus ONE named obf strategy carrying the sender-local junk
-emission (the jc/jmin/jmax trio and the I1-I5 CPS sequences).
+		Long: `Generates a paste-ready YAML fragment: the global obf block — the
+mesh-wide shared S/H handshake dialect (s1-s4, h1-h4, uniform by
+construction: wire compatibility requires it) plus ONE named strategy under
+obf.strategy carrying the sender-local junk emission (the jc/jmin/jmax trio
+and the I1-I5 CPS sequences).
 
-The strategy fragment lands in the central config's top-level obf: map; tag
-endpoints with the strategy name (host[<strategy>]) to use it, and adjust
-its ports to your deployment. Parameters come from the amnezigo oracle and
-are validated before anything is emitted.
+The strategy lands in the central config's obf.strategy map; tag endpoints
+with the strategy name (host[<strategy>]) to use it, and adjust its ports to
+your deployment. Parameters come from the amnezigo oracle and are validated
+before anything is emitted.
 
 --compat emits the fixed vanilla-compat profile (H1..H4 pinned to the
 WireGuard message types, no padding/junk/I) for the version-skew window
@@ -77,14 +78,14 @@ where plain-WireGuard peers must interoperate.`,
 	return cmd
 }
 
-// peerFragment mirrors the CentralCfg/NodeCfg yaml shape so the output is
-// paste-ready and unmarshals into state.CentralCfg without noise fields.
-// The sender-local junk (jc/jmin/jmax and the I-set) moved from the
-// mesh-wide profile into the central obf strategy map (see
-// state.ObfStrategy): one strategy carries one shared junk configuration.
+// outputFragment mirrors the CentralCfg yaml shape so the output is
+// paste-ready and unmarshals into state.CentralCfg without noise fields: the
+// global obf block carries the mesh-wide S/H dialect inline plus the named
+// strategy map under `strategy:` (see state.CentralObf). One strategy
+// carries one shared junk configuration (the jc/jmin/jmax trio and the
+// I-set, per the config reform — see state.ObfStrategy).
 type outputFragment struct {
-	AwgProfile *state.ObfProfile             `yaml:"awg_profile,omitempty"`
-	Obf        map[string]*state.ObfStrategy `yaml:"obf,omitempty"`
+	Obf *state.CentralObf `yaml:"obf,omitempty"`
 }
 
 // genJunk is the sender-local junk trio drawn for the strategy (the AWG J
@@ -181,8 +182,10 @@ func run(presetName string, random bool, protocol string, mtu int, strategyName 
 		strat.Jc, strat.Jmin, strat.Jmax = &junk.jc, &junk.jmin, &junk.jmax
 	}
 	frag := outputFragment{
-		AwgProfile: &profile,
-		Obf:        map[string]*state.ObfStrategy{strategyName: strat},
+		Obf: &state.CentralObf{
+			ObfProfile: profile,
+			Strategy:   map[string]*state.ObfStrategy{strategyName: strat},
+		},
 	}
 
 	output := outPath

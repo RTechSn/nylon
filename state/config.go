@@ -20,10 +20,13 @@ type ObfHeaderRange struct {
 
 // ObfProfile is the mesh-wide shared AWG 2.0 handshake dialect (S/H) — the
 // wire contract every pair of nodes must speak identically, so it cannot
-// vary from node to node. Living at CentralCfg level makes S/H uniform
-// across the full mesh by construction, which wire compatibility requires
-// (design §2.4). The sender-local junk emission (jc/jmin/jmax and the
-// I-packets) is per-strategy — see ObfStrategy and EffectiveStrategyJunk.
+// vary from node to node. It lives inline in the global `obf` block of the
+// central config (CentralObf), which keeps S/H uniform across the full mesh
+// by construction, as wire compatibility requires (design §2.4) — and matches
+// the upstream naming, where the central `obf` block is network-wide and the
+// per-node `obf` block (node.yaml) is per-node. The sender-local junk
+// emission (jc/jmin/jmax and the I-packets) is per-strategy — see ObfStrategy
+// and EffectiveStrategyJunk.
 type ObfProfile struct {
 	S1 uint32         `yaml:",omitempty"`
 	S2 uint32         `yaml:",omitempty"`
@@ -57,6 +60,47 @@ type ObfPeerParams struct {
 	I3       string `yaml:",omitempty"`
 	I4       string `yaml:",omitempty"`
 	I5       string `yaml:",omitempty"`
+}
+
+// CentralObf is the global `obf` block of the central config — the
+// network-wide obfuscation half (upstream keeps the same naming: a `obf`
+// block on a node holds per-node parameters, the central `obf` block holds
+// the parameters for the whole network). It carries the mesh-wide S/H
+// handshake dialect inline (the wire contract, uniform by construction) and
+// the named strategy map under `strategy:` — ports, rotation policy and the
+// sender-local junk emission, selected per endpoint (host[<strategy>,...]).
+// A nil CentralObf (no `obf:` key at all) is the vanilla-compat default.
+type CentralObf struct {
+	ObfProfile `yaml:",inline"`
+	// Strategy is the named obf strategy map; referenced per endpoint as
+	// host[strategy1,strategy2] (untagged / "[*]" = all strategies).
+	Strategy map[string]*ObfStrategy `yaml:"strategy,omitempty"`
+}
+
+// ObfStrategies returns the named obf strategy map of the global `obf` block
+// (nil when the block or the map is absent).
+func (c *CentralCfg) ObfStrategies() map[string]*ObfStrategy {
+	if c == nil || c.Obf == nil {
+		return nil
+	}
+	return c.Obf.Strategy
+}
+
+// Profile returns the mesh-wide AWG 2.0 S/H handshake dialect from the global
+// `obf` block, or nil when the block is absent or carries no dialect — nil
+// means vanilla-compat (the device pins H1..H4 to the WireGuard message
+// types; see core.obfDeviceIPC). The returned pointer aliases the embedded
+// profile inside the active config, so it stays stable for one config
+// generation and changes identity across a config swap.
+func (c *CentralCfg) Profile() *ObfProfile {
+	if c == nil || c.Obf == nil {
+		return nil
+	}
+	p := c.Obf.ObfProfile
+	if p == (ObfProfile{}) {
+		return nil
+	}
+	return &c.Obf.ObfProfile
 }
 
 type NodeCfg struct {
@@ -132,11 +176,10 @@ type CentralCfg struct {
 	Clients             []ClientCfg
 	Graph               []string
 	Timestamp           int64
-	ExcludeIPs          []netip.Prefix          `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
-	DynamicPrefixRanges []netip.Prefix          `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
-	AwgProfile          *ObfProfile             `yaml:"awg_profile,omitempty"`           // mesh-wide shared AWG 2.0 S/H handshake dialect; nil = vanilla-compat. The sender-local junk (jc/jmin/jmax, i1-i5) lives on the obf strategies.
-	ObfStrategies       map[string]*ObfStrategy `yaml:"obf,omitempty"`                   // named obf strategies: ports + per-strategy rotation policy + the sender-local junk (jc/jmin/jmax, i1-i5); referenced per-endpoint as host[strategy1,strategy2]
-	PriorityRules       []PriorityRule          `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
+	ExcludeIPs          []netip.Prefix `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
+	DynamicPrefixRanges []netip.Prefix `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
+	Obf                 *CentralObf    `yaml:"obf,omitempty"`                   // the global obf block: the mesh-wide AWG 2.0 S/H handshake dialect (inline s1-s4/h1-h4) plus the named strategy map under `strategy:` (ports, rotation policy, sender-local junk); nil = vanilla-compat; referenced per endpoint as host[strategy1,strategy2]
+	PriorityRules       []PriorityRule `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
 }
 
 // TunablesOverrides carries optional router tunable overrides from the local
@@ -301,15 +344,15 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 // router-level): the rotation policy and the served ports moved into central
 // obf strategies.
 func retiredHopPolicyError(where string) error {
-	return fmt.Errorf("%s: port_hopping_mode / port_hopping moved into obf strategies — define the rotation policy on the obf strategy that carries the ports (central top-level `obf:` block, e.g. obf.hopping.port_hopping_mode: timed), then tag the endpoints that use it: host[hopping]", where)
+	return fmt.Errorf("%s: port_hopping_mode / port_hopping moved into obf strategies — define the rotation policy on the obf strategy that carries the ports (central `obf:` block, e.g. obf.strategy.hopping.port_hopping_mode: timed), then tag the endpoints that use it: host[hopping]", where)
 }
 
 func retiredListenPortsError(where string) error {
-	return fmt.Errorf("%s: listen_ports moved into obf strategies — the listen half now derives from the strategies this node's own advertised endpoints name; define the ports on a central obf strategy (obf.<name>.ports) and advertise the strategy on an endpoint: host[<name>]", where)
+	return fmt.Errorf("%s: listen_ports moved into obf strategies — the listen half now derives from the strategies this node's own advertised endpoints name; define the ports on a central obf strategy (obf.strategy.<name>.ports) and advertise the strategy on an endpoint: host[<name>]", where)
 }
 
 func retiredNodeObfError(where string) error {
-	return fmt.Errorf("%s: the per-node obf block moved into central obf strategies — carry the jc/jmin/jmax and i1..i5 junk-packet params on the obf strategy that uses them (central top-level `obf:` block)", where)
+	return fmt.Errorf("%s: the per-node obf block moved into central obf strategies — carry the jc/jmin/jmax and i1..i5 junk-packet params on the obf strategy that uses them (the `obf.strategy` map of the central `obf:` block)", where)
 }
 
 // ValidateHopPolicyCfg checks one file's hop policy for internal

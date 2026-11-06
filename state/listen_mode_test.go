@@ -16,7 +16,7 @@ func strategyFixture(strategyPorts map[string]string, endpoints []string, mode s
 	}
 	key := GenerateKey()
 	central := &CentralCfg{
-		ObfStrategies: strats,
+		Obf: &CentralObf{Strategy: strats},
 		Routers: []RouterCfg{
 			{NodeCfg: NodeCfg{Id: "a", PubKey: key.Pubkey()}, Endpoints: endpoints},
 		},

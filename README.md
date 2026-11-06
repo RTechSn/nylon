@@ -9,7 +9,8 @@
 >
 > - **AmneziaWG 2.0 traffic obfuscation** — the vendored `polyamide/` device tree speaks the AWG 2.0
 >   wire format (the `s1`–`s4`/`h1`–`h4` handshake dialect plus `jc`/`jmin`/`jmax` and `i1`–`i5` sender
->   junk), driven by a mesh-wide `awg_profile` plus named obf strategies selected per endpoint.
+>   junk), driven by the global `obf` block — the mesh-wide S/H dialect inline — plus named
+>   obf strategies selected per endpoint.
 >   → [Traffic Obfuscation](https://arsolitt.github.io/nylon-docs/guides/obfuscation/)
 > - **Runtime dynamic prefixes (`prefixes.d`)** — external writers drop JSON announce files into a
 >   watched directory; the daemon applies and withdraws prefixes without a config reload or restart.
@@ -19,7 +20,7 @@
 >   scoped with `--lb-class`.
 >   → [Kubernetes LoadBalancer](https://arsolitt.github.io/nylon-docs/guides/nylon-lb/)
 > - **`nylon-genesis`** — an obfuscation-parameter generator that emits a paste-ready fragment
->   (the shared `awg_profile` dialect plus one named obf strategy carrying the junk).
+>   (the global `obf` block — the shared S/H dialect plus one named obf strategy carrying the junk).
 >   → [Config Genesis](https://arsolitt.github.io/nylon-docs/guides/genesis/)
 >
 > Fork documentation: **[arsolitt.github.io/nylon-docs](https://arsolitt.github.io/nylon-docs/)** ·

@@ -68,13 +68,13 @@ func newDeadlockFixtureNylon(t *testing.T) (*Nylon, device.NoisePublicKey, *bloc
 		EndpointResolver: state.NewEndpointResolver(state.NewDNSResolver(nil)),
 		ConfigState: state.ConfigState{
 			CentralCfg: state.CentralCfg{
-				ObfStrategies: map[string]*state.ObfStrategy{
+				Obf: &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
 					"hop": {
 						Ports:           "30000-30009",
 						PortHoppingMode: state.HopModeProactive,
 						PortHopping:     &state.PortHoppingCfg{BudgetPackets: uint32ptr2(12)},
 					},
-				},
+				}},
 				Routers: []state.RouterCfg{
 					{NodeCfg: state.NodeCfg{Id: "a"}},
 					{

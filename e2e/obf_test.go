@@ -15,11 +15,11 @@ import (
 
 // obfFixture mirrors the nylon-genesis output fragment so the committed
 // fixture (e2e/testdata/obf-profile.yaml) round-trips into the obf fields of
-// state.CentralCfg: the mesh-wide S/H dialect plus ONE named strategy
-// carrying the sender-local junk (jc/jmin/jmax and i1-i5).
+// state.CentralCfg: the global obf block — the mesh-wide S/H dialect inline
+// plus ONE named strategy under `strategy:` carrying the sender-local junk
+// (jc/jmin/jmax and i1-i5).
 type obfFixture struct {
-	AwgProfile *state.ObfProfile             `yaml:"awg_profile"`
-	Obf        map[string]*state.ObfStrategy `yaml:"obf"`
+	Obf *state.CentralObf `yaml:"obf"`
 }
 
 // TestObfProfileConnectivity proves that two nylon nodes with a generated
@@ -42,18 +42,18 @@ func TestObfProfileConnectivity(t *testing.T) {
 	if err := yaml.UnmarshalWithOptions(data, &fixture, yaml.Strict()); err != nil {
 		t.Fatalf("parsing obf fixture: %v", err)
 	}
-	if fixture.AwgProfile == nil {
-		t.Fatal("obf fixture carries no awg_profile")
+	if fixture.Obf == nil {
+		t.Fatal("obf fixture carries no global obf block")
 	}
-	if err := fixture.AwgProfile.Validate(); err != nil {
+	if err := fixture.Obf.Validate(); err != nil {
 		t.Fatalf("obf fixture profile invalid: %v", err)
 	}
-	if len(fixture.Obf) != 1 {
-		t.Fatalf("obf fixture must carry exactly one strategy, got %d", len(fixture.Obf))
+	if len(fixture.Obf.Strategy) != 1 {
+		t.Fatalf("obf fixture must carry exactly one strategy, got %d", len(fixture.Obf.Strategy))
 	}
 	var strategyName string
 	var strat *state.ObfStrategy
-	for n, s := range fixture.Obf {
+	for n, s := range fixture.Obf.Strategy {
 		strategyName, strat = n, s
 	}
 	if strategyName == "" || strat == nil || strat.Ports == "" {
@@ -90,9 +90,8 @@ func TestObfProfileConnectivity(t *testing.T) {
 		Graph: []string{
 			"node1, node2",
 		},
-		Timestamp:     time.Now().UnixNano(),
-		AwgProfile:    fixture.AwgProfile,
-		ObfStrategies: fixture.Obf,
+		Timestamp: time.Now().UnixNano(),
+		Obf:       fixture.Obf,
 	}
 
 	centralPath := h.WriteConfig(configDir, "central.yaml", central)

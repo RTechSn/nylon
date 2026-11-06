@@ -78,10 +78,11 @@ func validateProfile(t *testing.T, profile *state.ObfProfile, strat *state.ObfSt
 // strategyOf fetches the single generated strategy or fails the test.
 func strategyOf(t *testing.T, cfg state.CentralCfg) (string, *state.ObfStrategy) {
 	t.Helper()
-	if len(cfg.ObfStrategies) != 1 {
-		t.Fatalf("expected exactly 1 obf strategy, got %d (%v)", len(cfg.ObfStrategies), cfg.ObfStrategies)
+	strategies := cfg.ObfStrategies()
+	if len(strategies) != 1 {
+		t.Fatalf("expected exactly 1 obf strategy, got %d (%v)", len(strategies), strategies)
 	}
-	for name, s := range cfg.ObfStrategies {
+	for name, s := range strategies {
 		return name, s
 	}
 	return "", nil
@@ -90,8 +91,8 @@ func strategyOf(t *testing.T, cfg state.CentralCfg) (string, *state.ObfStrategy)
 func TestGeneratePresetStrategyValidates(t *testing.T) {
 	cfg := generate(t, "standard-1420", false, "quic", 1420, "", "40000-41000", false)
 
-	if cfg.AwgProfile == nil {
-		t.Fatal("awg_profile is nil")
+	if cfg.Profile() == nil {
+		t.Fatal("the global obf block's S/H profile is nil")
 	}
 	name, strat := strategyOf(t, cfg)
 	if name != "quic" {
@@ -113,7 +114,7 @@ func TestGeneratePresetStrategyValidates(t *testing.T) {
 			t.Errorf("strategy.I%d is empty", j+1)
 		}
 	}
-	validateProfile(t, cfg.AwgProfile, strat)
+	validateProfile(t, cfg.Profile(), strat)
 
 	// the fragment must validate as part of a full central config with a
 	// tagged endpoint using it (two routers so the graph pairing is valid)
@@ -136,19 +137,20 @@ func TestGeneratePresetStrategyValidates(t *testing.T) {
 func TestGenerateCompatProfile(t *testing.T) {
 	cfg := generate(t, defaultPreset, false, "quic", 0, "compat", "51820", true)
 
-	if cfg.AwgProfile == nil {
-		t.Fatal("central awg_profile is nil")
+	if cfg.Profile() == nil {
+		t.Fatal("the global obf block's S/H profile is nil")
 	}
 	want := [4]state.ObfHeaderRange{
 		{Min: 1, Max: 1}, {Min: 2, Max: 2}, {Min: 3, Max: 3}, {Min: 4, Max: 4},
 	}
-	for i, h := range [4]state.ObfHeaderRange{cfg.AwgProfile.H1, cfg.AwgProfile.H2, cfg.AwgProfile.H3, cfg.AwgProfile.H4} {
+	compat := cfg.Profile()
+	for i, h := range [4]state.ObfHeaderRange{compat.H1, compat.H2, compat.H3, compat.H4} {
 		if h != want[i] {
 			t.Errorf("h%d = {%d,%d}, want {%d,%d}", i+1, h.Min, h.Max, want[i].Min, want[i].Max)
 		}
 	}
 	for name, v := range map[string]uint32{
-		"s1": cfg.AwgProfile.S1, "s2": cfg.AwgProfile.S2, "s3": cfg.AwgProfile.S3, "s4": cfg.AwgProfile.S4,
+		"s1": compat.S1, "s2": compat.S2, "s3": compat.S3, "s4": compat.S4,
 	} {
 		if v != 0 {
 			t.Errorf("%s = %d, want 0 in compat profile", name, v)
@@ -180,7 +182,7 @@ func TestGenerateRandomStrategyValidates(t *testing.T) {
 			t.Errorf("strategy.I%d is empty", j+1)
 		}
 	}
-	validateProfile(t, cfg.AwgProfile, strat)
+	validateProfile(t, cfg.Profile(), strat)
 }
 
 // TestGenerateRandomRedrawIsValid drives both shared-profile sources with
@@ -208,7 +210,7 @@ func TestGenerateRandomRedrawIsValid(t *testing.T) {
 					t.Errorf("strategy.I%d is empty", j+1)
 				}
 			}
-			validateProfile(t, cfg.AwgProfile, strat)
+			validateProfile(t, cfg.Profile(), strat)
 		})
 	}
 }
