@@ -135,18 +135,6 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	var sendBuffer [][]byte
-
-	for _, ipacket := range peer.device.ipackets {
-		if ipacket != nil {
-			buf := make([]byte, ipacket.ObfuscatedLen(0))
-			ipacket.Obfuscate(buf, nil)
-			sendBuffer = append(sendBuffer, buf)
-		}
-	}
-
-	sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
-
 	padding := int(peer.device.paddings.init.Load())
 	trailerLen := max(peer.randomTrailer(padding+MessageInitiationSize), 0)
 
@@ -174,9 +162,12 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	trailer := buf[padding+MessageInitiationSize:]
 	rand.Read(trailer)
 
-	sendBuffer = append(sendBuffer, buf)
-
-	// try a different index every time
+	// Endpoint selection FIRST: the carrying endpoint selection adopts the
+	// connection's obf strategy (hopCarrying → the hop source → the
+	// controller's strategy adoption), so the junk consult below must run
+	// AFTER it to see the strategy this very handshake belongs to — otherwise
+	// the first handshake after a fresh wire-up would speak the old or
+	// fallback junk.
 	peer.endpoints.Lock()
 	var selEp conn.Endpoint
 	if hopEp := peer.hopCarrying(); hopEp != nil {
@@ -193,6 +184,21 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		selEp = peer.endpoints.val[peer.endpoints.lastInitIndex]
 	}
 	peer.endpoints.Unlock()
+
+	// The prepend stream: the per-peer junk hook decides (per-strategy
+	// junk); (spec, false) — no source wired, or none that claims the peer —
+	// falls back to the device-global UAPI knobs (jc/jmin/jmax + i1..i5),
+	// i.e. everything configured through UAPI behaves exactly as before.
+	var sendBuffer [][]byte
+	if spec, ok := peer.junkSpec(); ok {
+		sendBuffer = append(sendBuffer, peer.device.specIPacketBuffers(spec.I)...)
+		sendBuffer = append(sendBuffer, peer.device.junkPackets(spec.Jc, spec.Jmin, spec.Jmax)...)
+	} else {
+		sendBuffer = append(sendBuffer, peer.device.iPacketBuffers(peer.device.ipackets)...)
+		sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
+	}
+
+	sendBuffer = append(sendBuffer, buf)
 
 	eps := make([]conn.Endpoint, len(sendBuffer))
 	for i := range eps {

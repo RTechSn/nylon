@@ -22,11 +22,12 @@ type Peer struct {
 	keypairs          Keypairs
 	handshake         Handshake
 	device            *Device
-	stopping          sync.WaitGroup           // routines pending stop
-	txBytes           atomic.Uint64            // bytes send to peer (endpoint)
-	rxBytes           atomic.Uint64            // bytes received from peer
-	lastHandshakeNano atomic.Int64             // nano seconds since epoch
-	hop               atomic.Pointer[hopState] // port hopping state (nil = stock endpoint behaviour)
+	stopping          sync.WaitGroup            // routines pending stop
+	txBytes           atomic.Uint64             // bytes send to peer (endpoint)
+	rxBytes           atomic.Uint64             // bytes received from peer
+	lastHandshakeNano atomic.Int64              // nano seconds since epoch
+	hop               atomic.Pointer[hopState]  // port hopping state (nil = stock endpoint behaviour)
+	junk              atomic.Pointer[junkState] // per-peer junk source state (nil = stock device knobs)
 
 	endpoints struct {
 		sync.Mutex

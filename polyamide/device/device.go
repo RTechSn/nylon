@@ -129,6 +129,15 @@ type Device struct {
 
 	ipackets [5]*obfChain
 
+	// ichains caches parsed i-packet obfuscation chains per distinct spec
+	// string (chains are immutable): the per-peer junk hook feeds spec
+	// STRINGS on the send path, parsed once per distinct spec instead of
+	// once per handshake (see Device.chainFor).
+	ichains struct {
+		mu sync.Mutex
+		m  map[string]*obfChain
+	}
+
 	headerProtection struct {
 		sync.RWMutex
 		key HeaderCipherKey

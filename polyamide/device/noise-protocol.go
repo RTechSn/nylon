@@ -6,7 +6,6 @@
 package device
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -629,19 +628,12 @@ func (peer *Peer) ReceivedWithKeypair(receivedKeypair *Keypair) bool {
 	return true
 }
 
+// JunkPackets draws the device-configured junk datagram stream (the
+// UAPI jc/jmin/jmax knobs): jc datagrams of sizes drawn from [jmin, jmax).
+// The per-peer junk hook (JunkSource) drives the same draw with a spec's
+// trio through Device.junkPackets.
 func (device *Device) JunkPackets() [][]byte {
-	var bufs [][]byte
-
-	min := device.junk.min.Load()
-	max := device.junk.max.Load()
-
-	for range device.junk.count.Load() {
-		buf := make([]byte, min+fastrandn(max-min))
-		rand.Read(buf)
-		bufs = append(bufs, buf)
-	}
-
-	return bufs
+	return device.junkPackets(device.junk.count.Load(), device.junk.min.Load(), device.junk.max.Load())
 }
 
 func (device *Device) HeaderProtectionCipher(salt []byte) (*chacha20.Cipher, error) {
