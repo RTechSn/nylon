@@ -1,6 +1,15 @@
 # Per-Strategy Junk — Design & Work Plan
 
-Status: **planned — not implemented** · Branch: `feat/strategy-junk` (based on `feat/strategy-mode`, PR #8; rebase onto `main` once #8 merges) · Scope: the sender-local junk stream (`jc`/`jmin`/`jmax` and `i1`–`i5`) becomes a property of the obf strategy carrying the connection.
+Status: **implemented (stages 1–4; the vibe1 field gate pending)** · Branch: `feat/strategy-junk` (rebased on `main` with PR #8) · Scope: the sender-local junk stream (`jc`/`jmin`/`jmax` and `i1`–`i5`) becomes a property of the obf strategy carrying the connection.
+
+Implementation record (commits on this branch):
+
+- **Stage 1** `feat(obf): per-strategy junk resolution` — `state.StrategyJunkOf` (one strategy's effective junk, defaults folded per field, idempotently over raw or resolved maps); `state.EffectiveStrategyJunk` became the device-fallback resolver (agreed → obf default → none) and lost its error; the seal-time agreement error is gone (the rig config that failed now seals — pinned as the acceptance case); every strategy's i-specs validate through `device.ValidateObfSpec`.
+- **Stage 2** `feat(device): the per-peer JunkSource hook` — `polyamide/device/junk.go` (JunkSpec, JunkSource, JunkLabeler, the chain cache, the spec-driven draw); `SendHandshakeInitiation` consults the hook BELOW the endpoint selection (the strategy adoption ordering); the i-chain parse is once per distinct spec; UAPI behaviour byte-identical without a hook.
+- **Stage 3** `feat(core): per-strategy junk wiring` — `portFactory.JunkFor`/`JunkLabel` (device.JunkSource/JunkLabeler) with the per-strategy specs cached in `refreshGroups` (dispatch loop) and read under `f.mu` on the send path; `wireDevPeer` wires the hook, the drop paths unwire it; the UAPI dump surfaces `junk_hook`/`junk_strategy`/`junk_jc`/`junk_jmin`/`junk_jmax`/`junk_i1..i5` per peer next to the hop lines; the rotation and fallback journals name the junk; the deadlock-pattern test extends to the consult.
+- **Stage 4** proof & docs — `interop/awgref`: a junk-free-knob nylon device with the hook driving the wire junk completes the handshake and exchanges data with the upstream reference (which drops the junk), and the session survives a live spec switch; `integration/strategy_junk_test.go`: random-mode rotations across strategies with different junk keep the session (no re-handshake) while data flows and the hook serves each strategy's own spec; `docs/guides/obfuscation.mdx` and `docs/reference/config.mdx` document per-strategy junk and the fallback rules.
+
+Remaining: the vibe1 field gate (the original failing central.yaml under `strategy_mode: random`, ping surviving the switches, the journal showing the junk switching with the strategy).
 
 ## 1. Problem
 
@@ -75,15 +84,15 @@ New file `polyamide/device/junk.go`, mirroring `hop.go`:
 // JunkSpec is a resolved sender-local junk configuration: the AWG J trio plus
 // the i1..i5 packet specs ("" = unset). The zero value emits no junk.
 type JunkSpec struct {
-	Jc, Jmin, Jmax uint32
-	I              [5]string
+        Jc, Jmin, Jmax uint32
+        I              [5]string
 }
 
 // JunkSource supplies the junk prepended to every handshake initiation toward
 // one peer. Implemented by the nylon core (per-strategy junk). Implementations
 // MUST be safe for concurrent use and fast (no I/O): called from the send path.
 type JunkSource interface {
-	JunkFor(peer *Peer) (JunkSpec, bool)
+        JunkFor(peer *Peer) (JunkSpec, bool)
 }
 
 func (peer *Peer) SetJunkSource(src JunkSource) // nil = stock device knobs
