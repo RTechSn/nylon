@@ -109,6 +109,33 @@ type portFactory struct {
 	policies        map[string]state.PortHoppingPolicy
 	currentStrategy string
 
+	// strategy selection state (config: obf.strategy_mode — the connect
+	// half chooses WHICH strategy carries each new connection; the rotation
+	// policy above governs WHEN the carrying endpoint rotates within it):
+	//
+	// lastGoodStrategy is the trial-mode memory — the strategy of the last
+	// CONFIRMED connection (the peer was heard back on a carrying endpoint
+	// of it; see noteHeardBack). Trial-mode draws prefer it — reconnects
+	// and rotations alike first use the proven one. It is maintained in
+	// every mode (a live mode switch starts with the knowledge already in
+	// hand) and only consumed by trial.
+	//
+	// lastGoodCondemned carries the two-strike verdict toward demotion
+	// (reconcileLinks): the carrying link of the remembered strategy died —
+	// the reconnect still retries the strategy first; a second death while
+	// condemned, without a confirmation in between (noteHeardBack redeems),
+	// demotes the memory and the selection returns to the random
+	// iteration. A budget rotation that exhausts its endpoint before a
+	// pong arrives is NOT a death: only the liveness model (the same
+	// signals that drive reactive rotation) condemns.
+	lastGoodStrategy  string
+	lastGoodCondemned bool
+
+	// strategyGroups caches each strategy's resolved pool groups, computed
+	// by refreshGroups on the dispatch loop; the send path only READS it
+	// (strategy-restricted draws never resolve on the send path).
+	strategyGroups map[string][]state.PortGroup
+
 	// rotation policy of the CURRENT carrying candidate's strategy (see
 	// policies); the mode governs WHEN the carrying endpoint rotates
 	mode       string        // static | reactive | proactive | timed
@@ -276,6 +303,167 @@ type hopCandidate struct {
 	policy   state.PortHoppingPolicy
 }
 
+// distinctStrategiesLocked returns the candidate set's distinct strategy
+// names in candidate order (config order: endpoints first, then the tag
+// order as written) — the strategy "list" the selection modes read. Callers
+// hold f.mu.
+func (f *portFactory) distinctStrategiesLocked() []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, c := range f.candidates {
+		if _, ok := seen[c.strategy]; ok {
+			continue
+		}
+		seen[c.strategy] = struct{}{}
+		out = append(out, c.strategy)
+	}
+	return out
+}
+
+// strategyGroupsOf returns the cached resolved groups of one strategy (nil
+// when the strategy has no resolvable groups — a hostname mid-resolution, or
+// a strategy the config no longer carries). Send-path safe: a cached map
+// read; a factory that was never refreshed (a literal before its first
+// refresh pass — the production path builds the cache in getPortFactory
+// before the first bootstrap) builds it once on first use, resolving literal
+// hosts inline and hostnames through the shared resolver's cache exactly
+// like refreshGroups on the dispatch loop (the send path already resolves
+// candidate hosts the same way through strategyForAp/adoptCurrent).
+func (f *portFactory) strategyGroupsOf(strategy string) []state.PortGroup {
+	f.mu.Lock()
+	cached := f.strategyGroups
+	f.mu.Unlock()
+	if cached == nil {
+		f.refreshGroups()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.strategyGroups[strategy]
+}
+
+// selectStrategyLocked chooses the strategy for the next connection attempt
+// under the configured obf.strategy_mode. hard names strategies whose groups
+// already failed this draw (never re-picked within one draw); soft names the
+// outgoing connection's strategy (a change preference — random and the trial
+// iteration prefer a strategy other than the outgoing one while any remains).
+// Returns "" when hard exhausts the list. Callers hold f.mu.
+//
+//   - fixed: the first strategy of the candidate list, always.
+//   - random: a uniform random strategy per connection.
+//   - trial: the remembered confirmed strategy (lastGood) while it is
+//     selectable — reconnects and rotations alike first use the proven one;
+//     otherwise the random iteration.
+func (f *portFactory) selectStrategyLocked(hard, soft map[string]struct{}) string {
+	names := f.distinctStrategiesLocked()
+	avail := make([]string, 0, len(names))
+	for _, n := range names {
+		if _, done := hard[n]; done {
+			continue
+		}
+		avail = append(avail, n)
+	}
+	if len(avail) == 0 {
+		return ""
+	}
+	mode := f.n.ObfStrategyMode()
+	if mode == state.StrategyModeFixed {
+		// fixed ignores the change preference: the first strategy of the
+		// list, always — a rotation may exhaust it, but never switch away
+		return avail[0]
+	}
+	if mode == state.StrategyModeTrial && f.lastGoodStrategy != "" {
+		for _, n := range avail {
+			if n == f.lastGoodStrategy {
+				return n
+			}
+		}
+	}
+	pool := avail
+	if len(soft) > 0 && len(avail) > 1 {
+		filtered := make([]string, 0, len(avail))
+		for _, n := range avail {
+			if _, out := soft[n]; !out {
+				filtered = append(filtered, n)
+			}
+		}
+		if len(filtered) > 0 {
+			pool = filtered
+		}
+	}
+	return pool[rand.IntN(len(pool))]
+}
+
+// drawCarrying draws a fresh carrying endpoint under the configured strategy
+// selection: the strategy is chosen per obf.strategy_mode, then the port
+// within that strategy's cached groups (the pool's diversity selection
+// restricted to them). When the chosen strategy's ports are exhausted (all
+// cooling), the selection re-runs on the remaining strategies — fixed never
+// switches — until one serves a draw or every strategy is exhausted (the
+// caller's recycle/stall path then applies, as before). Send-path safe: only
+// cached strategy groups and the pool's own locking.
+func (f *portFactory) drawCarrying(avoid []netip.AddrPort) (netip.AddrPort, error) {
+	hard := map[string]struct{}{}
+	for {
+		f.mu.Lock()
+		soft := map[string]struct{}{}
+		if f.current.IsValid() && f.currentStrategy != "" {
+			soft[f.currentStrategy] = struct{}{}
+		}
+		strategy := f.selectStrategyLocked(hard, soft)
+		f.mu.Unlock()
+		if strategy == "" {
+			return netip.AddrPort{}, state.ErrPoolExhausted
+		}
+		groups := f.strategyGroupsOf(strategy)
+		if len(groups) == 0 {
+			// no resolvable groups for the strategy yet (hostname mid-resolution,
+			// or the config dropped it): try the others, same as an exhausted draw
+			hard[strategy] = struct{}{}
+			continue
+		}
+		ap, err := f.pool.SelectFrom(groups, avoid)
+		if err == nil {
+			return ap, nil
+		}
+		// the strategy's ports are all cooling: NOT a strategy failure (no
+		// attempt was made — nothing to demote the trial memory for); the
+		// strategy is simply skipped for THIS draw and preferred again once
+		// its cooldown elapses
+		if f.n.ObfStrategyMode() == state.StrategyModeFixed {
+			// fixed never switches strategies: the exhausted first strategy is
+			// the whole answer — the caller's recycle/stall path applies
+			return netip.AddrPort{}, err
+		}
+		hard[strategy] = struct{}{}
+	}
+}
+
+// noteHeardBack records that the peer was heard back from on the given
+// addr:port (an inbound probe from it, or a pong to ours — every nylon packet
+// is authenticated, so hearing from an endpoint means the handshake on it
+// completed). When it is the current carrying endpoint, the connection
+// attempt on it is CONFIRMED: the trial memory adopts the carrying strategy
+// as the proven one (see lastGoodStrategy).
+func (f *portFactory) noteHeardBack(ap netip.AddrPort) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.current.IsValid() || ap != f.current {
+		return
+	}
+	if f.currentStrategy != "" && f.currentStrategy != f.lastGoodStrategy {
+		f.lastGoodStrategy = f.currentStrategy
+		f.lastGoodCondemned = false
+		if f.n.ObfStrategyMode() == state.StrategyModeTrial {
+			f.n.Log.Info("port hop: trial strategy confirmed — reconnects prefer it",
+				"peer", f.node, "strategy", f.currentStrategy, "endpoint", ap.String())
+		}
+		return
+	}
+	// a confirmation on the remembered strategy redeems a pending
+	// condemnation (the retry established — the strategy still works)
+	f.lastGoodCondemned = false
+}
+
 // candidatesOf returns a copy of the configured draw candidates.
 func (f *portFactory) candidatesOf() []hopCandidate {
 	f.mu.Lock()
@@ -369,6 +557,15 @@ func (n *Nylon) getPortFactory(peer state.NodeId, candidates []hopCandidate, poo
 	f.mu.Lock()
 	f.candidates = slices.Clone(candidates)
 	f.policies = candidatePolicies(candidates)
+	// the trial memory only names strategies the peer still carries: a
+	// config change that dropped the remembered strategy resets the
+	// selection to the fresh draw rules
+	if f.lastGoodStrategy != "" && !slices.ContainsFunc(candidates, func(c hopCandidate) bool {
+		return c.strategy == f.lastGoodStrategy
+	}) {
+		f.lastGoodStrategy = ""
+		f.lastGoodCondemned = false
+	}
 	// the pool hygiene knobs are the conservative maximum across the
 	// candidate strategies (the pool is one object; the WHEN knobs stay
 	// per-strategy through syncStrategyLocked)
@@ -470,20 +667,24 @@ func (f *portFactory) adoptCurrent(ap netip.AddrPort) {
 
 // drawAndMaterialize draws a fresh carrying endpoint (if the pool has usable
 // groups) and materialises its link, mirroring NextHopEndpoint without
-// retiring anything. In static mode the draw is the pinned endpoint instead
-// of a pool selection. Runs on the dispatch loop.
+// retiring anything. In static mode the draw is the pinned endpoint of the
+// selected strategy instead of a pool selection. Runs on the dispatch loop.
 func (f *portFactory) drawAndMaterialize() {
 	f.mu.Lock()
 	mode := f.mode
+	strategy := f.selectStrategyLocked(nil, nil)
 	avoid := make([]netip.AddrPort, 0, 1)
 	if f.current.IsValid() {
 		avoid = append(avoid, f.current)
 	}
 	f.mu.Unlock()
+	if strategy == "" {
+		return // no candidates (or none resolvable yet): retried on the next pass
+	}
 
 	var ap netip.AddrPort
 	if mode == state.HopModeStatic {
-		pinned, ok := f.pinnedEndpoint()
+		pinned, ok := f.pinnedEndpointOf(strategy)
 		if !ok {
 			// no candidate resolvable yet (hostname resolving): retried on
 			// the next SyncApplicationState pass
@@ -491,7 +692,7 @@ func (f *portFactory) drawAndMaterialize() {
 		}
 		ap = pinned
 	} else {
-		drawn, err := f.pool.Select(avoid)
+		drawn, err := f.drawCarrying(avoid)
 		if err != nil {
 			// pool not ready (e.g. hostname still resolving): retried by the
 			// background resolve above and the next SyncApplicationState pass
@@ -504,6 +705,7 @@ func (f *portFactory) drawAndMaterialize() {
 	f.current = ap
 	f.lastProbeAt = time.Now()
 	f.drawsSinceRecycle++
+	strategy = f.currentStrategy // the strategy owning the drawn endpoint (drawCarrying selects its own)
 	f.mu.Unlock()
 	f.registerDrawn(ap)
 	neigh := f.n.RouterState.GetNeighbour(f.node)
@@ -512,19 +714,22 @@ func (f *portFactory) drawAndMaterialize() {
 	}
 	f.materializeCarrying(neigh, ap, netip.AddrPort{})
 	if mode == state.HopModeStatic {
-		f.n.Log.Info("port hop: static carrying endpoint pinned", "peer", f.node, "endpoint", ap.String())
+		f.n.Log.Info("port hop: static carrying endpoint pinned", "peer", f.node, "endpoint", ap.String(), "strategy", strategy)
 	} else {
-		f.n.Log.Info("port hop: initial carrying endpoint selected", "peer", f.node, "endpoint", ap.String())
+		f.n.Log.Info("port hop: initial carrying endpoint selected", "peer", f.node, "endpoint", ap.String(), "strategy", strategy)
 	}
 }
 
-// pinnedEndpoint returns the static-mode carrying endpoint: the first port
-// of the first resolvable candidate (config order: endpoints first, then
-// strategy order within an endpoint). The listen half serves every port of
-// every strategy (sockets mode binds them all; nftables mode redirects them
-// all), so the first port is always a valid wire target.
-func (f *portFactory) pinnedEndpoint() (netip.AddrPort, bool) {
+// pinnedEndpointOf returns the static-mode carrying endpoint of the given
+// strategy: the first port of its first resolvable candidate (config order:
+// endpoints first, then the tag order as written). The listen half serves
+// every port of every strategy (sockets mode binds them all; nftables mode
+// redirects them all), so the first port is always a valid wire target.
+func (f *portFactory) pinnedEndpointOf(strategy string) (netip.AddrPort, bool) {
 	for _, c := range f.candidatesOf() {
+		if c.strategy != strategy {
+			continue
+		}
 		addr, ok := f.resolveCandidateAddr(c)
 		if !ok {
 			continue
@@ -551,23 +756,29 @@ func (n *Nylon) dropPortFactory(peer state.NodeId) {
 
 // refreshGroups re-resolves the configured candidates into pool groups
 // (literal IPs parse directly; hostnames go through the shared resolver and
-// follow its cache expiry).
+// follow its cache expiry) and caches the per-strategy group subsets the
+// strategy-restricted draws read (obf.strategy_mode; see strategyGroups).
 func (f *portFactory) refreshGroups() {
 	candidates := f.candidatesOf()
 
 	groups := make([]state.PortGroup, 0, len(candidates))
+	perStrategy := make(map[string][]state.PortGroup, len(candidates))
 	for _, c := range candidates {
 		addr, ok := f.resolveCandidateAddr(c)
 		if !ok {
 			continue
 		}
 		groups = append(groups, state.PortGroup{Addr: addr, Ports: c.ports})
+		perStrategy[c.strategy] = append(perStrategy[c.strategy], state.PortGroup{Addr: addr, Ports: c.ports})
 	}
 	if !slices.EqualFunc(f.pool.Groups(), groups, func(a, b state.PortGroup) bool {
 		return a.Addr == b.Addr && a.Ports == b.Ports
 	}) {
 		f.pool.SetGroups(groups)
 	}
+	f.mu.Lock()
+	f.strategyGroups = perStrategy
+	f.mu.Unlock()
 }
 
 // resolveCandidateAddr resolves the host part of a candidate to an address.
@@ -682,7 +893,7 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	}
 	f.mu.Unlock()
 
-	ap, err := f.pool.Select(avoid)
+	ap, err := f.drawCarrying(avoid)
 	if err != nil {
 		// recycle_seconds: every port is cooling down and the operator
 		// opted into clean-slate restarts — release the retired ports and
@@ -702,20 +913,20 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 			// retry the draw regardless: a concurrent rotation may have
 			// won the recycle (cleared == 0) — the pool is on a clean
 			// slate either way
-			ap, err = f.pool.Select(avoid)
+			ap, err = f.drawCarrying(avoid)
 		}
 	}
 	if err != nil {
 		f.warnPoolExhausted(err)
 		return nil, err
 	}
+	f.adoptCurrent(ap)
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
 	f.drawsSinceRecycle++
 	f.mu.Unlock()
 	f.registerDrawn(ap)
-	f.adoptCurrent(ap)
 	// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
 	// device.net READ lock. Never call n.Device.Bind() here — it takes the
 	// device.net WRITE lock and self-deadlocks. Use the cached bind.
@@ -733,9 +944,26 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 
 // staticCarrying parses and returns the pinned static-mode carrying
 // endpoint, recording it as the factory's current. Never retires anything:
-// there is nothing to rotate to.
+// there is nothing to rotate to. The connection's strategy is selected once
+// (on the first send or the eager bootstrap, whichever wins) and stays sticky
+// for the pin's lifetime — the static pin never rotates, so the selection
+// never re-runs while the pin holds.
 func (f *portFactory) staticCarrying() (conn.Endpoint, error) {
-	ap, ok := f.pinnedEndpoint()
+	f.mu.Lock()
+	strategy := f.currentStrategy
+	if strategy == "" {
+		// connection establishment on the send path (the first send beat the
+		// eager bootstrap): select the strategy once under obf.strategy_mode
+		strategy = f.selectStrategyLocked(nil, nil)
+		if strategy != "" {
+			f.syncStrategyLocked(strategy, time.Now())
+		}
+	}
+	f.mu.Unlock()
+	if strategy == "" {
+		return nil, errors.New("port hop: no strategy candidates for the static carrying endpoint")
+	}
+	ap, ok := f.pinnedEndpointOf(strategy)
 	if !ok {
 		return nil, errors.New("port hop: no resolvable range spec for the static carrying endpoint")
 	}
@@ -750,8 +978,11 @@ func (f *portFactory) staticCarrying() (conn.Endpoint, error) {
 	}
 	f.adoptCurrent(ap)
 	f.mu.Lock()
-	f.current = ap
-	f.lastProbeAt = time.Now()
+	if f.current != ap {
+		// a new (or moved) pin is a new connection attempt
+		f.current = ap
+		f.lastProbeAt = time.Now()
+	}
 	f.mu.Unlock()
 	return ep, nil
 }
@@ -771,13 +1002,14 @@ func (f *portFactory) logRotation(ap netip.AddrPort) {
 	reason := f.rotateReason
 	f.rotateReason = ""
 	mode := f.mode
+	strategy := f.currentStrategy
 	emit := mode == state.HopModeReactive || now.Sub(f.lastRotationLog) >= hopRotationLogInterval
 	if emit {
 		count := f.rotationCount
 		f.rotationCount = 0
 		f.lastRotationLog = now
 		f.mu.Unlock()
-		attrs := []any{"peer", f.node, "endpoint", ap.String(), "rotations", count}
+		attrs := []any{"peer", f.node, "endpoint", ap.String(), "strategy", strategy, "rotations", count}
 		if reason != "" {
 			attrs = append(attrs, "reason", reason)
 		}
@@ -785,7 +1017,7 @@ func (f *portFactory) logRotation(ap netip.AddrPort) {
 		return
 	}
 	f.mu.Unlock()
-	f.n.Log.Debug("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String())
+	f.n.Log.Debug("port hop: carrying endpoint rotated", "peer", f.node, "endpoint", ap.String(), "strategy", strategy)
 }
 
 // recycleGate decides and atomically claims the opt-in auto-recycle
@@ -888,7 +1120,10 @@ func (f *portFactory) reconcileLinks() {
 	// may have moved or invalidated it — retire the stale carrying link and
 	// let the next pass re-pin through bootstrap.
 	if mode == state.HopModeStatic && current.IsValid() {
-		if pinned, ok := f.pinnedEndpoint(); !ok || pinned != current {
+		f.mu.Lock()
+		curStrategy := f.currentStrategy
+		f.mu.Unlock()
+		if pinned, ok := f.pinnedEndpointOf(curStrategy); !ok || pinned != current {
 			for _, ep := range neigh.Eps {
 				if ep.IsRemote() || ep.IsExhausted() {
 					continue
@@ -950,6 +1185,8 @@ func (f *portFactory) reconcileLinks() {
 		// but if it does, do not rank a burned port: the tombstone removal
 		// will reap it and the next pass materialises a fresh link.
 		f.n.Log.Debug("port hop: carrying link is exhausted, awaiting re-materialisation", "peer", f.node, "endpoint", curAddr)
+	} else {
+		f.judgeTrialStrategy(curLink)
 	}
 
 	// Tombstone every other hop link of this peer: they belong to ports the
@@ -986,6 +1223,49 @@ func (f *portFactory) reconcileLinks() {
 		f.n.scheduleExhaustedLinkRemoval(f.node, nep.Address)
 		f.n.Log.Debug("port hop: retired carrying link tombstoned", "peer", f.node, "endpoint", nep.Address)
 	}
+}
+
+// judgeTrialStrategy runs the trial memory's death verdict on the current
+// carrying link: the SAME liveness model that drives reactive rotation (no
+// traffic heard back for link_dead_threshold — Metric() == INF — or a probe
+// streak) condemns the remembered strategy. One death does NOT demote — the
+// reconnect still retries the strategy first ("при переподключении выбирать
+// сначала ту же стратегию"); a SECOND death while condemned, without a
+// confirmation in between (noteHeardBack redeems), demotes the memory and
+// the selection returns to the random iteration. Endpoint exhaustion alone
+// (a budget rotation that outruns its pong) never condemns: under load a
+// 12-packet budget burns faster than any RTT, and demoting on it would turn
+// trial into random exactly when rotation storms run. Runs on the dispatch
+// loop (reconcileLinks).
+func (f *portFactory) judgeTrialStrategy(curLink state.Endpoint) {
+	if curLink == nil || curLink.IsExhausted() {
+		return
+	}
+	f.mu.Lock()
+	strategy, lastGood := f.currentStrategy, f.lastGoodStrategy
+	f.mu.Unlock()
+	if strategy == "" || strategy != lastGood {
+		return // not the remembered strategy: nothing to condemn
+	}
+	nep := curLink.AsNylonEndpoint()
+	if time.Since(nep.FirstSeen()) <= f.n.RouterTunables.LinkDeadThreshold {
+		return // young links get time to prove themselves first
+	}
+	if curLink.Metric() < state.INF && nep.ProbeStreak() < hopReactiveProbeStreak {
+		return // alive: nothing to condemn
+	}
+	f.mu.Lock()
+	if f.lastGoodCondemned {
+		f.lastGoodStrategy = ""
+		f.lastGoodCondemned = false
+		f.n.Log.Info("port hop: trial strategy demoted — the retry on it died without confirmation, back to iteration",
+			"peer", f.node, "strategy", strategy)
+	} else {
+		f.lastGoodCondemned = true
+		f.n.Log.Info("port hop: trial strategy condemned — the carrying link died; the reconnect retries it first",
+			"peer", f.node, "strategy", strategy)
+	}
+	f.mu.Unlock()
 }
 
 // externalRotationDue reports whether an externally driven rotation
@@ -1335,7 +1615,17 @@ func (n *Nylon) logStrategyHopPolicies() {
 			delete(n.portHopping.appliedPolicies, name)
 		}
 	}
+	// the strategy selection mode rides the same journal cadence: one line
+	// whenever the effective mode changes (startup, config update)
+	mode, modeChanged := n.ObfStrategyMode(), false
+	if mode != n.portHopping.appliedStrategyMode {
+		n.portHopping.appliedStrategyMode = mode
+		modeChanged = true
+	}
 	n.portHopping.mu.Unlock()
+	if modeChanged {
+		n.Log.Info("obf strategy mode applied", "mode", mode)
+	}
 	for _, name := range used {
 		if !changed[name] {
 			continue
@@ -1379,6 +1669,21 @@ func (n *Nylon) hopOwnedEndpoint(peer state.NodeId, ap netip.AddrPort) bool {
 		return false
 	}
 	return f.ownsOrDrew(ap)
+}
+
+// noteHopHeardBack records that the peer was heard back from on the given
+// addr:port (an inbound probe from it, or a pong to one of ours) — the
+// factory's confirmation signal that the connection attempt on its current
+// carrying endpoint established (see portFactory.noteHeardBack; the trial
+// strategy selection pins the confirmed strategy).
+func (n *Nylon) noteHopHeardBack(peer state.NodeId, ap netip.AddrPort) {
+	n.portHopping.mu.Lock()
+	f, ok := n.portHopping.factories[peer]
+	n.portHopping.mu.Unlock()
+	if !ok {
+		return
+	}
+	f.noteHeardBack(ap)
 }
 
 // hopProbeReady reports whether the link with the given address is due for

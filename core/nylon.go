@@ -52,6 +52,9 @@ type Nylon struct {
 		// signature per obf strategy (change detection for the
 		// "port hop policy applied" lines — one per strategy)
 		appliedPolicies map[string]string
+		// appliedStrategyMode carries the last-journalled strategy selection
+		// mode (change detection for the "obf strategy mode applied" line)
+		appliedStrategyMode string
 
 		// hintSigs carries the per-peer data-arrival adoption slot (see
 		// hopAdoptDataArrival): a lock-free sync.Map read on the TC hot path

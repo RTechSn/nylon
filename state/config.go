@@ -75,6 +75,11 @@ type CentralObf struct {
 	// Strategy is the named obf strategy map; referenced per endpoint as
 	// host[strategy1,strategy2] (untagged / "[*]" = all strategies).
 	Strategy map[string]*ObfStrategy `yaml:"strategy,omitempty"`
+	// StrategyMode is the strategy selection principle for new connections
+	// (obf.strategy_mode): fixed (default) | random | trial; `rated` is
+	// reserved. Required when the mesh defines more than one strategy —
+	// see ValidateObfStrategies.
+	StrategyMode string `yaml:"strategy_mode,omitempty"`
 }
 
 // ObfStrategies returns the named obf strategy map of the global `obf` block
@@ -84,6 +89,22 @@ func (c *CentralCfg) ObfStrategies() map[string]*ObfStrategy {
 		return nil
 	}
 	return c.Obf.Strategy
+}
+
+// ObfStrategyMode returns the resolved strategy selection mode of the global
+// `obf` block: an absent block or value resolves to fixed. Unknown values
+// (a live-swapped config that slipped past validation) also resolve to fixed —
+// validation owns the loud error; the runtime never wedges on a bad value.
+func (c *CentralCfg) ObfStrategyMode() string {
+	if c == nil || c.Obf == nil {
+		return StrategyModeFixed
+	}
+	switch c.Obf.StrategyMode {
+	case StrategyModeRandom, StrategyModeTrial:
+		return c.Obf.StrategyMode
+	default:
+		return StrategyModeFixed
+	}
 }
 
 // Profile returns the mesh-wide AWG 2.0 S/H handshake dialect from the global
@@ -255,6 +276,60 @@ func ValidateHopMode(mode string) error {
 		return fmt.Errorf("port_hopping_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, HopModes())
 	}
 	return fmt.Errorf("unknown port_hopping_mode %q (want one of %v)", mode, HopModes())
+}
+
+// Strategy selection modes (obf.strategy_mode) decide WHICH obf strategy a
+// new connection uses — the connect half of the strategy model. Where
+// port_hopping_mode governs WHEN the carrying endpoint rotates (within the
+// strategy's ports), strategy_mode governs the strategy choice per
+// connection: every drawn carrying endpoint is one connection (one UDP flow
+// through the middleboxes), so the mode applies on every draw.
+const (
+	// StrategyModeFixed uses the FIRST strategy of the endpoint's list
+	// (config order: endpoints first, then the tag order as written) for
+	// every connection. Default; the deterministic, predictable pin.
+	StrategyModeFixed = "fixed"
+	// StrategyModeRandom draws a random strategy for every connection,
+	// preferring one other than the outgoing connection's when the peer
+	// names more than one.
+	StrategyModeRandom = "random"
+	// StrategyModeTrial iterates randomly until a connection establishes
+	// (the carrying endpoint is heard back on — the handshake completed);
+	// the confirmed strategy is remembered, and every later connection
+	// (reconnects and rotations alike) first uses it. When an attempt on the
+	// remembered strategy exhausts without confirmation, the memory is
+	// demoted and the random iteration resumes.
+	StrategyModeTrial = "trial"
+
+	// StrategyModeRated is a reserved mode name: strategy rating by measured
+	// connection performance. Parseable, but rejected by validation until
+	// the implementing branch lands (same contract as the reserved hop
+	// modes).
+	StrategyModeRated = "rated" // rating by measured performance — not implemented yet
+)
+
+// StrategyModes lists the implemented obf.strategy_mode values.
+func StrategyModes() []string {
+	return []string{StrategyModeFixed, StrategyModeRandom, StrategyModeTrial}
+}
+
+// ReservedStrategyModes lists the obf.strategy_mode values reserved for
+// future branches.
+func ReservedStrategyModes() []string {
+	return []string{StrategyModeRated}
+}
+
+// ValidateStrategyMode checks an obf.strategy_mode value: implemented modes
+// pass, reserved names get a dedicated not-yet-implemented error, anything
+// else is unknown.
+func ValidateStrategyMode(mode string) error {
+	if slices.Contains(StrategyModes(), mode) {
+		return nil
+	}
+	if slices.Contains(ReservedStrategyModes(), mode) {
+		return fmt.Errorf("strategy_mode %q is reserved for a future release and not implemented yet (this build implements %v)", mode, StrategyModes())
+	}
+	return fmt.Errorf("unknown strategy_mode %q (want one of %v)", mode, StrategyModes())
 }
 
 // PortHoppingCfg is the client-side port rotation policy for peers whose

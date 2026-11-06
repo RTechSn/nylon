@@ -243,6 +243,12 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+  # Strategy selection for new connections (which obf strategy carries each
+  # connection): fixed (the first strategy of the endpoint's list) | random
+  # (a random strategy per connection) | trial (iterate randomly until a
+  # connection establishes, then prefer the confirmed strategy; re-search on
+  # failure). REQUIRED when the mesh defines more than one strategy.
+  strategy_mode: trial
   # Named obf strategies: each entry bundles the ports a node listens on /
   # connects through, the client-side rotation policy for those ports, and the
   # sender-local junk (jc/jmin/jmax and i1-i5). Endpoints reference strategies
@@ -307,6 +313,17 @@ Strategies are the multi-level named list inside the global `obf:` block (`obf.s
 
 **Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
 
+**Strategy selection** (`obf.strategy_mode`): decides WHICH strategy carries each new connection — every drawn carrying endpoint is one connection (one UDP flow through the middleboxes), so the mode applies on every draw. Orthogonal to `port_hopping_mode`, which decides WHEN the carrying endpoint rotates *within* the selected strategy's ports.
+
+| Value    | Behavior                                                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `fixed`  | every connection uses the FIRST strategy of the endpoint's list (config order: endpoints first, then the tag order as written) |
+| `random` | every connection draws a random strategy, preferring one other than the outgoing connection's when the endpoint names more than one |
+| `trial`  | iterate randomly until a connection establishes (the carrying endpoint is heard back on — the handshake completed); the confirmed strategy is remembered, and every later connection — reconnects and rotations alike — first uses it. A carrying-link death (the same liveness model that drives reactive rotation) condemns the memory: the reconnect still retries the strategy first, and only a second death without a confirmation in between demotes it — the random iteration resumes |
+| `rated`  | reserved: strategy rating by measured connection performance — parses, but validation rejects it as not implemented yet                              |
+
+The mode is required when the mesh defines more than one strategy (this build replaced the former implicit behavior — rotations drew across all strategies uniformly — with an explicit choice, like `port_hopping_mode` before it), and dead config when the mesh defines none. An explicit tag list is the operator's preference order: `fixed` pins the first as written, while untagged hosts and `[*]` use the strategies in sorted (map) order.
+
 **Wire reality**: the AWG 2.0 device speaks exactly ONE handshake dialect (the mesh-wide S/H inline in `obf:`) and emits ONE junk configuration — the `jc`/`jmin`/`jmax` stream plus one I-packet set, sent toward EVERY peer, not per strategy. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single junk set — validation rejects conflicting `jc`/`jmin`/`jmax` or `i1`-`i5` with the strategies named. A strategy without junk params simply emits no junk. Receivers discard junk unclassified, so two nodes may still draw their junk from different strategies.
 
 **Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message. The strategy `protocol` label and the `jc`/`jmin`/`jmax` trio on the mesh-wide profile were dropped in the same reform — the strategy NAME is the identifier, and the junk trio moved onto the strategy itself. The intermediate `awg_profile:` top-level key (the first reform draft) folded into `obf:` — nest `s1`–`s4`/`h1`–`h4` directly under `obf:` and strategies under `obf.strategy:`; strict decoding rejects the old placement with an unknown-field error.
@@ -321,7 +338,7 @@ Three forms exist (IPv6 hosts bracketed as usual: `[2001:db8::1]:51820`, `[2001:
 | --------------------- | ------------------------------------------------------------------------------------------------ |
 | `host:port`           | raw fixed-port endpoint, no strategy; a stock configured link                                     |
 | `host`                | bare host: every strategy's ports when the mesh defines any, else the default port (57175)          |
-| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies; `host[*]` is the same as untagged        |
+| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies, in the written order (the preference order `strategy_mode: fixed` pins); `host[*]` is the same as untagged |
 
 Inline port ranges (`host:30000-40000`) moved into strategies and are rejected with a migration error; combining an explicit port with tags (`host:9000[s1]`) is a contradiction and is rejected too.
 
