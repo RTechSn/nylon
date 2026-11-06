@@ -131,6 +131,14 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 }
 
 func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
+	return peer.sendBuffers(buffers, eps, nil)
+}
+
+// sendBuffers sends parallel buffer/endpoint arrays, optionally with a
+// parallel TOS array (nil or all-zero = everything unmarked; see
+// conn.TOSBind). Contiguous runs sharing (endpoint, TOS) go out as one
+// batch; a run with a nonzero TOS is stamped on the outer datagrams.
+func (peer *Peer) sendBuffers(buffers [][]byte, eps []conn.Endpoint, tos []byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
 
@@ -162,13 +170,15 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 	// batch) when the budget is spent
 	peer.hopAccountSend(eps)
 
-	// optimization, if multiple contiguous buffers share the same endpoint, send them in a single batch
+	// optimization, if multiple contiguous buffers share the same endpoint
+	// (and TOS), send them in a single batch
 	prevIdx := 0
 	prevEp := eps[0]
+	prevTOS := tosAt(tos, 0)
 
 	var anyError error
 	for i := 0; i <= len(buffers); i++ {
-		if i == len(buffers) || eps[i] != prevEp {
+		if i == len(buffers) || eps[i] != prevEp || tosAt(tos, i) != prevTOS {
 			// send batch from prevIdx to i-1
 			if prevEp == nil {
 				prevEp = peer.hopCarrying()
@@ -183,16 +193,23 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 				prevIdx = i
 				if i < len(buffers) {
 					prevEp = eps[i]
+					prevTOS = tosAt(tos, i)
 				}
 				continue
 			}
-			err := peer.device.net.bind.Send(buffers[prevIdx:i], prevEp)
+			var err error
+			if tosAt(tos, prevIdx) != 0 {
+				err = peer.sendMarkedBatch(buffers[prevIdx:i], prevEp, tosAt(tos, prevIdx))
+			} else {
+				err = peer.device.net.bind.Send(buffers[prevIdx:i], prevEp)
+			}
 			if err != nil {
 				anyError = err
 			}
 			prevIdx = i
 			if i < len(buffers) {
 				prevEp = eps[i]
+				prevTOS = tosAt(tos, i)
 			}
 		}
 	}
@@ -205,6 +222,20 @@ func (peer *Peer) SendBuffers(buffers [][]byte, eps []conn.Endpoint) error {
 	perf.SentBytesPerSecond.Add(float64(totalLen))
 	peer.txBytes.Add(totalLen)
 	return anyError
+}
+
+// sendMarkedBatch sends one (endpoint, TOS)-homogeneous batch, stamping tos
+// onto every outer datagram through a TOS-capable bind (conn.TOSBind).
+// Binds without per-packet marking (non-Linux platforms) fall back to a
+// plain unmarked send, noted once per device.
+func (peer *Peer) sendMarkedBatch(bufs [][]byte, ep conn.Endpoint, tos byte) error {
+	if tb, ok := peer.device.net.bind.(conn.TOSBind); ok {
+		return tb.SendTOS(bufs, ep, tos)
+	}
+	if !peer.device.net.tosMarkFallback.Swap(true) {
+		peer.device.Log.Verbosef("%v - bind does not support outer DSCP marking (no TOSBind); priority rules apply to in-device batch ordering only", peer)
+	}
+	return peer.device.net.bind.Send(bufs, ep)
 }
 
 func (peer *Peer) GetPublicKey() NoisePublicKey {

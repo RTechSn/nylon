@@ -81,7 +81,7 @@ func NewStdNetBind() Bind {
 				msgs := make([]ipv6.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
+					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize+tosControlSize)
 				}
 				return &msgs
 			},
@@ -382,6 +382,13 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 }
 
 func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
+	return s.sendDatagrams(bufs, endpoint, 0)
+}
+
+// sendDatagrams writes bufs to endpoint, stamping tos (the full TOS byte,
+// e.g. 0xb8 for EF) on every datagram when nonzero — the transport-level
+// half of the in-tunnel QoS marking (see TOSBind / state.PriorityRule).
+func (s *StdNetBind) sendDatagrams(bufs [][]byte, endpoint Endpoint, tos byte) error {
 	s.mu.Lock()
 	blackhole := s.blackhole4
 	conn := s.ipv4
@@ -425,10 +432,19 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 		retried bool
 		err     error
 	)
+	var tosCtl []byte
+	if tos != 0 {
+		tosCtl = tosControlMessage(tos, is6)
+	}
 retry:
 	if offload {
 		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
 		usedMessages = max(usedMessages, n)
+		if tosCtl != nil {
+			for i := 0; i < n; i++ {
+				appendTOSControl(&(*msgs)[i].OOB, tosCtl)
+			}
+		}
 		err = s.send(conn, br, (*msgs)[:n])
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
@@ -448,6 +464,9 @@ retry:
 			(*msgs)[i].Addr = ua
 			(*msgs)[i].Buffers[0] = bufs[i]
 			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
+			if tosCtl != nil {
+				appendTOSControl(&(*msgs)[i].OOB, tosCtl)
+			}
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
 	}

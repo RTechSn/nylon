@@ -79,8 +79,13 @@ container() { echo "$PROJECT-$1"; } # <node> → container name
 upper() { echo "$1" | tr '[:lower:]' '[:upper:]'; }
 
 # ── Docker compose ───────────────────────────────────────────────────
+# Every invocation stamps the checkout's commit into image builds
+# (docker-compose.yml passes it on as a build arg, the Dockerfile bakes it
+# into the binary via buildinfo, and the daemon logs it at startup), so a
+# running stand always names the tree it was built from.
 dc() {
-  docker compose --env-file "$ENV_FILE" -f "$DEMO_DIR/docker-compose.yml" -p "$PROJECT" "$@"
+  NYLON_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo none)" \
+    docker compose --env-file "$ENV_FILE" -f "$DEMO_DIR/docker-compose.yml" -p "$PROJECT" "$@"
 }
 
 # ── Addresses ────────────────────────────────────────────────────────

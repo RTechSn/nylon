@@ -44,6 +44,8 @@ Despite being called a "public" key, the distribution key also acts as the share
    nylon seal -c central.yaml -k dist.key -o central.nybundle
    ```
 
+   `nylon seal` parses the central config **strictly**: a key the schema does not model (a typo, or a section at an unsupported level) fails the seal with an error instead of silently vanishing from the distributed bundle. The receiving side applies the same guarantee — a bundle carrying a field the binary does not know fails the poll loudly and the node keeps its last active config rather than half-applying the update.
+
 3. ### Publish the Bundle
 
    Host `central.nybundle` on any HTTP/HTTPS server (e.g., GitHub Pages, S3, or Nginx).
@@ -84,7 +86,7 @@ Every poll round is visible in the journal, which makes "why is my node still hi
 - `config poll loop started interval=1h0m0s interval_source=central repos=1` — the effective cadence at startup and where it came from (`central` = `dist.interval` of the active central config, `node` = `dist.interval` in `node.yaml`, `default` = built-in 10 seconds).
 - `checking config sources for updates repos=1 interval=1h0m0s interval_source=central` — one record per poll attempt, before the fetches start.
 - `config bundle is not newer than the active config, skipping repo=... bundle_timestamp=... active_timestamp=...` — the source was reached but still serves a bundle that is not newer than the active one. Equal or older timestamps mean the re-seal or re-upload never landed (for example, an edit to the plain `central.yaml` without running `nylon seal`, or a bundle sealed by an older binary that silently drops unknown fields such as `interval`).
-- `failed to fetch config update repo=... err=...` — the source could not be reached or the bundle failed to verify.
+- `failed to fetch config update repo=... err=...` — the source could not be reached, the bundle failed to verify, or its config failed the strict parse (a field this binary does not know — version skew; the node keeps its last active config).
 - `config poll interval changed from=10s to=1h0m0s interval_source=central` — a live interval change distributed inside a config update.
 
 Note that an `interval` added to a served `central.yaml` only takes effect after the bundle carrying it is applied — the apply requires a strictly newer timestamp, so a missing re-seal keeps the old cadence while the log lines above show exactly that.

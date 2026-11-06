@@ -6,9 +6,11 @@
 package bindtest
 
 import (
-	"github.com/encodeous/nylon/polyamide/conn"
 	"net"
 	"net/netip"
+	"sync"
+
+	"github.com/encodeous/nylon/polyamide/conn"
 )
 
 type chanPkt struct {
@@ -26,6 +28,12 @@ type chanPkt struct {
 type ChannelBind2 struct {
 	rx, tx      *chan chanPkt
 	closeSignal chan bool
+
+	// tosMu guards tosCounts: outgoing packet counts per destination
+	// endpoint and TOS byte (test seam for the outer DSCP marking — plain
+	// Send records 0, SendTOS records the stamped byte).
+	tosMu     sync.Mutex
+	tosCounts map[ChannelEndpoint2]map[byte]uint64
 }
 
 type ChannelEndpoint2 netip.AddrPort
@@ -84,6 +92,7 @@ func EndpointDstOf(ep conn.Endpoint) (ChannelEndpoint2, uint16) {
 
 var (
 	_ conn.Bind     = (*ChannelBind2)(nil)
+	_ conn.TOSBind  = (*ChannelBind2)(nil)
 	_ conn.Endpoint = (*ChannelEndpoint2)(nil)
 )
 
@@ -162,23 +171,54 @@ func (c *ChannelBind2) makeReceiveFunc(ch chan chanPkt) conn.ReceiveFunc {
 	}
 }
 
-func (c *ChannelBind2) Send(bufs [][]byte, ep conn.Endpoint) error {
-	var remote ChannelEndpoint2
-	var hint uint16
+// channelEndpointOf unwraps a send-path endpoint into its destination and
+// the source-port hint it carries (0 when absent).
+func channelEndpointOf(ep conn.Endpoint) (ChannelEndpoint2, uint16) {
 	switch e := ep.(type) {
 	case ChannelEndpoint2:
-		remote = e
+		return e, 0
 	case HintedEndpoint:
-		remote, hint = e.Dst, e.SrcPort
+		return e.Dst, e.SrcPort
 	default:
-		// hinted endpoint types from other packages (e.g. the real
-		// conn.TaggedEndpoint): unwrap the destination, carry the port hint
 		ap := ep.DstIPPort()
-		remote = ChannelEndpoint2(ap)
+		remote := ChannelEndpoint2(ap)
 		if h, ok := ep.(interface{ PortHint() uint16 }); ok {
-			hint = h.PortHint()
+			return remote, h.PortHint()
 		}
+		return remote, 0
 	}
+}
+
+// recordTOS notes the TOS byte carried by an outgoing batch (0 for a plain
+// Send).
+func (c *ChannelBind2) recordTOS(remote ChannelEndpoint2, tos byte, n int) {
+	c.tosMu.Lock()
+	defer c.tosMu.Unlock()
+	if c.tosCounts == nil {
+		c.tosCounts = make(map[ChannelEndpoint2]map[byte]uint64)
+	}
+	m := c.tosCounts[remote]
+	if m == nil {
+		m = make(map[byte]uint64)
+		c.tosCounts[remote] = m
+	}
+	m[tos] += uint64(n)
+}
+
+// TOSCounts returns a copy of the per-TOS outgoing packet counts recorded
+// for dst (test seam for the outer DSCP marking path).
+func (c *ChannelBind2) TOSCounts(dst ChannelEndpoint2) map[byte]uint64 {
+	c.tosMu.Lock()
+	defer c.tosMu.Unlock()
+	m := c.tosCounts[dst]
+	out := make(map[byte]uint64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *ChannelBind2) send(bufs [][]byte, remote ChannelEndpoint2, hint uint16) error {
 	for _, b := range bufs {
 		select {
 		case <-c.closeSignal:
@@ -194,6 +234,20 @@ func (c *ChannelBind2) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 	}
 	return nil
+}
+
+func (c *ChannelBind2) Send(bufs [][]byte, ep conn.Endpoint) error {
+	remote, hint := channelEndpointOf(ep)
+	c.recordTOS(remote, 0, len(bufs))
+	return c.send(bufs, remote, hint)
+}
+
+// SendTOS implements conn.TOSBind: a plain send with every datagram stamped
+// tos, recorded per destination for test assertions.
+func (c *ChannelBind2) SendTOS(bufs [][]byte, ep conn.Endpoint, tos byte) error {
+	remote, hint := channelEndpointOf(ep)
+	c.recordTOS(remote, tos, len(bufs))
+	return c.send(bufs, remote, hint)
 }
 
 func (c *ChannelBind2) ParseEndpoint(s string) (conn.Endpoint, error) {

@@ -396,34 +396,48 @@ func (p PrefixHealthWrapper) MarshalYAML() (interface{}, error) {
 }
 
 func (p *PrefixHealthWrapper) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	var raw struct {
-		Type string `yaml:"type"`
-	}
+	// The type peek must go through a map: under a strict decode
+	// (disallowUnknownField) an intermediate struct with fewer keys than
+	// the input would flag every other key as unknown. The concrete decodes
+	// mirror MarshalYAML's shape (type + inlined fields) so every input key
+	// has a matching field and the wrapper roundtrips under strict parsing
+	// too (nylon seal / bundle polls).
+	var raw map[string]any
 	if err := unmarshal(&raw); err != nil {
 		return err
 	}
+	typ, _ := raw["type"].(string)
 
-	switch raw.Type {
+	switch typ {
 	case "static":
-		var sp StaticPrefixHealth
+		var sp struct {
+			Type               string `yaml:"type"`
+			StaticPrefixHealth `yaml:",inline"`
+		}
 		if err := unmarshal(&sp); err != nil {
 			return err
 		}
-		p.PrefixHealth = &sp
+		p.PrefixHealth = &sp.StaticPrefixHealth
 	case "ping":
-		var pp PingPrefixHealth
+		var pp struct {
+			Type             string `yaml:"type"`
+			PingPrefixHealth `yaml:",inline"`
+		}
 		if err := unmarshal(&pp); err != nil {
 			return err
 		}
-		p.PrefixHealth = &pp
+		p.PrefixHealth = &pp.PingPrefixHealth
 	case "http":
-		var hp HTTPPrefixHealth
+		var hp struct {
+			Type             string `yaml:"type"`
+			HTTPPrefixHealth `yaml:",inline"`
+		}
 		if err := unmarshal(&hp); err != nil {
 			return err
 		}
-		p.PrefixHealth = &hp
+		p.PrefixHealth = &hp.HTTPPrefixHealth
 	default:
-		return fmt.Errorf("unknown prefix health type: %s", raw.Type)
+		return fmt.Errorf("unknown prefix health type: %s", typ)
 	}
 	return nil
 }

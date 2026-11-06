@@ -57,6 +57,9 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, "node config"); err != nil {
 		return err
 	}
+	if err := ValidatePriorityRules(node.PriorityRules, "node config"); err != nil {
+		return err
+	}
 	if node.PortHopping != nil {
 		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
 			return fmt.Errorf("port_hopping.budget_packets must be greater than 0 (or omitted for the default)")
@@ -198,6 +201,11 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			return fmt.Errorf("invalid obf profile: %w", err)
 		}
 	}
+	// mesh-wide default priority rules; each router's own list (validated
+	// below) wins wholesale over this one
+	if err := ValidatePriorityRules(cfg.PriorityRules, "central config"); err != nil {
+		return err
+	}
 	nodes := make([]string, 0)
 	for _, node := range cfg.Routers {
 		err := NameValidator(string(node.Id))
@@ -213,6 +221,9 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 			}
 		}
 		if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, fmt.Sprintf("router %s", node.Id)); err != nil {
+			return err
+		}
+		if err := ValidatePriorityRules(node.PriorityRules, fmt.Sprintf("router %s", node.Id)); err != nil {
 			return err
 		}
 		nodes = append(nodes, string(node.Id))

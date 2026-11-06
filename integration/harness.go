@@ -423,6 +423,7 @@ func (v *VirtualHarness) Start() chan error {
 	nodes := len(v.Central.Routers)
 	vn.virtTun = make([]*tuntest.ChannelTUN, nodes)
 	vn.binds = make([]conn.Bind, nodes)
+	vn.devBinds = make([]conn.Bind, nodes)
 	vn.readyCond = sync.NewCond(&sync.Mutex{})
 	// pick the first endpoint specified for each node
 	vn.EpOutMapping = func(curNode state.NodeId, to bindtest.ChannelEndpoint2) bindtest.ChannelEndpoint2 {
@@ -520,6 +521,7 @@ type InMemoryNetwork struct {
 	sync.Mutex
 	cfg            *VirtualHarness
 	binds          []conn.Bind
+	devBinds       []conn.Bind // device-side (send-path) binds; test seam for outer-datagram assertions (e.g. DSCP marking)
 	virtTun        []*tuntest.ChannelTUN
 	SelfHandler    PacketFilter // packet filter for handling packets destined for the current node
 	TransitHandler PacketFilter // packet filter for handling packets passing through the current node
@@ -529,6 +531,14 @@ type InMemoryNetwork struct {
 
 	flowMu   sync.Mutex
 	flowSrcs map[flowKey]bindtest.ChannelEndpoint2 // (node, dst) -> synthesized reply source
+}
+
+// DevBind returns the bind through which the node's device sends its outer
+// packets (test seam for outer-datagram assertions such as DSCP marking).
+func (i *InMemoryNetwork) DevBind(node state.NodeId) conn.Bind {
+	i.Lock()
+	defer i.Unlock()
+	return i.devBinds[i.cfg.IndexOf(node)]
 }
 
 // setFlowSrc records that replies from node `n` to `dst` should be sourced
@@ -649,6 +659,7 @@ func (i *InMemoryNetwork) Bind(node state.NodeId) conn.Bind {
 	}
 	numId := i.cfg.IndexOf(node)
 	i.binds[numId] = remote
+	i.devBinds[numId] = bp[1]
 	go func() {
 		// bind listener routine for packets sent from this node
 		bufSize := remote.BatchSize()
@@ -736,15 +747,23 @@ func (i *InMemoryNetwork) Tun(node state.NodeId) tun.Device {
 }
 
 func (i *InMemoryNetwork) Send(node state.NodeId, src, dst string, pkt []byte, ttl byte) {
+	i.SendProto(node, src, dst, pkt, ttl, 0)
+}
+
+// SendProto is Send with the IPv4 protocol field set on the synthetic header
+// (0 keeps the historic protocol-less header; the device itself never reads
+// it, but the in-tunnel QoS classifier matches on it).
+func (i *InMemoryNetwork) SendProto(node state.NodeId, src, dst string, pkt []byte, ttl byte, proto byte) {
 	const (
 		ipv4Size = 20
 	)
 	numId := i.cfg.IndexOf(node)
 	ipPkt := append(make([]byte, ipv4Size), pkt...)
 	ip := ipPkt[0:ipv4Size]
-	ip[0] = 4 << 4
+	ip[0] = 0x45 // version 4, IHL 5 (a well-formed minimal header)
 	binary.BigEndian.PutUint16(ip[2:4], uint16(ipv4Size+len(pkt)))
 	ip[8] = ttl
+	ip[9] = proto
 	copy(ipPkt[12:16], netip.MustParseAddr(src).AsSlice())
 	copy(ipPkt[16:20], netip.MustParseAddr(dst).AsSlice())
 	i.virtTun[numId].Outbound <- ipPkt

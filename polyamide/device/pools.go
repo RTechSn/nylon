@@ -115,6 +115,7 @@ func (device *Device) GetTCElement() *TCElement {
 func (device *Device) PutTCElement(elem *TCElement) {
 	elem.clearPointers()
 	elem.Priority = 0
+	elem.TOS = 0
 	device.pool.tcElements.Put(elem)
 }
 

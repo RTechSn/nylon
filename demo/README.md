@@ -54,12 +54,32 @@ Anything else fails the run — a green `record.sh` is a recording that proved t
 A runtime watchdog (180s) kills the recording session if the story stalls, so the recorder can
 never hang.
 
+### `./qos-test.sh` — in-tunnel QoS acceptance run
+
+Needs the stand up (`./up.sh`). Replaces alice's egress qdisc with a test bottleneck (10 Mbit,
+15 ms one-way, a 300-packet bulk queue and a DSCP-EF fast band), then measures four probe flows
+through the tunnel — idle and under a saturating iperf3 bulk — and **judges the run**:
+
+- it refuses to measure a stand whose daemon is not running the demo `priority_rules`
+  (journal precheck): a stale image or stale configs fail in seconds with the exact rebuild
+  commands, instead of producing a confident-looking before-state table;
+- it exits non-zero when the EF band carried no packets under load (the before-state
+  signature), when the matched flows did not separate from the unmarked controls, or when the
+  idle reference shows an unhealthy harness; `demo/output/qos-<ts>/verdict.txt` records the
+  verdict for later comparison.
+
+`--keep-qdisc` leaves the test qdisc on alice for manual inspection; `--allow-no-rules`
+records the before-state table on purpose (precheck skipped, before-verdict downgraded to a
+note).
+
 ### `./generate-configs.sh` — configs only
 
 Writes `demo/.env` (a free Docker subnet picked from the pool `e2e/network_allocator.go` uses),
 three WireGuard keypairs and the `central.yaml` / `<node>.yaml` pair per node, then validates each
 node config with `nylon verify`. Idempotent — existing configs are reused; pass `--force` to
-regenerate.
+regenerate. The image is rebuilt on every invocation (layer cache keeps an unchanged checkout
+fast, and `dc()` stamps the checkout's commit into the build), so the configs are always
+validated by — and the stand always runs — the binary the current checkout builds.
 
 ## Layout
 
@@ -69,6 +89,7 @@ demo/
 ├── generate-configs.sh   # .env + keys + configs, validated
 ├── up.sh                 # interactive stand
 ├── record.sh             # recorder + asset installer
+├── qos-test.sh           # in-tunnel QoS acceptance run (prechecked + self-judging)
 ├── docker-compose.yml    # three nodes, subnet and addresses from demo/.env
 └── panes/                # the four tmux panes the recording shows, run inside alice
     ├── mtr.sh            # traceroute across the mesh

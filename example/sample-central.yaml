@@ -5,6 +5,17 @@ dist:
   repos:
     - file:central.nybundle # use local file system
     - https://static.example.com/network1.nybundle # GET from a server
+# In-tunnel QoS: the mesh-wide default priority_rules. Every node (routers
+# and clients alike) receives these through the distributed config; a
+# router's own priority_rules entry wins wholesale over this list, which
+# wins wholesale over node.yaml. See guides/qos-priority.
+priority_rules:
+  - protocol: udp
+    port: 5405 # corosync totem
+    priority: high
+  - protocol: tcp
+    port: 22 # ssh
+    priority: high
 routers:
   - id: alice
     pubkey: xmfAovAKN4AY5ocK5s+/VsG9I27KrQ13Vzb0HOsLKAs==

@@ -17,7 +17,9 @@ require_cmd docker
 load_env || die "$ENV_FILE was not written — cannot start the stand"
 
 info "starting the mesh"
-dc up -d --force-recreate # always start from the configs on disk
+# Always start from the configs on disk AND from the image the current
+# checkout builds (--build hits the layer cache when nothing changed).
+dc up -d --build --force-recreate
 
 wait_for_shaping 30
 warm_up 120

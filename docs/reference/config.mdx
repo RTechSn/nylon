@@ -64,6 +64,27 @@ port_hopping:
   candidate_samples: 32  # candidates scored per draw for IP/subnet diversity
   recycle_seconds: 0     # opt-in auto-recycle: when every port is cooling down (pool exhausted), clear the retirement quarantine and restart the sweep, at most once per this many seconds (0 = off: stall until the cooldown elapses); applies to every rotating mode
 
+# In-tunnel QoS: classify inner packets by protocol/port and keep small
+# flows alive under bulk load. Matched flows ride ahead of bulk within
+# in-device batches AND their outer (encrypted) datagrams are stamped with
+# the rule's DSCP so a DSCP-aware WAN bottleneck can carry them past the
+# bulk queue. medium/high/max map to in-device levels + default outer DSCP
+# AF41/EF/CS7; dscp (0-63, optional) overrides the outer codepoint. The port
+# matches either side of the flow (dport of requests, sport of replies);
+# tcp/udp rules require a port, icmp rules match all ICMP/ICMPv6 and must
+# not set one. Overlapping rules match in order (first wins), exact
+# duplicates are config errors, at most 64 rules. The central config's lists
+# win wholesale over these — first the router's own central entry, then the
+# central top-level (mesh-wide) list. See guides/qos-priority.
+priority_rules:
+  - protocol: udp
+    port: 5405 # or "5000-5100" for an inclusive range
+    priority: high
+  - protocol: tcp
+    port: 22
+    priority: high
+    dscp: 46 # optional override of high's default EF
+
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
   url: https://static.example.com/network1.nybundle
@@ -106,6 +127,17 @@ dist:
     - https://static.example.com/network1.nybundle # remote URL (HTTP GET)
   interval: 1h # optional: polling cadence; takes precedence over node.yaml's dist.interval
 
+# --- In-tunnel QoS (optional, mesh-wide default) ---
+# priority_rules at the TOP LEVEL is the mesh-wide default: every node
+# (routers and clients alike) receives it through the distributed config.
+# A router's own list (below) wins wholesale over this one, which wins
+# wholesale over node.yaml. Same rule semantics as node.yaml's
+# priority_rules (see node.yaml above and guides/qos-priority).
+# priority_rules:
+#   - protocol: udp
+#     port: 5405
+#     priority: high
+
 # --- Routers ---
 # Active nylon nodes that participate in routing and can forward traffic.
 routers:
@@ -128,6 +160,16 @@ routers:
     #   budget_packets: 12
     #   cooldown_seconds: 180
     #   recycle_seconds: 1
+
+    # In-tunnel QoS rules for THIS router: a non-empty list here wins
+    # wholesale over the mesh-wide top-level priority_rules and over the
+    # node's node.yaml priority_rules (an empty list is indistinguishable
+    # from an absent one — configs roundtrip through yaml, which drops
+    # empty lists). Same rule semantics as node.yaml.
+    # priority_rules:
+    #   - protocol: udp
+    #     port: 5405
+    #     priority: high
     prefixes:
       # Static: always advertised at the given metric
       - type: static

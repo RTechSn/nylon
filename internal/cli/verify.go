@@ -22,7 +22,9 @@ var verifyCmd = &cobra.Command{
 		}
 
 		var cfg state.CentralCfg
-		if err := yaml.Unmarshal(data, &cfg); err != nil {
+		// Strict: flagging unknown keys is this tool's whole job — a typo'd
+		// or misplaced section must fail validation, not silently drop.
+		if err := yaml.UnmarshalWithOptions(data, &cfg, yaml.Strict()); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}

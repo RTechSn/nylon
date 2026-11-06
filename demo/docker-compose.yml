@@ -12,6 +12,8 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: debug
+      args:
+        COMMIT: ${NYLON_COMMIT:-none}
     container_name: nylon-demo-alice
     hostname: alice
     cap_add: [NET_ADMIN]
@@ -30,6 +32,8 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: debug
+      args:
+        COMMIT: ${NYLON_COMMIT:-none}
     container_name: nylon-demo-bob
     hostname: bob
     cap_add: [NET_ADMIN]
@@ -48,6 +52,8 @@ services:
       context: ..
       dockerfile: Dockerfile
       target: debug
+      args:
+        COMMIT: ${NYLON_COMMIT:-none}
     container_name: nylon-demo-charlie
     hostname: charlie
     cap_add: [NET_ADMIN]

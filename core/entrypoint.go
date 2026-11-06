@@ -86,7 +86,11 @@ func readCentralConfig(centralPath, nodePath string, tunables *state.RouterTunab
 
 		centralCfg = *cfg
 	} else {
-		err = yaml.Unmarshal(file, &centralCfg)
+		// Strict: a key the binary does not model must fail startup loudly,
+		// not silently vanish from the parsed config (a dropped section is
+		// indistinguishable from "applied" until traffic proves otherwise;
+		// bundles keep the same guarantee via state.UnbundleConfig).
+		err = yaml.UnmarshalWithOptions(file, &centralCfg, yaml.Strict())
 		if err != nil {
 			return nil, err
 		}
