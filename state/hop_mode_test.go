@@ -305,11 +305,14 @@ obf:
 	}
 }
 
-// TestStrategyJunkCoherence pins the junk rule: the strategies a node uses
-// must agree on one junk configuration — the AWG 2.0 device emits one junk
-// stream (jc/jmin/jmax) and prepends one I-packet set to every handshake
-// toward every peer.
-func TestStrategyJunkCoherence(t *testing.T) {
+// TestStrategyJunkFallbackTiers pins the device-fallback semantics of
+// EffectiveStrategyJunk: the wire junk is per connection (the carrying
+// strategy's own, StrategyJunkOf), and the device knobs only serve peers no
+// strategy carries — the AGREED junk when every used strategy concurs (all
+// pre-per-strategy-junk configs, byte-identical behaviour), else the
+// obf-level default junk, else none. Disagreement is no longer a config
+// error; it selects the fallback.
+func TestStrategyJunkFallbackTiers(t *testing.T) {
 	strats := func(a, b string) map[string]*ObfStrategy {
 		return map[string]*ObfStrategy{
 			"awg":     {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: a, I2: b},
@@ -318,78 +321,164 @@ func TestStrategyJunkCoherence(t *testing.T) {
 		}
 	}
 
-	// one junk set among the used strategies: fine
-	junk, src, err := EffectiveStrategyJunk(strats("aabb", "ccdd"), []string{"awg", "hopping"})
-	if err != nil || src != "awg" {
-		t.Fatalf("single junk set: src=%q err=%v", src, err)
+	// tier 1 — one junk set among the used strategies: the agreed junk
+	junk, src := EffectiveStrategyJunk(strats("aabb", "ccdd"), nil, []string{"awg", "hopping"})
+	if src != "awg" {
+		t.Fatalf("single junk set: src=%q", src)
 	}
 	if junk.Jc != 5 || junk.Jmin != 250 || junk.Jmax != 800 || junk.I[0] != "aabb" || junk.I[1] != "ccdd" {
 		t.Fatalf("resolved junk wrong: %+v", junk)
 	}
 
-	// two different i-sets both used: rejected
-	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
-		"awg":  {Ports: "40000", I1: "aabb"},
-		"awg2": {Ports: "40001", I1: "ccdd"},
-	}, []string{"awg", "awg2"})
-	if err == nil || !strings.Contains(err.Error(), "define different i1..i5") {
-		t.Fatalf("conflicting i-sets must be rejected, got: %v", err)
-	}
-
-	// two different junk trios both used: rejected
-	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
-		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
-		"awg2": {Ports: "40001", Jc: hopStr(7), Jmin: hopStr(250), Jmax: hopStr(800)},
-	}, []string{"awg", "awg2"})
-	if err == nil || !strings.Contains(err.Error(), "define different jc (5 vs 7)") {
-		t.Fatalf("conflicting junk trios must be rejected, got: %v", err)
-	}
-
-	// identical junk across strategies: fine (the second strategy inherits)
-	junk, src, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
+	// tier 1 — identical junk across strategies: agreed, the first names it
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
 		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "aabb"},
 		"awg2": {Ports: "40001", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
-	}, []string{"awg", "awg2"})
-	if err != nil || src != "awg" || junk.Jc != 5 || junk.I[0] != "aabb" {
-		t.Fatalf("identical junk trios: src=%q junk=%+v err=%v", src, junk, err)
+	}, nil, []string{"awg", "awg2"})
+	if src != "awg" || junk.Jc != 5 || junk.I[0] != "aabb" {
+		t.Fatalf("identical junk trios: src=%q junk=%+v", src, junk)
+	}
+
+	// tier 3 — two different i-sets both used and no obf default: no fallback
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", I1: "aabb"},
+		"awg2": {Ports: "40001", I1: "ccdd"},
+	}, nil, []string{"awg", "awg2"})
+	if src != "" || junk.set() {
+		t.Fatalf("conflicting i-sets must fall back to none, got src=%q junk=%+v", src, junk)
+	}
+
+	// tier 3 — two different junk trios both used and no obf default
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
+		"awg2": {Ports: "40001", Jc: hopStr(7), Jmin: hopStr(250), Jmax: hopStr(800)},
+	}, nil, []string{"awg", "awg2"})
+	if src != "" || junk.set() {
+		t.Fatalf("conflicting trios must fall back to none, got src=%q junk=%+v", src, junk)
+	}
+
+	// tier 2 — the same disagreement with obf-level default junk: the neutral
+	// default is the fallback
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
+		"awg2": {Ports: "40001", Jc: hopStr(7), Jmin: hopStr(250), Jmax: hopStr(800)},
+	}, &CentralObf{Jc: hopStr(2), Jmin: hopStr(100), Jmax: hopStr(400), I3: "<r 16>"}, []string{"awg", "awg2"})
+	if src != "defaults" || junk.Jc != 2 || junk.Jmin != 100 || junk.Jmax != 400 || junk.I[2] != "<r 16>" || junk.I[0] != "" {
+		t.Fatalf("disagreement must fall back to the obf default junk, got src=%q junk=%+v", src, junk)
 	}
 
 	// unused strategies never restrict the used set
-	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
 		"awg":  {Ports: "40000", I1: "aabb"},
 		"awg2": {Ports: "40001", I1: "ccdd"},
-	}, []string{"awg"})
-	if err != nil {
-		t.Fatalf("unused strategy must not restrict: %v", err)
+	}, nil, []string{"awg"})
+	if src != "awg" || junk.I[0] != "aabb" {
+		t.Fatalf("unused strategy must not restrict: src=%q junk=%+v", src, junk)
 	}
 
-	// the central validator catches it across every router endpoint
+	// the partial agreement is not agreement: jc concurs but the i-sets
+	// differ, so the whole agreement is abandoned (none, no obf default)
+	junk, src = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "aabb"},
+		"awg2": {Ports: "40001", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "ccdd"},
+	}, nil, []string{"awg", "awg2"})
+	if src != "" || junk.set() {
+		t.Fatalf("partial agreement must not serve the agreed tier, got src=%q junk=%+v", src, junk)
+	}
+}
+
+// TestStrategyJunkPerStrategySeals pins the acceptance case of the
+// per-strategy junk reform: the rig config that the device-global model
+// rejected (two used strategies defining different jc) now seals, and each
+// strategy resolves to its own junk while the device knobs fall back.
+func TestStrategyJunkPerStrategySeals(t *testing.T) {
 	central := &CentralCfg{
-		Obf: &CentralObf{StrategyMode: StrategyModeFixed, Strategy: map[string]*ObfStrategy{
-			"awg":  {Ports: "40000", I1: "aabb"},
-			"awg2": {Ports: "40001", I1: "ccdd"},
-		}},
+		Obf: &CentralObf{
+			StrategyMode: StrategyModeRandom,
+			Strategy: map[string]*ObfStrategy{
+				"proactive_hopping": {Ports: "40000-50000", PortHoppingMode: HopModeProactive, PortHopping: &PortHoppingCfg{BudgetPackets: hopStr(12)}, Jc: hopStr(5), Jmin: hopStr(64), Jmax: hopStr(320)},
+				"reactive_hopping":  {Ports: "40000-50000", PortHoppingMode: HopModeReactive, Jc: hopStr(1), Jmin: hopStr(64), Jmax: hopStr(320)},
+			},
+		},
 		Routers: []RouterCfg{
-			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
-			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
+			{NodeCfg: NodeCfg{Id: "hub"}, Endpoints: []string{"hub.example.com[proactive_hopping,reactive_hopping]"}},
+			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"r2.example.com[proactive_hopping]"}},
 		},
 	}
-	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "define different i1..i5") {
-		t.Errorf("mesh-wide i-set conflict: err = %v, want coherence error", err)
+	if err := CentralConfigValidator(central); err != nil {
+		t.Fatalf("per-strategy junk must seal: %v", err)
+	}
+	// each strategy resolves to its own junk
+	m := central.ObfStrategies()
+	pj, ok := StrategyJunkOf(m, central.Obf, "proactive_hopping")
+	if !ok || pj.Jc != 5 || pj.Jmin != 64 || pj.Jmax != 320 {
+		t.Fatalf("proactive_hopping junk: ok=%v %+v", ok, pj)
+	}
+	rj, ok := StrategyJunkOf(m, central.Obf, "reactive_hopping")
+	if !ok || rj.Jc != 1 {
+		t.Fatalf("reactive_hopping junk: ok=%v %+v", ok, rj)
+	}
+	// the device fallback: the strategies disagree and no obf default exists
+	used := NodeUsedStrategies(central, "hub")
+	junk, src := EffectiveStrategyJunk(m, central.Obf, used)
+	if src != "" || junk.set() {
+		t.Fatalf("disagreeing strategies with no default must render no fallback junk, got src=%q junk=%+v", src, junk)
+	}
+}
+
+// TestStrategyJunkOf pins the per-strategy resolution: the strategy's own
+// trio and i-set, the obf-level defaults inherited per field, the zero spec
+// of a junkless strategy (ok — it must not leak the fallback), and ok=false
+// for a strategy the map does not carry.
+func TestStrategyJunkOf(t *testing.T) {
+	m := map[string]*ObfStrategy{
+		"own":  {Ports: "40000", Jc: hopStr(7), Jmin: hopStr(300), I1: "11111111"},
+		"bare": {},
+		"none": {Ports: "51820"},
+	}
+	obf := &CentralObf{Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "deadbeef", I2: "cafebabe"}
+
+	// own values win per field; the unset jmax and i2..i5 inherit
+	spec, ok := StrategyJunkOf(m, obf, "own")
+	if !ok {
+		t.Fatal("own must resolve")
+	}
+	if spec.Jc != 7 || spec.Jmin != 300 || spec.Jmax != 800 {
+		t.Fatalf("own trio: %+v", spec)
+	}
+	if spec.I[0] != "11111111" || spec.I[1] != "cafebabe" || spec.I[2] != "" {
+		t.Fatalf("own i-set: %+v", spec)
+	}
+	own := spec
+
+	// everything inherited
+	spec, ok = StrategyJunkOf(m, obf, "bare")
+	if !ok || spec.Jc != 5 || spec.Jmin != 250 || spec.Jmax != 800 || spec.I[0] != "deadbeef" || spec.I[4] != "" {
+		t.Fatalf("bare must inherit per field: ok=%v %+v", ok, spec)
 	}
 
-	central = &CentralCfg{
-		Obf: &CentralObf{StrategyMode: StrategyModeFixed, Strategy: map[string]*ObfStrategy{
-			"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
-			"awg2": {Ports: "40001", Jc: hopStr(6), Jmin: hopStr(250), Jmax: hopStr(800)},
-		}},
-		Routers: []RouterCfg{
-			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
-			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
-		},
+	// a junkless strategy with no defaults: ok with a ZERO spec (a junkless
+	// strategy must not leak the device fallback onto its connections)
+	spec, ok = StrategyJunkOf(m, nil, "none")
+	if !ok || spec.set() {
+		t.Fatalf("junkless strategy must resolve to a zero spec: ok=%v %+v", ok, spec)
 	}
-	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "define different jc") {
-		t.Errorf("mesh-wide jc conflict: err = %v, want coherence error", err)
+
+	// unknown / empty names: no spec, the caller falls back
+	if _, ok = StrategyJunkOf(m, obf, "missing"); ok {
+		t.Fatal("an unknown strategy must not resolve")
+	}
+	if _, ok = StrategyJunkOf(m, obf, ""); ok {
+		t.Fatal("the empty name must not resolve")
+	}
+
+	// the fold is idempotent: an already-resolved map resolves identically
+	resolved := map[string]*ObfStrategy{
+		"own": obf.applyDefaults(m["own"]),
+	}
+	spec2, _ := StrategyJunkOf(resolved, obf, "own")
+	if spec2 != own {
+		t.Fatalf("resolved-map re-fold changed the spec: %+v then %+v", own, spec2)
 	}
 }
 

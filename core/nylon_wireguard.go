@@ -42,12 +42,11 @@ func resolveTunOptions(cfg *state.LocalCfg) tun.CreateOptions {
 // every parameter unset picks message type 0 (PickOne over a zero range),
 // which is NOT vanilla WireGuard — pinning H1..H4 to the WG message types
 // preserves byte-level vanilla behavior for existing meshes and the
-// version-skew window (design §2.4). The junk EMISSION — the jc/jmin/jmax
-// trio and the I-packet set, resolved from the obf strategies — is
-// device-global: the AWG 2.0 device emits it on every handshake toward
-// every peer, so the strategies the node uses must agree on one junk
-// configuration (state.EffectiveStrategyJunk); the winning configuration's
-// provider names itself in the journal.
+// version-skew window (design §2.4). The junk lines carry the DEVICE
+// FALLBACK (state.EffectiveStrategyJunk): the wire junk of a connection is
+// its carrying strategy's own (the per-peer junk hook, device.JunkSource);
+// the knobs only serve peers no strategy carries (raw host:port endpoints,
+// the bootstrap window) and what UAPI `get` reports.
 func obfDeviceIPC(obf *state.ObfProfile, junk state.StrategyJunk) string {
 	var b strings.Builder
 	if junk.Jc > 0 {
@@ -70,29 +69,35 @@ func obfDeviceIPC(obf *state.ObfProfile, junk state.StrategyJunk) string {
 	return b.String()
 }
 
-// strategyJunkSet resolves this node's effective junk configuration from the
-// obf strategies it uses (own + peers' advertised endpoints): at most one
-// junk configuration may be in effect, since the device emits one junk
-// stream and one I-packet set toward every peer.
-func (n *Nylon) strategyJunkSet() (state.StrategyJunk, []string, string, error) {
+// strategyJunkSet resolves this node's device-fallback junk from the obf
+// strategies it uses (own + peers' advertised endpoints): the agreed junk
+// when every used strategy concurs, else the obf-level default junk, else
+// none (state.EffectiveStrategyJunk). The per-connection junk — what the
+// wire actually speaks — is the carrying strategy's own, served through the
+// per-peer junk hook (portFactory.JunkFor).
+func (n *Nylon) strategyJunkSet() (state.StrategyJunk, []string, string) {
 	used := state.NodeUsedStrategies(&n.CentralCfg, n.LocalCfg.Id)
-	junk, source, err := state.EffectiveStrategyJunk(n.ObfStrategies(), used)
-	if err != nil {
-		return state.StrategyJunk{}, nil, "", fmt.Errorf("obf strategies: %w", err)
+	junk, source := state.EffectiveStrategyJunk(n.ObfStrategies(), n.CentralCfg.Obf, used)
+	return junk, used, source
+}
+
+// junkSourceLabel names the fallback provider for the journal: the strategy
+// whose junk the device knobs render, "defaults" (the obf-level default
+// junk), or "none".
+func junkSourceLabel(source string) string {
+	if source == "" {
+		return "none"
 	}
-	return junk, used, source, nil
+	return source
 }
 
 // applyObfDeviceIPC (re-)applies the device-level AWG dialect and the
-// strategy junk, journalling the effective state whenever it changes (startup,
-// config update): the S/H profile, the strategy count and the junk
-// provider.
+// fallback junk, journalling the effective state whenever it changes
+// (startup, config update): the S/H profile, the strategy count and the
+// fallback junk provider.
 func (n *Nylon) applyObfDeviceIPC() error {
-	junk, used, source, err := n.strategyJunkSet()
-	if err != nil {
-		return err
-	}
-	sig := fmt.Sprintf("%p|%v|%s", n.Profile(), used, source)
+	junk, used, source := n.strategyJunkSet()
+	sig := fmt.Sprintf("%p|%v|%s|%d/%d/%d", n.Profile(), used, source, junk.Jc, junk.Jmin, junk.Jmax)
 	if err := n.Device.IpcSet(obfDeviceIPC(n.Profile(), junk)); err != nil {
 		return fmt.Errorf("failed to apply obf profile: %v", err)
 	}
@@ -101,7 +106,7 @@ func (n *Nylon) applyObfDeviceIPC() error {
 		n.Log.Info("obf strategies applied",
 			"strategies", len(n.ObfStrategies()),
 			"used", len(used),
-			"junk", source)
+			"junk", junkSourceLabel(source))
 	}
 	return nil
 }

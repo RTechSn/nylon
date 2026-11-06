@@ -135,14 +135,12 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 		if centralNode.Obf != nil {
 			return retiredNodeObfError(fmt.Sprintf("central entry of node %s", node.Id))
 		}
-		// the node's used-strategy junk must be coherent (the AWG 2.0 device
-		// emits one junk configuration; see EffectiveStrategyJunk)
-		if len(central.ObfStrategies()) > 0 {
-			used := NodeUsedStrategies(central, node.Id)
-			if _, _, err := EffectiveStrategyJunk(central.ObfStrategies(), used); err != nil {
-				return fmt.Errorf("node %s: %w", node.Id, err)
-			}
-		}
+		// Per-strategy junk needs no cross-strategy coherence: the junk
+		// a connection speaks is its carrying strategy's own (the
+		// per-strategy resolution lives in state.StrategyJunkOf; the
+		// device knobs degrade to the fallback). Every strategy's own
+		// junk trio and i-specs are validated mesh-wide by
+		// CentralConfigValidator.
 	}
 	return nil
 }

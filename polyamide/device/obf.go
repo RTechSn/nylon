@@ -95,6 +95,17 @@ func newObfChain(spec string) (*obfChain, error) {
 	}, nil
 }
 
+// ValidateObfSpec checks that spec parses as an obfuscation chain — the same
+// parse the i1..i5 UAPI lines (and the per-peer junk hook's spec cache)
+// perform. A tagless spec is valid and emits nothing (the UAPI parse accepts
+// it and yields a nil chain). Exposed for config validation: every obf
+// strategy's i-params must parse before they can reach the send path, where
+// a parse error can no longer fail loudly.
+func ValidateObfSpec(spec string) error {
+	_, err := newObfChain(spec)
+	return err
+}
+
 func (c *obfChain) Obfuscate(dst, src []byte) {
 	written := 0
 	for _, o := range c.obfs {

@@ -156,22 +156,29 @@ func TestObfDefaultsEffectiveConsumers(t *testing.T) {
 		t.Errorf("own resolved policy: %+v", p)
 	}
 
-	// junk: bare and own must AGREE through the defaults (bare inherits
-	// jmax=800 like own; bare inherits jc=5 but own sets jc=7 — they
-	// disagree on jc, so the coherence check must fire over the resolved
-	// values)
-	_, _, err = EffectiveStrategyJunk(m, []string{"bare", "own"})
-	if err == nil || !strings.Contains(err.Error(), "different jc") {
-		t.Errorf("junk coherence must run over the resolved values, got: %v", err)
+	// junk: bare and own DISAGREE through the defaults (bare inherits
+	// jmax=800 like own; bare inherits jc=5 but own sets jc=7) — per-strategy
+	// junk makes that legal: each strategy resolves to its own spec and the
+	// device knobs fall back to the obf default junk (the neutral choice)
+	junk, src := EffectiveStrategyJunk(m, cfg.Obf, []string{"bare", "own"})
+	if src != "defaults" {
+		t.Fatalf("the jc disagreement must select the defaults fallback, got src=%q", src)
+	}
+	if junk.Jc != 5 || junk.Jmin != 250 || junk.Jmax != 800 || junk.I[0] != "deadbeef" {
+		t.Errorf("defaults fallback junk: %+v", junk)
 	}
 	// two strategies that BOTH inherit the full default trio agree through
 	// the defaults and resolve to one junk configuration
-	junk, src, err := EffectiveStrategyJunk(m, []string{"bare"})
-	if err != nil {
-		t.Fatalf("junk over bare (inherited): %v", err)
+	junk, src = EffectiveStrategyJunk(m, nil, []string{"bare"})
+	if src != "bare" {
+		t.Fatalf("junk over bare (inherited): src=%q", src)
 	}
-	if junk.Jc != 5 || junk.Jmin != 250 || junk.Jmax != 800 || junk.I[0] != "deadbeef" || src != "bare" {
-		t.Errorf("resolved junk: %+v from %q", junk, src)
+	if junk.Jc != 5 || junk.Jmin != 250 || junk.Jmax != 800 || junk.I[0] != "deadbeef" {
+		t.Errorf("resolved junk: %+v", junk)
+	}
+	// the per-strategy resolution inherits the defaults per field
+	if spec, ok := StrategyJunkOf(m, cfg.Obf, "own"); !ok || spec.Jc != 7 || spec.Jmin != 300 || spec.Jmax != 800 {
+		t.Errorf("own per-strategy junk: ok=%v %+v", ok, spec)
 	}
 }
 
