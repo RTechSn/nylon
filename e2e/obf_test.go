@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,47 +14,50 @@ import (
 )
 
 // obfFixture mirrors the nylon-genesis output fragment so the committed
-// fixture (e2e/testdata/obf-profile.yaml) round-trips into the obf fields
-// of state.CentralCfg/state.NodeCfg.
+// fixture (e2e/testdata/obf-profile.yaml) round-trips into the obf fields of
+// state.CentralCfg: the mesh-wide S/H dialect plus ONE named strategy
+// carrying the sender-local junk (jc/jmin/jmax and i1-i5).
 type obfFixture struct {
-	Obf     *state.ObfProfile `yaml:"obf"`
-	Routers []struct {
-		Id  string               `yaml:"id"`
-		Obf *state.ObfPeerParams `yaml:"obf"`
-	} `yaml:"routers"`
+	AwgProfile *state.ObfProfile             `yaml:"awg_profile"`
+	Obf        map[string]*state.ObfStrategy `yaml:"obf"`
 }
 
 // TestObfProfileConnectivity proves that two nylon nodes with a generated
-// AWG 2.0 obfuscation profile (shared S/H/J + per-node sender-local I)
-// establish a mesh and pass traffic over the obfuscated wire format.
+// AWG 2.0 obfuscation fragment (mesh-wide S/H dialect + one named strategy
+// carrying the sender-local junk) establish a mesh and pass traffic over the
+// obfuscated wire format.
 func TestObfProfileConnectivity(t *testing.T) {
 	t.Parallel()
 	h := NewHarness(t)
 
 	// Load the committed fixture, generated once via:
 	//   go run ./cmd/nylon-genesis --preset standard-1420 --protocol quic \
-	//       --mtu 1420 --peers node1,node2
+	//       --mtu 1420 --strategy-ports 51820
 	fixturePath := filepath.Join(h.RootDir, "e2e", "testdata", "obf-profile.yaml")
 	data, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatalf("reading obf fixture: %v", err)
 	}
 	var fixture obfFixture
-	if err := yaml.Unmarshal(data, &fixture); err != nil {
+	if err := yaml.UnmarshalWithOptions(data, &fixture, yaml.Strict()); err != nil {
 		t.Fatalf("parsing obf fixture: %v", err)
 	}
-	if fixture.Obf == nil {
-		t.Fatal("obf fixture carries no profile")
+	if fixture.AwgProfile == nil {
+		t.Fatal("obf fixture carries no awg_profile")
 	}
-	if err := fixture.Obf.Validate(); err != nil {
+	if err := fixture.AwgProfile.Validate(); err != nil {
 		t.Fatalf("obf fixture profile invalid: %v", err)
 	}
-	peerObf := make(map[string]*state.ObfPeerParams, len(fixture.Routers))
-	for _, r := range fixture.Routers {
-		peerObf[r.Id] = r.Obf
+	if len(fixture.Obf) != 1 {
+		t.Fatalf("obf fixture must carry exactly one strategy, got %d", len(fixture.Obf))
 	}
-	if peerObf["node1"] == nil || peerObf["node2"] == nil {
-		t.Fatal("obf fixture missing node1/node2 peer params")
+	var strategyName string
+	var strat *state.ObfStrategy
+	for n, s := range fixture.Obf {
+		strategyName, strat = n, s
+	}
+	if strategyName == "" || strat == nil || strat.Ports == "" {
+		t.Fatal("obf fixture strategy missing or unnamed")
 	}
 
 	// Generate keys
@@ -71,12 +75,13 @@ func TestObfProfileConnectivity(t *testing.T) {
 	// Create config directory for this test run
 	configDir := h.SetupTestDir()
 
-	// 1. Create Central Config: shared mesh profile at CentralCfg level and
-	// each node's own sender-local I-packet params on its router entry.
+	// 1. Create Central Config: the mesh-wide S/H dialect plus the named
+	// strategy carrying the sender-local junk. node2 advertises the
+	// strategy (host[<strategy>]), so it serves the strategy's ports, and
+	// every node in the graph draws the same effective junk configuration.
 	router1 := SimpleRouter("node1", node1Key.Pubkey(), node1NylonIP, "")
-	router1.Obf = peerObf["node1"]
-	router2 := SimpleRouter("node2", node2Key.Pubkey(), node2NylonIP, node2IP)
-	router2.Obf = peerObf["node2"]
+	router2 := SimpleRouter("node2", node2Key.Pubkey(), node2NylonIP, "")
+	router2.Endpoints = []string{fmt.Sprintf("%s[%s]", node2IP, strategyName)}
 	central := state.CentralCfg{
 		Routers: []state.RouterCfg{
 			router1,
@@ -85,8 +90,9 @@ func TestObfProfileConnectivity(t *testing.T) {
 		Graph: []string{
 			"node1, node2",
 		},
-		Timestamp: time.Now().UnixNano(),
-		Obf:       fixture.Obf,
+		Timestamp:     time.Now().UnixNano(),
+		AwgProfile:    fixture.AwgProfile,
+		ObfStrategies: fixture.Obf,
 	}
 
 	centralPath := h.WriteConfig(configDir, "central.yaml", central)

@@ -10,8 +10,10 @@ import (
 //
 //      obf:                      # central top level — named strategies, mesh-wide
 //        awg_main:
-//          protocol: quic        # informational: amnezigo template the i-params were drawn from
 //          ports: "40000"        # required: one port or an inclusive range "40000-50000"
+//          jc: 5                 # sender-local junk: jc datagrams of size [jmin, jmax)
+//          jmin: 250             #   ahead of every handshake initiation (per strategy)
+//          jmax: 800
 //          i1: ... i5: ...       # optional sender junk packets (see the note below)
 //        hopping:
 //          ports: "40000-50000"
@@ -34,19 +36,19 @@ import (
 // tagged peer endpoint into one candidate set per named strategy.
 //
 // WIRE REALITY (documented, not negotiable by config): the AWG 2.0 device
-// speaks exactly ONE dialect. The S/H/J profile is mesh-wide (awg_profile),
-// and the I-packet set is device-global: I-packets are prepended to every
-// handshake toward EVERY peer. A strategy's i1..i5 therefore apply to a
-// node's handshakes toward all peers, not only toward peers reached via that
-// strategy — and the strategies a node uses must agree on one i-set. See
-// EffectiveStrategyIPackets.
+// speaks exactly ONE handshake dialect — the S/H profile is mesh-wide
+// (awg_profile) — and emits ONE junk configuration: the jc/jmin/jmax junk
+// stream and the I-packets are device-global, sent toward EVERY peer, not
+// per strategy. The strategies a node uses must therefore agree on the
+// whole junk set (see EffectiveStrategyJunk). Receivers discard junk
+// unclassified, so two nodes may still draw their junk from different
+// strategies without breaking interop.
 
 // ObfStrategy is one named entry of the central top-level `obf` map: a
 // wire-reachability definition (ports) plus, optionally, the client-side
-// rotation policy for those ports and the sender junk packets to emit.
+// rotation policy for those ports and the sender-local junk emission (the
+// AWG J trio and the I-packets). The strategy NAME is its identity.
 type ObfStrategy struct {
-	Protocol string `yaml:"protocol,omitempty"` // informational label (amnezigo template provenance); no runtime effect
-
 	// Ports is the strategy's port spec: a single port ("40000") or an
 	// inclusive range ("40000-50000"). Required.
 	Ports string `yaml:"ports"`
@@ -56,9 +58,20 @@ type ObfStrategy struct {
 	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"` // static (default) | reactive | proactive | timed
 	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`
 
-	// Sender-local junk packets (AWG I1-I5). At most one i-set may be in
-	// effect per node: the strategies the node uses must define identical
-	// non-empty i-params (see EffectiveStrategyIPackets).
+	// Sender-local junk datagrams (AWG Jc/Jmin/Jmax): `jc` datagrams of
+	// sizes drawn from [jmin, jmax) go out ahead of every handshake
+	// initiation, per strategy. `jc` requires the size range
+	// (ValidateStrategyJunk), and the strategies a node uses must agree on
+	// these values — the device emits one junk stream (see
+	// EffectiveStrategyJunk).
+	Jc   *uint32 `yaml:"jc,omitempty"`
+	Jmin *uint32 `yaml:"jmin,omitempty"`
+	Jmax *uint32 `yaml:"jmax,omitempty"`
+
+	// Sender-local junk packets (AWG I1-I5), prepended to every handshake
+	// initiation. At most one i-set may be in effect per node: the
+	// strategies the node uses must define identical non-empty i-params
+	// (see EffectiveStrategyJunk).
 	I1 string `yaml:"i1,omitempty"`
 	I2 string `yaml:"i2,omitempty"`
 	I3 string `yaml:"i3,omitempty"`
@@ -249,33 +262,94 @@ func MergePortRanges(prs ...PortRange) []PortRange {
 	return out
 }
 
-// EffectiveStrategyIPackets resolves the junk-packet set a node's device must
+// StrategyJunk is the resolved, device-global sender junk configuration the
+// AWG 2.0 device must speak: `jc` junk datagrams of sizes drawn from
+// [jmin, jmax) ahead of every handshake initiation, plus the I-packet set
+// prepended to it. Zero values emit no junk of that kind.
+type StrategyJunk struct {
+	Jc   uint32
+	Jmin uint32
+	Jmax uint32
+	I    [5]string
+}
+
+// EffectiveStrategyJunk resolves the junk configuration a node's device must
 // speak, given the strategies the node uses (union over the strategy tags of
-// its own and its peers' advertised endpoints). The AWG 2.0 device prepends
-// the I-packets to every handshake toward every peer, so at most one i-set
-// may be in effect: all used strategies with a non-empty i-set must define
-// the SAME one. Returns the effective specs and the name of the strategy that
-// provided them ("" when the node speaks no junk).
-func EffectiveStrategyIPackets(m map[string]*ObfStrategy, used []string) ([5]string, string, error) {
-	var zero [5]string
-	var effective [5]string
+// its own and its peers' advertised endpoints). The AWG 2.0 device emits one
+// junk stream and prepends the I-packets to every handshake toward every
+// peer, so at most one junk configuration may be in effect: for each of
+// jc/jmin/jmax, every used strategy that sets the knob must agree, and all
+// used strategies with a non-empty i-set must define the SAME one. Returns
+// the effective configuration and the name of the strategy that provided it
+// ("" when the node speaks no junk).
+func EffectiveStrategyJunk(m map[string]*ObfStrategy, used []string) (StrategyJunk, string, error) {
+	var out StrategyJunk
+	// the first setter of each J knob fixes the effective value; a later
+	// disagreement is a config error (the device cannot speak two junk
+	// configurations at once).
+	var knobVal [3]uint32
+	var knobSrc [3]string
+	var knobSeen [3]bool
+	var iSet [5]string
+	var iSrc string
+	var iSeen bool
 	source := ""
 	for _, name := range used {
 		s, ok := m[name]
-		if !ok || !s.iParamsSet() {
+		if !ok {
 			continue
 		}
-		set := s.iParams()
-		if source == "" {
-			effective = set
+		contributes := s.iParamsSet() || s.Jc != nil || s.Jmin != nil || s.Jmax != nil
+		if contributes && source == "" {
 			source = name
-			continue
 		}
-		if set != effective {
-			return zero, "", fmt.Errorf("obf strategies %s and %s define different i1..i5, but the AWG 2.0 device emits one junk-packet set on every handshake toward every peer; strategies used by the same node must share a single i-set (or leave the i-params unset in all but one of them)", source, name)
+		for i, p := range [3]*uint32{s.Jc, s.Jmin, s.Jmax} {
+			if p == nil {
+				continue
+			}
+			if !knobSeen[i] {
+				knobSeen[i], knobVal[i], knobSrc[i] = true, *p, name
+				continue
+			}
+			if knobVal[i] != *p {
+				return StrategyJunk{}, "", fmt.Errorf("obf strategies %s and %s define different %s (%d vs %d), but the AWG 2.0 device emits one junk configuration toward every peer; strategies used by the same node must agree (or leave the junk params unset in all but one of them)", knobSrc[i], name, []string{"jc", "jmin", "jmax"}[i], knobVal[i], *p)
+			}
+		}
+		if s.iParamsSet() {
+			set := s.iParams()
+			if !iSeen {
+				iSet, iSeen, iSrc = set, true, name
+				continue
+			}
+			if set != iSet {
+				return StrategyJunk{}, "", fmt.Errorf("obf strategies %s and %s define different i1..i5, but the AWG 2.0 device emits one junk-packet set on every handshake toward every peer; strategies used by the same node must share a single i-set (or leave the i-params unset in all but one of them)", iSrc, name)
+			}
 		}
 	}
-	return effective, source, nil
+	out.Jc, out.Jmin, out.Jmax = knobVal[0], knobVal[1], knobVal[2]
+	out.I = iSet
+	return out, source, nil
+}
+
+// ValidateStrategyJunk checks one strategy's sender-junk trio for internal
+// consistency: the size range travels with the count — `jc` requires
+// `jmin`/`jmax`, and a size range without a positive `jc` emits nothing, so
+// it is rejected rather than carried as dead config.
+func ValidateStrategyJunk(s *ObfStrategy, name string) error {
+	if s == nil {
+		return nil
+	}
+	jcSet := s.Jc != nil && *s.Jc > 0
+	if jcSet && (s.Jmin == nil || s.Jmax == nil) {
+		return fmt.Errorf("obf strategy %s: jc requires the jmin/jmax junk size range (datagram sizes are drawn from [jmin, jmax))", name)
+	}
+	if !jcSet && (s.Jmin != nil || s.Jmax != nil) {
+		return fmt.Errorf("obf strategy %s: jmin/jmax are set but jc is not positive — no junk datagrams are emitted without a count; set jc, or drop the size range", name)
+	}
+	if s.Jmin != nil && s.Jmax != nil && *s.Jmin > *s.Jmax {
+		return fmt.Errorf("obf strategy %s: jmin (%d) must not exceed jmax (%d)", name, *s.Jmin, *s.Jmax)
+	}
+	return nil
 }
 
 // NodeUsedStrategies computes the strategies a node may speak, in stable
@@ -327,8 +401,8 @@ func NodeUsedStrategies(central *CentralCfg, node NodeId) []string {
 }
 
 // ValidateObfStrategies checks the central strategy map: names, ports,
-// per-strategy rotation policy, and the i-set coherence across every
-// strategy any endpoint may name.
+// per-strategy rotation policy and junk trio, and the junk/i-set coherence
+// across every strategy any endpoint may name.
 func ValidateObfStrategies(cfg *CentralCfg) error {
 	m := cfg.ObfStrategies
 	if len(m) == 0 {
@@ -345,11 +419,14 @@ func ValidateObfStrategies(cfg *CentralCfg) error {
 		if err := ValidateHopPolicyCfg(s.PortHoppingMode, s.PortHopping, fmt.Sprintf("obf strategy %s", name)); err != nil {
 			return err
 		}
+		if err := ValidateStrategyJunk(s, name); err != nil {
+			return err
+		}
 	}
 	// The mesh-wide coherence check: the superset of every strategy named by
-	// any endpoint must share one i-set, so `nylon seal` / `nylon verify`
-	// give one consistent answer. NodeConfigValidator re-checks the node's
-	// own used set (defense in depth).
+	// any endpoint must share one junk configuration, so `nylon seal` /
+	// `nylon verify` give one consistent answer. NodeConfigValidator
+	// re-checks the node's own used set (defense in depth).
 	var used []string
 	seen := map[string]struct{}{}
 	for i := range cfg.Routers {
@@ -373,7 +450,7 @@ func ValidateObfStrategies(cfg *CentralCfg) error {
 		}
 	}
 	slices.Sort(used)
-	if _, _, err := EffectiveStrategyIPackets(m, used); err != nil {
+	if _, _, err := EffectiveStrategyJunk(m, used); err != nil {
 		return err
 	}
 	return nil

@@ -27,7 +27,9 @@ obf:
       cooldown_seconds: 60
   awg_main:
     ports: "40000"
-    protocol: quic
+    jc: 5
+    jmin: 250
+    jmax: 800
     i1: "aabbcc"
 `
 	var central CentralCfg
@@ -48,8 +50,11 @@ obf:
 		t.Fatalf("period_jitter_pct not parsed: %+v", h.PortHopping)
 	}
 	a := central.ObfStrategies["awg_main"]
-	if a.Ports != "40000" || a.Protocol != "quic" || a.I1 != "aabbcc" {
+	if a.Ports != "40000" || a.I1 != "aabbcc" {
 		t.Errorf("awg_main not parsed: %+v", a)
+	}
+	if a.Jc == nil || *a.Jc != 5 || a.Jmin == nil || *a.Jmin != 250 || a.Jmax == nil || *a.Jmax != 800 {
+		t.Errorf("awg_main junk trio not parsed: %+v", a)
 	}
 
 	// the strategy block must survive a marshal/unmarshal roundtrip
@@ -66,7 +71,7 @@ obf:
 		t.Errorf("hop policy lost in roundtrip: %+v", h2)
 	}
 	a2 := central2.ObfStrategies["awg_main"]
-	if a2.Ports != "40000" || a2.I1 != "aabbcc" || a2.Protocol != "quic" {
+	if a2.Ports != "40000" || a2.I1 != "aabbcc" || a2.Jc == nil || *a2.Jc != 5 || a2.Jmin == nil || *a2.Jmin != 250 || a2.Jmax == nil || *a2.Jmax != 800 {
 		t.Errorf("strategy fields lost in roundtrip: %+v", a2)
 	}
 }
@@ -269,26 +274,30 @@ obf:
 	}
 }
 
-// TestStrategyIPacketsCoherence pins the i-set rule: the strategies a node
-// uses must agree on one non-empty i-set (the AWG 2.0 device prepends one
-// junk set to every handshake toward every peer).
-func TestStrategyIPacketsCoherence(t *testing.T) {
+// TestStrategyJunkCoherence pins the junk rule: the strategies a node uses
+// must agree on one junk configuration — the AWG 2.0 device emits one junk
+// stream (jc/jmin/jmax) and prepends one I-packet set to every handshake
+// toward every peer.
+func TestStrategyJunkCoherence(t *testing.T) {
 	strats := func(a, b string) map[string]*ObfStrategy {
 		return map[string]*ObfStrategy{
-			"awg":     {Ports: "40000", I1: a, I2: b},
+			"awg":     {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: a, I2: b},
 			"hopping": {Ports: "40000-50000"},
 			"vanilla": {Ports: "51820"},
 		}
 	}
 
-	// one i-set among the used strategies: fine
-	_, src, err := EffectiveStrategyIPackets(strats("aabb", "ccdd"), []string{"awg", "hopping"})
+	// one junk set among the used strategies: fine
+	junk, src, err := EffectiveStrategyJunk(strats("aabb", "ccdd"), []string{"awg", "hopping"})
 	if err != nil || src != "awg" {
-		t.Fatalf("single i-set: src=%q err=%v", src, err)
+		t.Fatalf("single junk set: src=%q err=%v", src, err)
+	}
+	if junk.Jc != 5 || junk.Jmin != 250 || junk.Jmax != 800 || junk.I[0] != "aabb" || junk.I[1] != "ccdd" {
+		t.Fatalf("resolved junk wrong: %+v", junk)
 	}
 
 	// two different i-sets both used: rejected
-	_, _, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
+	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
 		"awg":  {Ports: "40000", I1: "aabb"},
 		"awg2": {Ports: "40001", I1: "ccdd"},
 	}, []string{"awg", "awg2"})
@@ -296,17 +305,26 @@ func TestStrategyIPacketsCoherence(t *testing.T) {
 		t.Fatalf("conflicting i-sets must be rejected, got: %v", err)
 	}
 
-	// identical i-sets across strategies: fine
-	_, src, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
-		"awg":  {Ports: "40000", I1: "aabb", I5: "ff00"},
-		"awg2": {Ports: "40001", I1: "aabb", I5: "ff00"},
+	// two different junk trios both used: rejected
+	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
+		"awg2": {Ports: "40001", Jc: hopStr(7), Jmin: hopStr(250), Jmax: hopStr(800)},
 	}, []string{"awg", "awg2"})
-	if err != nil || src != "awg" {
-		t.Fatalf("identical i-sets: src=%q err=%v", src, err)
+	if err == nil || !strings.Contains(err.Error(), "define different jc (5 vs 7)") {
+		t.Fatalf("conflicting junk trios must be rejected, got: %v", err)
+	}
+
+	// identical junk across strategies: fine (the second strategy inherits)
+	junk, src, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "aabb"},
+		"awg2": {Ports: "40001", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
+	}, []string{"awg", "awg2"})
+	if err != nil || src != "awg" || junk.Jc != 5 || junk.I[0] != "aabb" {
+		t.Fatalf("identical junk trios: src=%q junk=%+v err=%v", src, junk, err)
 	}
 
 	// unused strategies never restrict the used set
-	_, _, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
+	_, _, err = EffectiveStrategyJunk(map[string]*ObfStrategy{
 		"awg":  {Ports: "40000", I1: "aabb"},
 		"awg2": {Ports: "40001", I1: "ccdd"},
 	}, []string{"awg"})
@@ -327,6 +345,57 @@ func TestStrategyIPacketsCoherence(t *testing.T) {
 	}
 	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "define different i1..i5") {
 		t.Errorf("mesh-wide i-set conflict: err = %v, want coherence error", err)
+	}
+
+	central = &CentralCfg{
+		ObfStrategies: map[string]*ObfStrategy{
+			"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
+			"awg2": {Ports: "40001", Jc: hopStr(6), Jmin: hopStr(250), Jmax: hopStr(800)},
+		},
+		Routers: []RouterCfg{
+			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
+			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
+		},
+	}
+	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "define different jc") {
+		t.Errorf("mesh-wide jc conflict: err = %v, want coherence error", err)
+	}
+}
+
+// TestValidateStrategyJunkMatrix walks the per-strategy junk trio checks:
+// the size range travels with the count, and the range must be ordered.
+func TestValidateStrategyJunkMatrix(t *testing.T) {
+	viaValidator := func(s *ObfStrategy) error {
+		return ValidateObfStrategies(&CentralCfg{ObfStrategies: map[string]*ObfStrategy{"hop": s}})
+	}
+	cases := []struct {
+		name    string
+		s       *ObfStrategy
+		wantErr string // "" = expect success
+	}{
+		{"no junk at all", &ObfStrategy{Ports: "40000"}, ""},
+		{"valid trio", &ObfStrategy{Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)}, ""},
+		{"equal bounds (fixed-length junk)", &ObfStrategy{Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(250)}, ""},
+		{"jc without range", &ObfStrategy{Ports: "40000", Jc: hopStr(5)}, "jc requires the jmin/jmax junk size range"},
+		{"jmin only", &ObfStrategy{Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250)}, "jc requires the jmin/jmax junk size range"},
+		{"jmax only", &ObfStrategy{Ports: "40000", Jc: hopStr(5), Jmax: hopStr(800)}, "jc requires the jmin/jmax junk size range"},
+		{"range without jc", &ObfStrategy{Ports: "40000", Jmin: hopStr(250), Jmax: hopStr(800)}, "jmin/jmax are set but jc is not positive"},
+		{"range with explicit zero jc", &ObfStrategy{Ports: "40000", Jc: hopStr(0), Jmin: hopStr(250), Jmax: hopStr(800)}, "jmin/jmax are set but jc is not positive"},
+		{"inverted range", &ObfStrategy{Ports: "40000", Jc: hopStr(5), Jmin: hopStr(800), Jmax: hopStr(250)}, "must not exceed jmax"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := viaValidator(tc.s)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %v does not contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

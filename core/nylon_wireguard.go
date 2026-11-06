@@ -42,24 +42,27 @@ func resolveTunOptions(cfg *state.LocalCfg) tun.CreateOptions {
 // every parameter unset picks message type 0 (PickOne over a zero range),
 // which is NOT vanilla WireGuard — pinning H1..H4 to the WG message types
 // preserves byte-level vanilla behavior for existing meshes and the
-// version-skew window (design §2.4). The I-packet set is device-global — the
-// AWG 2.0 device prepends it to every handshake toward every peer — so the
-// strategies the node uses must agree on one i-set (state.
-// EffectiveStrategyIPackets); the winning set's provider names itself in the
-// journal.
-func obfDeviceIPC(obf *state.ObfProfile, iSet [5]string) string {
+// version-skew window (design §2.4). The junk EMISSION — the jc/jmin/jmax
+// trio and the I-packet set, resolved from the obf strategies — is
+// device-global: the AWG 2.0 device emits it on every handshake toward
+// every peer, so the strategies the node uses must agree on one junk
+// configuration (state.EffectiveStrategyJunk); the winning configuration's
+// provider names itself in the journal.
+func obfDeviceIPC(obf *state.ObfProfile, junk state.StrategyJunk) string {
 	var b strings.Builder
+	if junk.Jc > 0 {
+		fmt.Fprintf(&b, "jc=%d\njmin=%d\njmax=%d\n", junk.Jc, junk.Jmin, junk.Jmax)
+	}
 	if obf == nil {
 		b.WriteString("h1=1-1\nh2=2-2\nh3=3-3\nh4=4-4\n")
 	} else {
-		fmt.Fprintf(&b, "jc=%d\njmin=%d\njmax=%d\n", obf.Jc, obf.Jmin, obf.Jmax)
 		fmt.Fprintf(&b, "s1=%d\ns2=%d\ns3=%d\ns4=%d\n", obf.S1, obf.S2, obf.S3, obf.S4)
 		fmt.Fprintf(&b, "h1=%d-%d\n", obf.H1.Min, obf.H1.Max)
 		fmt.Fprintf(&b, "h2=%d-%d\n", obf.H2.Min, obf.H2.Max)
 		fmt.Fprintf(&b, "h3=%d-%d\n", obf.H3.Min, obf.H3.Max)
 		fmt.Fprintf(&b, "h4=%d-%d\n", obf.H4.Min, obf.H4.Max)
 	}
-	for i, spec := range iSet {
+	for i, spec := range junk.I {
 		if spec != "" {
 			fmt.Fprintf(&b, "i%d=%s\n", i+1, spec)
 		}
@@ -67,30 +70,30 @@ func obfDeviceIPC(obf *state.ObfProfile, iSet [5]string) string {
 	return b.String()
 }
 
-// strategyIPacketSet resolves this node's effective junk-packet set from the
+// strategyJunkSet resolves this node's effective junk configuration from the
 // obf strategies it uses (own + peers' advertised endpoints): at most one
-// non-empty i-set may be in effect, since the device prepends it to every
-// handshake toward every peer.
-func (n *Nylon) strategyIPacketSet() ([5]string, []string, string, error) {
+// junk configuration may be in effect, since the device emits one junk
+// stream and one I-packet set toward every peer.
+func (n *Nylon) strategyJunkSet() (state.StrategyJunk, []string, string, error) {
 	used := state.NodeUsedStrategies(&n.CentralCfg, n.LocalCfg.Id)
-	iSet, source, err := state.EffectiveStrategyIPackets(n.CentralCfg.ObfStrategies, used)
+	junk, source, err := state.EffectiveStrategyJunk(n.CentralCfg.ObfStrategies, used)
 	if err != nil {
-		return [5]string{}, nil, "", fmt.Errorf("obf strategies: %w", err)
+		return state.StrategyJunk{}, nil, "", fmt.Errorf("obf strategies: %w", err)
 	}
-	return iSet, used, source, nil
+	return junk, used, source, nil
 }
 
-// applyObfDeviceIPC (re-)applies the device-level AWG dialect and junk
-// packets, journalling the effective state whenever it changes (startup,
-// config update): the S/H/J profile, the strategy count and the i-set
+// applyObfDeviceIPC (re-)applies the device-level AWG dialect and the
+// strategy junk, journalling the effective state whenever it changes (startup,
+// config update): the S/H profile, the strategy count and the junk
 // provider.
 func (n *Nylon) applyObfDeviceIPC() error {
-	iSet, used, source, err := n.strategyIPacketSet()
+	junk, used, source, err := n.strategyJunkSet()
 	if err != nil {
 		return err
 	}
 	sig := fmt.Sprintf("%p|%v|%s", n.AwgProfile, used, source)
-	if err := n.Device.IpcSet(obfDeviceIPC(n.AwgProfile, iSet)); err != nil {
+	if err := n.Device.IpcSet(obfDeviceIPC(n.AwgProfile, junk)); err != nil {
 		return fmt.Errorf("failed to apply obf profile: %v", err)
 	}
 	if sig != n.obfAppliedSig {
@@ -98,7 +101,7 @@ func (n *Nylon) applyObfDeviceIPC() error {
 		n.Log.Info("obf strategies applied",
 			"strategies", len(n.CentralCfg.ObfStrategies),
 			"used", len(used),
-			"i-set", source)
+			"junk", source)
 	}
 	return nil
 }
@@ -368,8 +371,9 @@ func (n *Nylon) SyncWireGuard() error {
 	}
 
 	// (re-)apply the AWG 2.0 obfuscation knobs; a config reload may switch the
-	// S/H profile or the effective i-set live. In-flight handshakes can fail
-	// for one rekey window — maintenance-action semantics (design §2.4).
+	// S/H dialect or the effective junk configuration live. In-flight
+	// handshakes can fail for one rekey window — maintenance-action semantics
+	// (design §2.4).
 	if err := n.applyObfDeviceIPC(); err != nil {
 		return err
 	}

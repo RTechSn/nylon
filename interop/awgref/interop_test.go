@@ -15,8 +15,9 @@
 // (nylon 127.0.0.1:57310, reference 127.0.0.1:57311), are configured through
 // their respective UAPI IpcSet implementations with identical device-level
 // obfuscation knobs (jc/jmin/jmax/s1-s4 and h1-h4 min-max ranges — the same
-// lines core.initWireGuard synthesizes from a CentralCfg obf profile, which
-// must precede the first public_key line in both parsers).
+// lines core.initWireGuard synthesizes from a CentralCfg awg_profile plus an
+// obf strategy's junk, which must precede the first public_key line in both
+// parsers).
 //
 // What it proves: with obfuscation active on both ends, the two independent
 // implementations complete a Noise handshake and exchange byte-identical

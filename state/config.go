@@ -18,29 +18,27 @@ type ObfHeaderRange struct {
 	Max uint32
 }
 
-// ObfProfile is the mesh-wide shared AWG 2.0 obfuscation profile (S/H/J).
-// Living at CentralCfg level makes S/H uniform across the full mesh by
-// construction, which wire compatibility requires (design §2.4).
+// ObfProfile is the mesh-wide shared AWG 2.0 handshake dialect (S/H) — the
+// wire contract every pair of nodes must speak identically, so it cannot
+// vary from node to node. Living at CentralCfg level makes S/H uniform
+// across the full mesh by construction, which wire compatibility requires
+// (design §2.4). The sender-local junk emission (jc/jmin/jmax and the
+// I-packets) is per-strategy — see ObfStrategy and EffectiveStrategyJunk.
 type ObfProfile struct {
-	Jc   uint32         `yaml:",omitempty"`
-	Jmin uint32         `yaml:",omitempty"`
-	Jmax uint32         `yaml:",omitempty"`
-	S1   uint32         `yaml:",omitempty"`
-	S2   uint32         `yaml:",omitempty"`
-	S3   uint32         `yaml:",omitempty"`
-	S4   uint32         `yaml:",omitempty"`
-	H1   ObfHeaderRange `yaml:",omitempty"`
-	H2   ObfHeaderRange `yaml:",omitempty"`
-	H3   ObfHeaderRange `yaml:",omitempty"`
-	H4   ObfHeaderRange `yaml:",omitempty"`
+	S1 uint32         `yaml:",omitempty"`
+	S2 uint32         `yaml:",omitempty"`
+	S3 uint32         `yaml:",omitempty"`
+	S4 uint32         `yaml:",omitempty"`
+	H1 ObfHeaderRange `yaml:",omitempty"`
+	H2 ObfHeaderRange `yaml:",omitempty"`
+	H3 ObfHeaderRange `yaml:",omitempty"`
+	H4 ObfHeaderRange `yaml:",omitempty"`
 }
 
 // Validate performs structural load-time checks. Deep parameter validation
-// (padding collisions, header-range viability) belongs to the genesis tool.
+// (padding collisions, header-range viability) belongs to the genesis tool;
+// the per-strategy junk trio carries its own checks (ValidateStrategyJunk).
 func (p *ObfProfile) Validate() error {
-	if p.Jmin > p.Jmax {
-		return fmt.Errorf("jmin (%d) must not exceed jmax (%d)", p.Jmin, p.Jmax)
-	}
 	for i, h := range [4]ObfHeaderRange{p.H1, p.H2, p.H3, p.H4} {
 		if h.Min > h.Max {
 			return fmt.Errorf("h%d min (%d) must not exceed max (%d)", i+1, h.Min, h.Max)
@@ -136,8 +134,8 @@ type CentralCfg struct {
 	Timestamp           int64
 	ExcludeIPs          []netip.Prefix          `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
 	DynamicPrefixRanges []netip.Prefix          `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
-	AwgProfile          *ObfProfile             `yaml:"awg_profile,omitempty"`           // mesh-wide shared AWG 2.0 S/H/J dialect; nil = vanilla-compat. The i-packets moved into obf strategies.
-	ObfStrategies       map[string]*ObfStrategy `yaml:"obf,omitempty"`                   // named obf strategies: ports + per-strategy rotation policy + sender i-packets; referenced per-endpoint as host[strategy1,strategy2]
+	AwgProfile          *ObfProfile             `yaml:"awg_profile,omitempty"`           // mesh-wide shared AWG 2.0 S/H handshake dialect; nil = vanilla-compat. The sender-local junk (jc/jmin/jmax, i1-i5) lives on the obf strategies.
+	ObfStrategies       map[string]*ObfStrategy `yaml:"obf,omitempty"`                   // named obf strategies: ports + per-strategy rotation policy + the sender-local junk (jc/jmin/jmax, i1-i5); referenced per-endpoint as host[strategy1,strategy2]
 	PriorityRules       []PriorityRule          `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
 }
 
@@ -311,7 +309,7 @@ func retiredListenPortsError(where string) error {
 }
 
 func retiredNodeObfError(where string) error {
-	return fmt.Errorf("%s: the per-node obf block moved into central obf strategies — carry the i1..i5 junk-packet params on the obf strategy that uses them (central top-level `obf:` block); the `protocol` label may stay on the strategy as an informational field", where)
+	return fmt.Errorf("%s: the per-node obf block moved into central obf strategies — carry the jc/jmin/jmax and i1..i5 junk-packet params on the obf strategy that uses them (central top-level `obf:` block)", where)
 }
 
 // ValidateHopPolicyCfg checks one file's hop policy for internal

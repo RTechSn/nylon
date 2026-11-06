@@ -28,19 +28,23 @@ func generate(t *testing.T, presetName string, random bool, protocol string, mtu
 	if err != nil {
 		t.Fatalf("reading generated output: %v", err)
 	}
+	// Strict pins the fragment to the current schema: a leftover field (the
+	// retired `protocol` label, junk on the mesh-wide profile) fails here
+	// instead of sailing through as an ignored key.
 	var cfg state.CentralCfg
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("generated output does not unmarshal into state.CentralCfg: %v\noutput:\n%s", err, data)
+	if err := yaml.UnmarshalWithOptions(data, &cfg, yaml.Strict()); err != nil {
+		t.Fatalf("generated output does not unmarshal strictly into state.CentralCfg: %v\noutput:\n%s", err, data)
 	}
 	return cfg
 }
 
 // validateProfile re-runs the amnezigo obfuscation sub-validators over a
-// generated (non-compat) profile: per-H range viability plus the AWG 2.0
-// size invariant for the strategy's I-packet lengths. It also asserts the
-// GenerateHeaderRanges invariant: generated ranges stay clear of the
+// generated (non-compat) fragment: per-H range viability on the mesh-wide
+// profile plus the AWG 2.0 size invariant for the strategy's junk — the
+// I-packet lengths against the strategy's jmin/jmax range. It also asserts
+// the GenerateHeaderRanges invariant: generated ranges stay clear of the
 // vanilla WG message type-ids 1..4.
-func validateProfile(t *testing.T, profile *state.ObfProfile, iSet [5]string) {
+func validateProfile(t *testing.T, profile *state.ObfProfile, strat *state.ObfStrategy) {
 	t.Helper()
 	if profile == nil {
 		t.Fatal("central awg_profile is nil")
@@ -53,18 +57,21 @@ func validateProfile(t *testing.T, profile *state.ObfProfile, iSet [5]string) {
 			t.Errorf("h%d min (%d) must exceed the vanilla WG type-id window 1..4", i+1, h.Min)
 		}
 	}
+	if strat.Jc == nil || strat.Jmin == nil || strat.Jmax == nil {
+		t.Fatalf("strategy junk trio missing from the fragment: %+v", strat)
+	}
 	iSizes := []int{
-		amnezigo.CPSLength(iSet[0]),
-		amnezigo.CPSLength(iSet[1]),
-		amnezigo.CPSLength(iSet[2]),
-		amnezigo.CPSLength(iSet[3]),
-		amnezigo.CPSLength(iSet[4]),
+		amnezigo.CPSLength(strat.I1),
+		amnezigo.CPSLength(strat.I2),
+		amnezigo.CPSLength(strat.I3),
+		amnezigo.CPSLength(strat.I4),
+		amnezigo.CPSLength(strat.I5),
 	}
 	if err := amnezigo.ValidatePacketSizes(
 		int(profile.S1), int(profile.S2), int(profile.S3), int(profile.S4),
-		iSizes, int(profile.Jmin), int(profile.Jmax),
+		iSizes, int(*strat.Jmin), int(*strat.Jmax),
 	); err != nil {
-		t.Errorf("packet sizes invalid for strategy I-set %q: %v", iSet[0], err)
+		t.Errorf("packet sizes invalid for strategy junk %q: %v", strat.I1, err)
 	}
 }
 
@@ -88,13 +95,16 @@ func TestGeneratePresetStrategyValidates(t *testing.T) {
 	}
 	name, strat := strategyOf(t, cfg)
 	if name != "quic" {
-		t.Errorf("strategy name = %q, want %q (defaults to the protocol)", name, "quic")
-	}
-	if strat.Protocol != "quic" {
-		t.Errorf("strategy.Protocol = %q, want %q", strat.Protocol, "quic")
+		t.Errorf("strategy name = %q, want %q (defaults to the protocol template name)", name, "quic")
 	}
 	if strat.Ports != "40000-41000" {
 		t.Errorf("strategy.Ports = %q, want %q", strat.Ports, "40000-41000")
+	}
+	// the protocol label is GONE: the strategy name is its identity, and
+	// generate() above proves the fragment unmarshals strictly — a leftover
+	// `protocol:` key would fail there
+	if strat.Jc == nil || *strat.Jc == 0 || strat.Jmin == nil || *strat.Jmin == 0 || strat.Jmax == nil || *strat.Jmax == 0 {
+		t.Errorf("strategy junk trio missing or zero: %+v", strat)
 	}
 	// Named protocol templates fill I1-I4; I5 is intentionally left empty
 	// by the amnezigo oracle (see DNSTemplate et al.).
@@ -103,7 +113,7 @@ func TestGeneratePresetStrategyValidates(t *testing.T) {
 			t.Errorf("strategy.I%d is empty", j+1)
 		}
 	}
-	validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
+	validateProfile(t, cfg.AwgProfile, strat)
 
 	// the fragment must validate as part of a full central config with a
 	// tagged endpoint using it (two routers so the graph pairing is valid)
@@ -138,7 +148,6 @@ func TestGenerateCompatProfile(t *testing.T) {
 		}
 	}
 	for name, v := range map[string]uint32{
-		"jc": cfg.AwgProfile.Jc, "jmin": cfg.AwgProfile.Jmin, "jmax": cfg.AwgProfile.Jmax,
 		"s1": cfg.AwgProfile.S1, "s2": cfg.AwgProfile.S2, "s3": cfg.AwgProfile.S3, "s4": cfg.AwgProfile.S4,
 	} {
 		if v != 0 {
@@ -149,6 +158,9 @@ func TestGenerateCompatProfile(t *testing.T) {
 	_, strat := strategyOf(t, cfg)
 	if strat.Ports != "51820" {
 		t.Errorf("compat strategy.Ports = %q, want 51820", strat.Ports)
+	}
+	if strat.Jc != nil || strat.Jmin != nil || strat.Jmax != nil {
+		t.Errorf("compat strategy must carry no junk trio: %+v", strat)
 	}
 	for j, seq := range []string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5} {
 		if seq != "" {
@@ -168,7 +180,7 @@ func TestGenerateRandomStrategyValidates(t *testing.T) {
 			t.Errorf("strategy.I%d is empty", j+1)
 		}
 	}
-	validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
+	validateProfile(t, cfg.AwgProfile, strat)
 }
 
 // TestGenerateRandomRedrawIsValid drives both shared-profile sources with
@@ -187,9 +199,6 @@ func TestGenerateRandomRedrawIsValid(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := generate(t, "standard-1420", tc.randomShared, amnezigo.ProtocolRandom, 1420, "obf_main", "30000-31000", false)
 			_, strat := strategyOf(t, cfg)
-			if strat.Protocol != amnezigo.ProtocolRandom {
-				t.Errorf("strategy.Protocol = %q, want %q", strat.Protocol, amnezigo.ProtocolRandom)
-			}
 			if strat.Ports != "30000-31000" {
 				t.Errorf("strategy.Ports = %q, want 30000-31000", strat.Ports)
 			}
@@ -199,7 +208,7 @@ func TestGenerateRandomRedrawIsValid(t *testing.T) {
 					t.Errorf("strategy.I%d is empty", j+1)
 				}
 			}
-			validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
+			validateProfile(t, cfg.AwgProfile, strat)
 		})
 	}
 }
