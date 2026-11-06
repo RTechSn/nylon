@@ -344,7 +344,7 @@ func TestStrategyJunkFallbackTiers(t *testing.T) {
 		"awg":  {Ports: "40000", I1: "aabb"},
 		"awg2": {Ports: "40001", I1: "ccdd"},
 	}, nil, []string{"awg", "awg2"})
-	if src != "" || junk.set() {
+	if src != "" || !junk.Empty() {
 		t.Fatalf("conflicting i-sets must fall back to none, got src=%q junk=%+v", src, junk)
 	}
 
@@ -353,7 +353,7 @@ func TestStrategyJunkFallbackTiers(t *testing.T) {
 		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800)},
 		"awg2": {Ports: "40001", Jc: hopStr(7), Jmin: hopStr(250), Jmax: hopStr(800)},
 	}, nil, []string{"awg", "awg2"})
-	if src != "" || junk.set() {
+	if src != "" || !junk.Empty() {
 		t.Fatalf("conflicting trios must fall back to none, got src=%q junk=%+v", src, junk)
 	}
 
@@ -382,7 +382,7 @@ func TestStrategyJunkFallbackTiers(t *testing.T) {
 		"awg":  {Ports: "40000", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "aabb"},
 		"awg2": {Ports: "40001", Jc: hopStr(5), Jmin: hopStr(250), Jmax: hopStr(800), I1: "ccdd"},
 	}, nil, []string{"awg", "awg2"})
-	if src != "" || junk.set() {
+	if src != "" || !junk.Empty() {
 		t.Fatalf("partial agreement must not serve the agreed tier, got src=%q junk=%+v", src, junk)
 	}
 }
@@ -421,7 +421,7 @@ func TestStrategyJunkPerStrategySeals(t *testing.T) {
 	// the device fallback: the strategies disagree and no obf default exists
 	used := NodeUsedStrategies(central, "hub")
 	junk, src := EffectiveStrategyJunk(m, central.Obf, used)
-	if src != "" || junk.set() {
+	if src != "" || !junk.Empty() {
 		t.Fatalf("disagreeing strategies with no default must render no fallback junk, got src=%q junk=%+v", src, junk)
 	}
 }
@@ -460,7 +460,7 @@ func TestStrategyJunkOf(t *testing.T) {
 	// a junkless strategy with no defaults: ok with a ZERO spec (a junkless
 	// strategy must not leak the device fallback onto its connections)
 	spec, ok = StrategyJunkOf(m, nil, "none")
-	if !ok || spec.set() {
+	if !ok || !spec.Empty() {
 		t.Fatalf("junkless strategy must resolve to a zero spec: ok=%v %+v", ok, spec)
 	}
 

@@ -287,18 +287,18 @@ type StrategyJunk struct {
 	I    [5]string
 }
 
-// set reports whether the junk configuration carries anything (a junk
-// datagram trio or an i-packet).
-func (j StrategyJunk) set() bool {
+// Empty reports whether the junk configuration carries nothing (no junk
+// datagram trio, no i-packet).
+func (j StrategyJunk) Empty() bool {
 	if j.Jc > 0 {
-		return true
+		return false
 	}
 	for _, v := range j.I {
 		if v != "" {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // StrategyJunkOf resolves ONE strategy's effective junk: its own trio and
@@ -419,7 +419,7 @@ func EffectiveStrategyJunk(m map[string]*ObfStrategy, obf *CentralObf, used []st
 			}
 		}
 		d.I = [5]string{obf.I1, obf.I2, obf.I3, obf.I4, obf.I5}
-		if d.set() {
+		if !d.Empty() {
 			return d, "defaults"
 		}
 	}

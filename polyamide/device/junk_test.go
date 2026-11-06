@@ -8,6 +8,7 @@ package device
 import (
 	"bytes"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -462,5 +463,61 @@ func TestJunkPacketsDraw(t *testing.T) {
 	}
 	if bufs := dev.junkPackets(3, 20, 10); len(bufs) != 0 {
 		t.Fatalf("an inverted range drew %d datagrams", len(bufs))
+	}
+}
+
+// TestUAPIGetJunkHookLines pins the dump surface: the per-peer junk lines
+// appear next to the hop lines when a source is wired (the label, the trio
+// and the i-set the NEXT handshake speaks) and stay absent for sourceless
+// peers — the device-global jc/jmin/jmax + i1..i5 knobs carry those.
+func TestUAPIGetJunkHookLines(t *testing.T) {
+	dev, peer, _ := newJunkDevice(t,
+		"jc", "2",
+		"jmin", "50",
+		"jmax", "90",
+	)
+
+	src := &junkSourceStub{spec: JunkSpec{Jc: 3, Jmin: 100, Jmax: 200, I: [5]string{"<b 0xc0ff>", "", "<r 16>", "", ""}}, ok: true}
+	src.label = "alpha"
+	peer.SetJunkSource(src)
+
+	var buf bytes.Buffer
+	if err := dev.IpcGetOperation(&buf); err != nil {
+		t.Fatalf("IpcGetOperation: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"junk_hook=true\n",
+		"junk_strategy=alpha\n",
+		"junk_jc=3\n",
+		"junk_jmin=100\n",
+		"junk_jmax=200\n",
+		"junk_i1=<b 0xc0ff>\n",
+		"junk_i3=<r 16>\n",
+		// the device-level knobs render as-is alongside the hook lines
+		"jc=2\n",
+		"jmin=50\n",
+		"jmax=90\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dump missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "junk_i2=") || strings.Contains(out, "junk_i4=") || strings.Contains(out, "junk_i5=") {
+		t.Errorf("unset i-slots must not render:\n%s", out)
+	}
+
+	// unwired: the per-peer lines disappear, the device knobs stay
+	peer.SetJunkSource(nil)
+	buf.Reset()
+	if err := dev.IpcGetOperation(&buf); err != nil {
+		t.Fatalf("IpcGetOperation: %v", err)
+	}
+	out = buf.String()
+	if strings.Contains(out, "junk_") {
+		t.Errorf("an unwired peer must carry no junk_ lines:\n%s", out)
+	}
+	if !strings.Contains(out, "jc=2\n") {
+		t.Errorf("the device knobs must survive the unwiring:\n%s", out)
 	}
 }

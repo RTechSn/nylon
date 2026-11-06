@@ -177,6 +177,29 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 				}
 			}
 
+			// per-peer junk state (absent when no junk source is wired —
+			// the device-global jc/jmin/jmax + i1..i5 knobs carry the peer).
+			// The spec is a live consult: what the NEXT handshake initiation
+			// toward this peer prepends. The label names the configuration
+			// when the source implements JunkLabeler (the carrying obf
+			// strategy).
+			if spec, label, ok := peer.JunkStatus(); ok {
+				sendf("junk_hook=true")
+				if label != "" {
+					sendf("junk_strategy=%s", label)
+				}
+				if spec.Jc > 0 {
+					sendf("junk_jc=%d", spec.Jc)
+					sendf("junk_jmin=%d", spec.Jmin)
+					sendf("junk_jmax=%d", spec.Jmax)
+				}
+				for i, ispec := range spec.I {
+					if ispec != "" {
+						sendf("junk_i%d=%s", i+1, ispec)
+					}
+				}
+			}
+
 			nano := peer.lastHandshakeNano.Load()
 			secs := nano / time.Second.Nanoseconds()
 			nano %= time.Second.Nanoseconds()

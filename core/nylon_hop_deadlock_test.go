@@ -73,6 +73,9 @@ func newDeadlockFixtureNylon(t *testing.T) (*Nylon, device.NoisePublicKey, *bloc
 						Ports:           "30000-30009",
 						PortHoppingMode: state.HopModeProactive,
 						PortHopping:     &state.PortHoppingCfg{BudgetPackets: uint32ptr2(12)},
+						Jc:              uint32ptr2(1),
+						Jmin:            uint32ptr2(10),
+						Jmax:            uint32ptr2(20),
 					},
 				}},
 				Routers: []state.RouterCfg{
@@ -200,6 +203,18 @@ func TestGetPortFactoryBindsWithoutFactoryLock(t *testing.T) {
 	// their park within microseconds; the settle delay only absorbs CI
 	// scheduling jitter.
 	time.Sleep(250 * time.Millisecond)
+
+	// The junk hook consult (portFactory.JunkFor through peer.JunkStatus)
+	// takes only the factory mutex and must answer while a sender parks
+	// inside the device net READ lock — exactly the position of the consult
+	// a concurrent handshake initiation's prepend assembly finds itself in.
+	// The hook must be wired by ensurePortFactories (wireDevPeer) and serve
+	// the carrying strategy's spec.
+	if spec, label, active := peer.JunkStatus(); !active {
+		t.Fatal("the junk hook must be wired by ensurePortFactories")
+	} else if spec.Jc != 1 || spec.Jmin != 10 || spec.Jmax != 20 {
+		t.Fatalf("the hook must serve the hop strategy's junk, got %+v (label %q)", spec, label)
+	}
 
 	// What a concurrent send path does inside NextHopEndpoint: take the
 	// factory mutex while the READ lock is still held elsewhere.

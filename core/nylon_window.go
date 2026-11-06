@@ -2,12 +2,14 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"net"
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +140,14 @@ type portFactory struct {
 	// by refreshGroups on the dispatch loop; the send path only READS it
 	// (strategy-restricted draws never resolve on the send path).
 	strategyGroups map[string][]state.PortGroup
+
+	// junkSpecs caches each candidate strategy's resolved junk spec (the
+	// per-strategy junk the hook serves; see JunkFor). Computed with the pool
+	// groups on the dispatch loop (refreshGroups) — the resolved strategy
+	// map re-materialises on every ObfStrategies() call when obf-level
+	// defaults are set, which is never send-path safe — and read by the send
+	// path only under mu.
+	junkSpecs map[string]state.StrategyJunk
 
 	// rotation policy of the CURRENT carrying candidate's strategy (see
 	// policies); the mode governs WHEN the carrying endpoint rotates
@@ -779,8 +789,23 @@ func (f *portFactory) refreshGroups() {
 	}) {
 		f.pool.SetGroups(groups)
 	}
+	// the per-strategy junk specs resolve alongside the groups — INDEPENDENT
+	// of candidate host resolution (a strategy whose host is still resolving
+	// must already carry its junk for the moment its first endpoint is drawn)
+	m := f.n.ObfStrategies()
+	obf := f.n.CentralCfg.Obf
+	junk := make(map[string]state.StrategyJunk, len(candidates))
+	for _, c := range candidates {
+		if _, ok := junk[c.strategy]; ok {
+			continue
+		}
+		if spec, ok := state.StrategyJunkOf(m, obf, c.strategy); ok {
+			junk[c.strategy] = spec
+		}
+	}
 	f.mu.Lock()
 	f.strategyGroups = perStrategy
+	f.junkSpecs = junk
 	f.mu.Unlock()
 }
 
@@ -1104,10 +1129,12 @@ func (f *portFactory) reconcileLinks() {
 	// a rotation landed the carrying endpoint on a different strategy:
 	// re-wire the device peer's hop source to that strategy's mode/budget
 	// (the send path only flags; device mutation lives here)
+	// junk switch - the next handshake already speaks the new strategy's
+	// junk (JunkFor reads currentStrategy live)
 	if rewire != "" && devPeer != nil {
 		f.wireDevPeer(devPeer)
 		f.n.Log.Info("port hop: carrying strategy switched",
-			"peer", f.node, "strategy", rewire, "mode", f.hopMode())
+			"peer", f.node, "strategy", rewire, "mode", f.hopMode(), "junk", f.junkSummary(rewire))
 	}
 
 	if !current.IsValid() {
@@ -1478,11 +1505,16 @@ func (f *portFactory) scheduleTombstoneRemoval(addr string) {
 // wireDevPeer wires the device peer's hop source to the CURRENT strategy's
 // rotation mode: proactive budgets rotate on the send path; every other mode
 // rotates externally from the dispatch loop. Must run on the dispatch loop.
+// The junk hook rides along: JunkFor reads the CURRENT strategy live (the
+// next handshake after a switch simply speaks the new strategy's junk — no
+// re-wiring needed for a switch, the wiring here only guarantees the hook's
+// presence).
 func (f *portFactory) wireDevPeer(wgPeer *device.Peer) {
 	f.mu.Lock()
 	strategy := f.currentStrategy
 	f.mu.Unlock()
 	policy := f.policyOf(strategy)
+	wgPeer.SetJunkSource(f)
 	if policy.Mode == state.HopModeProactive {
 		wgPeer.SetHop(f, int(policy.Budget))
 	} else {
@@ -1491,6 +1523,61 @@ func (f *portFactory) wireDevPeer(wgPeer *device.Peer) {
 		// factory from the dispatch loop
 		wgPeer.SetHopExternal(f)
 	}
+}
+
+// JunkFor implements device.JunkSource (the per-strategy junk): the junk
+// of the strategy currently carrying the peer's connection
+// (currentStrategy, adopted on every draw/rotation). ok=false while no
+// strategy carries the connection (the bootstrap window) — the device
+// falls back to its UAPI knobs (the rendered fallback). A junkless
+// strategy serves its ZERO spec: its connections must not leak the
+// fallback.
+//
+// Send-path contract (the HopSource discipline): fast, f.mu only, no I/O,
+// never the device net write lock.
+func (f *portFactory) JunkFor(*device.Peer) (device.JunkSpec, bool) {
+	f.mu.Lock()
+	strategy, specs := f.currentStrategy, f.junkSpecs
+	f.mu.Unlock()
+	if strategy == "" || specs == nil {
+		return device.JunkSpec{}, false
+	}
+	spec, ok := specs[strategy]
+	if !ok {
+		return device.JunkSpec{}, false
+	}
+	return device.JunkSpec{Jc: spec.Jc, Jmin: spec.Jmin, Jmax: spec.Jmax, I: spec.I}, true
+}
+
+// JunkLabel implements device.JunkLabeler: the obf strategy carrying the
+// peer's connection (observability — the UAPI dump surfaces it next to the
+// hop status). "" while no strategy is adopted.
+func (f *portFactory) JunkLabel() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.currentStrategy
+}
+
+// junkSummary renders one strategy's junk spec for journal lines:
+// "jc=5 jmin=64 jmax=320 i1=<..> i3=<..>" or "none".
+func (f *portFactory) junkSummary(strategy string) string {
+	f.mu.Lock()
+	specs := f.junkSpecs
+	f.mu.Unlock()
+	spec, ok := specs[strategy]
+	if !ok || spec.Empty() {
+		return "none"
+	}
+	var parts []string
+	if spec.Jc > 0 {
+		parts = append(parts, fmt.Sprintf("jc=%d jmin=%d jmax=%d", spec.Jc, spec.Jmin, spec.Jmax))
+	}
+	for i, s := range spec.I {
+		if s != "" {
+			parts = append(parts, fmt.Sprintf("i%d=%s", i+1, s))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // policyOf is the lock-taking wrapper around policyOfLocked.
@@ -1570,6 +1657,7 @@ func (n *Nylon) ensurePortFactories() error {
 			if n.hasPortFactory(peer) {
 				if wgPeer := n.Device.LookupPeer(device.NoisePublicKey(n.GetNode(peer).PubKey)); wgPeer != nil {
 					wgPeer.SetHop(nil, 0)
+					wgPeer.SetJunkSource(nil)
 				}
 				n.dropPortFactory(peer)
 			}
@@ -1581,9 +1669,11 @@ func (n *Nylon) ensurePortFactories() error {
 			continue
 		}
 		if len(candidates) == 0 {
-			// no strategy candidates for this peer: make sure any stale hop state is gone
+			// no strategy candidates for this peer: make sure any stale hop and
+			// junk state is gone
 			if n.hasPortFactory(peer) {
 				wgPeer.SetHop(nil, 0)
+				wgPeer.SetJunkSource(nil)
 				n.dropPortFactory(peer)
 			}
 			continue
