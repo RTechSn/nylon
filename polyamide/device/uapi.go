@@ -97,8 +97,8 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("listen_port=%d", device.net.port)
 		}
 
-		if device.net.portRange.Valid() {
-			sendf("listen_ports=%s", device.net.portRange.String())
+		if len(device.net.portRanges) > 0 {
+			sendf("listen_ports=%s", conn.RangesString(device.net.portRanges))
 		}
 
 		if device.net.fwmark != 0 {
@@ -302,15 +302,16 @@ func (device *Device) handleDeviceLine(ipcDev *ipcSetDevice, key, value string) 
 		}
 
 	case "listen_ports":
-		// optional additional listen range for port hopping (server side)
-		pr, err := conn.ParsePortRange(value)
+		// optional additional listen ranges for obf strategies / port
+		// hopping (server side), comma-separated: "40000-50000,51820"
+		prs, err := conn.ParsePortRanges(value)
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse listen_ports: %w", err)
 		}
-		device.Log.Verbosef("UAPI: Updating listen range")
+		device.Log.Verbosef("UAPI: Updating listen ranges")
 
 		device.net.Lock()
-		device.net.portRange = pr
+		device.net.portRanges = prs
 		device.net.Unlock()
 
 		if err := device.BindUpdate(); err != nil {

@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared profile, generates per-node handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: a top-level `obf:` block plus `routers:` entries that carry only `id` and `obf`.
+`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared dialect, generates the handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: the global `obf:` block — the mesh-wide S/H dialect inline plus ONE named entry of the `obf.strategy` map.
 
 The tool generates obfuscation parameters only. WireGuard keys are a separate concern handled by `nylon key` — see [Getting started](/guides/getting-started).
 
@@ -13,18 +13,15 @@ The tool generates obfuscation parameters only. WireGuard keys are a separate co
 
 Every run emits one fragment with two parts:
 
-- A mesh-wide shared profile under `obf:` — the junk (`jc`, `jmin`, `jmax`), padding sizes (`s1`–`s4`), and message-type header ranges (`h1`–`h4`) that every node in the mesh must share.
-- One `routers:` entry per node you list, each carrying only that node's `id` and its sender-local `obf` block with `i1`–`i5` CPS strings.
+- A mesh-wide shared handshake dialect inline in the central `obf:` block — the padding sizes (`s1`–`s4`) and message-type header ranges (`h1`–`h4`) that every node in the mesh must share. The junk (`jc`, `jmin`, `jmax`) is NOT here: it is sender-local, so it rides the strategy like the I-packets.
+- One named obf **strategy** under `obf.strategy:` carrying the sender-local junk — the `jc`/`jmin`/`jmax` trio and the `i1`–`i5` CPS strings — and the strategy's `ports` (adjust them to your deployment; the default is a single port). The strategy name is its identifier; no `protocol` field is emitted.
 
-The fragment unmarshals cleanly into the central config structure, but it does not merge itself — you paste it into `central.yaml` by hand (see [Generate a profile](#generate-a-profile)). The shared profile is mesh-uniform by construction: one oracle call fixes S/H/J for the whole mesh, and every node receives every peer's `i1`–`i5` spec through the central config while sending only with its own.
+The fragment unmarshals cleanly into the central config structure, but it does not merge itself — you paste it into `central.yaml` by hand (see [Generate a profile](#generate-a-profile)). The dialect is mesh-uniform by construction: one oracle call fixes S/H for the whole mesh. The strategy's junk rides on every handshake the nodes that use the strategy send (the AWG 2.0 device emits one junk configuration toward every peer — see [Obfuscation](/guides/obfuscation) for the wire reality).
 
-The following output is the real committed fixture from this repository, generated with the command shown in [Step 5](#step-5-run-the-tool). Each additional id you pass to `--peers` appends another entry with the same shape:
+The following output shape is what the command shown in [Step 5](#step-5-run-the-tool) produces:
 
 ```yaml title="nylon-genesis output fragment"
 obf:
-  jc: 5
-  jmin: 250
-  jmax: 800
   s1: 32
   s2: 28
   s3: 20
@@ -41,17 +38,21 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
-routers:
-- id: node1
-  obf:
-    protocol: quic
-    i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
-    i2: <b 0xc0ff><b 0x00000001><b 0x08><d><b 0x00><b 0x00><b 0x0020><b 0x01><t><r 20>
-    i3: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0010><b 0x01><t><r 10>
-    i4: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0005><b 0x01><t><r 5>
+  strategy:
+    quic:
+      ports: "51820"
+      jc: 5
+      jmin: 250
+      jmax: 800
+      i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
+      i2: <b 0xc0ff><b 0x00000001><b 0x08><d><b 0x00><b 0x00><b 0x0020><b 0x01><t><r 20>
+      i3: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0010><b 0x01><t><r 10>
+      i4: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0005><b 0x01><t><r 5>
 ```
 
-For the meaning of each field, see [Obfuscation](/guides/obfuscation).
+The strategy is named after the protocol template by default (`--strategy` overrides the name), and the name is what endpoints reference: `hub.example.com[quic]`. The template itself only shapes the generated I-patterns — no `protocol` field is emitted; the name is the identifier.
+
+For the meaning of each field, see [Obfuscation](/guides/obfuscation) and the [Obf strategies reference](/reference/config#obf-strategies).
 
 ## Build the tool first
 
@@ -65,65 +66,66 @@ make build
 
 ## Generate a profile
 
-### Step 1. Choose the shared profile source
+### Step 1. Choose the shared dialect source
 
-Decide where the mesh-wide S/H/J parameters come from:
+Decide where the mesh-wide S/H dialect and the strategy's junk trio come from:
 
-- **Preset** (default): a named amnezigo preset, `standard-1420` by default. The preset supplies the junk and padding profile and the default MTU.
-- **Random**: pass `--random` to have the oracle generate a random profile instead. The preset still provides the default MTU and contributes `s1` and `jc`; `s2`–`s4`, `h1`–`h4`, and the `jmin`/`jmax` junk range are drawn fresh. A draw can collide a peer's `i1`–`i5` packet length with one of the profile's padded handshake sizes, which the AWG 2.0 size invariant forbids; the generator redraws a whole random profile when that is what is random, and always redraws a peer's `i`-set, until it validates (64 attempts, then an error) — with the default `--protocol random` that combination failed about half the time before the redraw.
+- **Preset** (default): a named amnezigo preset, `standard-1420` by default. The preset supplies the padding profile (S) and the default MTU, plus the strategy's junk trio (`jc`/`jmin`/`jmax`).
+- **Random**: pass `--random` to have the oracle generate a random dialect instead. The preset still provides the default MTU and contributes `s1` and `jc`; `s2`–`s4`, `h1`–`h4`, and the `jmin`/`jmax` junk range are drawn fresh. A draw can collide the strategy's `i1`–`i5` packet length with one of the profile's padded handshake sizes, which the AWG 2.0 size invariant forbids; the generator redraws the whole random profile, or just the strategy's `i`-set, until it validates (64 attempts, then an error).
 
 ### Step 2. Choose a protocol template
 
-`--protocol` selects the camouflage template for the per-node handshake packets: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random` (the default). Named protocols use that protocol's template shape and fill `i1`–`i4`; `i5` is intentionally left empty. `random` does not pick a template — it generates randomized simple CPS patterns across all of `i1`–`i5`, including `i5`.
+`--protocol` selects the camouflage template for the strategy's handshake packets: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random` (the default). Named protocols use that protocol's template shape and fill `i1`–`i4`; `i5` is intentionally left empty. `random` does not pick a template — it generates randomized simple CPS patterns across all of `i1`–`i5`, including `i5`.
 
 ### Step 3. Choose an MTU clamp (optional)
 
-`--mtu` bounds only the generated per-node I-packet sizes to your underlay MTU (the oracle caps each I-packet at `mtu - 49 - 149 - s1`). Junk sizes are not clamped — they come from the preset, or from a fresh 64–1024 byte draw under `--random` — so a small `--mtu` can still emit junk datagrams large enough to fragment. Leave it at the default `0` to use the preset's default MTU — `standard-1420` targets a 1420-byte underlay, and the fixture output above was generated with `--mtu 1420`.
+`--mtu` bounds only the generated I-packet sizes to your underlay MTU (the oracle caps each I-packet at `mtu - 49 - 149 - s1`). Junk sizes are not clamped — they come from the preset, or from a fresh 64–1024 byte draw under `--random` — so a small `--mtu` can still emit junk datagrams large enough to fragment. Leave it at the default `0` to use the preset's default MTU — `standard-1420` targets a 1420-byte underlay, and the example above was generated with `--mtu 1420`.
 
-### Step 4. List your nodes
+### Step 4. Name the strategy and set its ports
 
-`--peers` takes a comma-separated list of node ids. Use the same ids your routers carry in `central.yaml`, because you will merge each generated block into the matching router entry.
+`--strategy` names the generated obf strategy (default: the protocol template name) — this is the name your endpoints will reference. `--strategy-ports` sets its `ports` (default `51820`; a single port or an inclusive range like `40000-50000`). Adjust the ports to your deployment: they control where a node serving the strategy listens and which ports a node connecting through it targets.
 
 ### Step 5. Run the tool
 
 ```bash
-bin/nylon-genesis --preset standard-1420 --protocol quic --mtu 1420 --peers node1,node2
+bin/nylon-genesis --preset standard-1420 --protocol quic --mtu 1420
 ```
 
 The fragment goes to stdout. Pass `--out obf-fragment.yaml` to write it to a file instead (mode `0644`), and `-v`/`--verbose` for debug logging on stderr:
 
 ```bash
-bin/nylon-genesis --protocol quic --peers node1,node2 --out obf-fragment.yaml -v
+bin/nylon-genesis --protocol quic --strategy awg_main --strategy-ports 40000-50000 --out obf-fragment.yaml -v
 ```
 
 ### Step 6. Merge the fragment into central.yaml
 
-Paste the `obf:` block at the top level of `central.yaml`, then merge each `routers:` entry into your existing `routers:` list:
+Paste the `obf:` block at the top level of `central.yaml` (merge the generated strategy into your existing `obf.strategy` map if you already have strategies), then tag the endpoints that should use the strategy:
 
 ```yaml title="central.yaml (excerpt after merging)"
-# Top level: paste the generated obf block verbatim.
+# Top level: paste the generated obf: block verbatim.
 obf:
-  jc: 5
-  # ... rest of the generated obf block ...
+  s1: 32
+  # ... rest of the generated dialect ...
+  strategy:
+    quic:
+      ports: "40000" # adjusted to your deployment
+      # ... jc/jmin/jmax + i1..i4 from the generated fragment ...
 
 routers:
-  - id: node1
-    # Keep every existing key of this router and add obf alongside them.
-    obf:
-      protocol: quic
-      i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
-      # ... i2, i3, i4 from the generated fragment ...
+  - id: hub
+    endpoints:
+      - "hub.example.com[quic]" # the strategy tag names the ports
 ```
 
-The full field semantics — what S/H/J do on receive, why S/H must match mesh-wide, and how sender-local `i1`–`i5` are used — are covered in [Obfuscation](/guides/obfuscation), and the complete field reference lives in [Configuration reference](/reference/config).
+The full field semantics — what S/H do on receive, why they must match mesh-wide, and the one-junk-set-per-device wire reality — are covered in [Obfuscation](/guides/obfuscation), and the complete field reference lives in [Configuration reference](/reference/config).
 
 ::::caution
-The fragment does not merge itself. Each `routers:` entry contains only `id` and `obf`, so never paste the fragment's `routers:` list over your existing one — merge each `obf` block into the matching node's entry and keep that node's other keys intact.
+The fragment does not merge itself. If your `central.yaml` already defines strategies, merge the generated entry into the existing `obf.strategy` map instead of pasting over it, and remember that the strategies a node uses must share one junk set (`jc`/`jmin`/`jmax` and `i1`–`i5`).
 ::::
 
 ### Step 7. Distribute and reload
 
-Ship the updated `central.yaml` to your mesh the same way you distribute any config change — via [config distribution](/guides/config-distribution) or a direct reload. Nodes pick up the new profile on their next config sync.
+Ship the updated `central.yaml` to your mesh the same way you distribute any config change — via [config distribution](/guides/config-distribution) or a direct reload. Nodes pick up the new dialect on their next config sync.
 
 ::::caution
 Treat an obfuscation profile rollout as a maintenance action. The new parameters apply live when each node syncs, but in-flight handshakes can fail for one rekey window during the transition.
@@ -133,20 +135,21 @@ Treat an obfuscation profile rollout as a maintenance action. The new parameters
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--preset` | `standard-1420` | amnezigo preset name for the shared profile. |
-| `--random` | `false` | Generate a random shared profile via amnezigo's `GenerateConfig` instead of the preset; the draw is redrawn until it satisfies the size-classification invariant (64 attempts, then an error). |
-| `--protocol` | `random` | Per-peer I1–I5 template: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`. |
+| `--preset` | `standard-1420` | amnezigo preset name for the shared dialect. |
+| `--random` | `false` | Generate a random shared dialect via amnezigo's `GenerateConfig` instead of the preset; the draw is redrawn until it satisfies the size-classification invariant (64 attempts, then an error). |
+| `--protocol` | `random` | I1–I5 template: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`. |
 | `--mtu` | `0` | Underlay MTU clamp for I-packet sizes only; `0` uses the preset default. |
-| `--peers` | empty | Comma-separated node ids to generate per-node I1–I5 for. |
-| `--compat` | `false` | Emit the fixed vanilla-compat profile; the output does not depend on `--preset` or `--protocol`, but they are still validated. |
+| `--strategy` | protocol name | Name of the generated obf strategy (the name endpoints reference). |
+| `--strategy-ports` | `51820` | The strategy's `ports`: a single port or an inclusive range. |
+| `--compat` | `false` | Emit the fixed vanilla-compat dialect; the output does not depend on `--preset` or `--protocol`, but they are still validated. |
 | `--out` | stdout | Write to `FILE` instead of stdout (file mode `0644`). |
 | `-v`, `--verbose` | `false` | Log debug detail to stderr. |
 
-Print the stamped build version with the `--version` flag: `nylon-genesis --version` outputs `nylon-genesis version dev` (`dev` for local builds without version ldflags). There is no `version` subcommand — an unknown positional word is not an error, so `nylon-genesis version` silently generates a full obfuscation profile on stdout.
+Print the stamped build version with the `--version` flag: `nylon-genesis --version` outputs `nylon-genesis version dev` (`dev` for local builds without version ldflags). There is no `version` subcommand — an unknown positional word is not an error, so `nylon-genesis version` silently generates a full obfuscation fragment on stdout.
 
 ## Vanilla compatibility (--compat)
 
-Pass `--compat` to generate the vanilla-compat profile instead of an obfuscated one. It pins `h1`–`h4` to the exact vanilla WireGuard message types and leaves everything else at zero — no junk, no padding, and no per-node `obf` blocks. This is the profile that keeps stock WireGuard clients working against your mesh during a version-skew window:
+Pass `--compat` to generate the vanilla-compat dialect instead of an obfuscated one. It pins `h1`–`h4` to the exact vanilla WireGuard message types and leaves everything else at zero — no junk, no padding, and no `i`-params on the strategy. This is the dialect that keeps stock WireGuard clients working against your mesh during a version-skew window:
 
 ```yaml title="nylon-genesis --compat output"
 obf:
@@ -162,9 +165,9 @@ obf:
   h4:
     min: 4
     max: 4
-routers:
-- id: node1
-- id: node2
+  strategy:
+    compat:
+      ports: "51820"
 ```
 
 Two things to know about this mode:
@@ -172,18 +175,18 @@ Two things to know about this mode:
 - The compat output does not depend on `--preset` or `--protocol`, but they are still validated: an unknown value fails before any output is produced.
 - It deliberately skips the header-range viability checks that normal generation runs, because pinning headers to 1–4 is exactly what those checks reject: obfuscated ranges must stay clear of the vanilla message types.
 
-If your whole mesh speaks vanilla WireGuard anyway, you can also omit the `obf` key from `central.yaml` altogether — a mesh with no profile pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the profile semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
+If your whole mesh speaks vanilla WireGuard anyway, you can also omit `obf` from `central.yaml` altogether — a mesh with no dialect pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the dialect semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
 
 ## Validation and failure behavior
 
 Before writing anything, the tool validates its own output:
 
-1. Structural checks on the profile: `jmin` must not exceed `jmax`, and every `h1`–`h4` range must have `min` no greater than `max`.
+1. Structural checks on the dialect and the strategy's junk trio: every `h1`–`h4` range must have `min` no greater than `max`, and the strategy's `jmin` must not exceed `jmax`.
 2. Per-header range viability via the amnezigo validator.
 3. The packet-size classification invariant for the S-padded handshake sizes and the junk range.
-4. A re-check of the freshly generated per-peer `i1`–`i5` lengths.
+4. A re-check of the freshly generated strategy `i1`–`i5` lengths.
 
-An unknown `--protocol` or `--preset` name fails before any output is produced, so a failed run never leaves a half-written `--out` file behind.
+An unknown `--protocol`, `--preset` or `--strategy` name, or an invalid `--strategy-ports`, fails before any output is produced, so a failed run never leaves a half-written `--out` file behind.
 
 ## Provenance and licensing
 

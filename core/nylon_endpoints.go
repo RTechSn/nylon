@@ -551,10 +551,10 @@ func (n *Nylon) probeNew() error {
 		}
 		cfg := n.GetRouter(peer)
 		for _, address := range cfg.Endpoints {
-			// port hopping: range-form endpoints (e.g. "1.2.3.4:30000-40000")
+			// obf strategies: endpoints that expand into strategy candidates
 			// are owned by the port factory, which materialises concrete
 			// addr:port links as they are drawn; they are never probed as-is
-			if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
+			if n.endpointFactoryOwned(address) {
 				continue
 			}
 			idx := slices.IndexFunc(neigh.Eps, func(link state.Endpoint) bool {

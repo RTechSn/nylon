@@ -14,33 +14,45 @@ A tunnel pinned to a single `ip:port` cannot survive the first behaviour at all:
 
 ## Design in one paragraph
 
-Nylon already supports multiple endpoints per peer with probe-based ranking. Port hopping reuses that machinery: a peer configured with a **port range** (`203.0.113.7:30000-40000`) is *not* expanded into thousands of links at startup. Instead a **port factory** keeps exactly one *carrying endpoint* alive at a time, draws new ports from a **port pool** as the old ones burn out, and materialises each drawn port as a regular nylon link that the existing probe/metric/ranking code can see. Runtime state is O(active window), not O(range), which is what makes production-sized ranges (tens of thousands of ports) viable.
+Nylon already supports multiple endpoints per peer with probe-based ranking. Port hopping reuses that machinery: a peer endpoint tagged with an **obf strategy carrying a port range** (`203.0.113.7[hopping]` where strategy `hopping` defines `ports: "30000-40000"`) is *not* expanded into thousands of links at startup. Instead a **port factory** keeps exactly one *carrying endpoint* alive at a time, draws new ports from a **port pool** as the old ones burn out, and materialises each drawn port as a regular nylon link that the existing probe/metric/ranking code can see. Runtime state is O(active window), not O(range), which is what makes production-sized ranges (tens of thousands of ports) viable.
 
 The rotation itself lives in the device send path (a per-peer packet budget enforced on every outgoing batch — data, retransmits, keepalives, probe packets and AmneziaWG junk all count), so the switch to a fresh port is immediate and never waits for the nylon control loop. The WireGuard session is port-agnostic (transport data is decrypted by receiver index), so rotation needs no new handshake and nothing is injected into the encrypted stream — AmneziaWG compatibility is preserved by construction.
 
 ## Server side
 
-The server must accept packets on **every** port of its advertised range and — crucially — answer each peer from exactly the port that peer's last packet targeted. There are two modes; both satisfy the same contract, so the client cannot tell them apart:
+The server must accept packets on **every** port of the strategies its advertised endpoints name and — crucially — answer each peer from exactly the port that peer's last packet targeted. The listen set is **derived**: the union of those strategies' `ports`, merged into disjoint ranges. There are two serving modes; both satisfy the same contract, so the client cannot tell them apart:
 
 ### In-daemon range listener (default, up to 4096 ports)
 
-Set `listen_ports` in the server's `node.yaml` (the default `listen_mode: sockets`). The daemon binds one extra UDP socket per port and tags received packets with the receiving port, so replies leave through the same socket (NAT path symmetry):
+The strategies live in `central.yaml`; the server's `node.yaml` keeps the default `listen_mode: sockets`. The daemon binds one extra UDP socket per port of the derived union and tags received packets with the receiving port, so replies leave through the same socket (NAT path symmetry):
+
+```yaml title="central.yaml (excerpt)"
+obf:
+  strategy:
+    hopping:
+      ports: "57175-57575" # the union of your advertised strategies; max 4096 ports in sockets mode
+```
 
 ```yaml title="node.yaml (server)"
-port: 57175
-listen_ports: 57175-57575 # must contain the primary port; max 4096 ports wide
-listen_mode: sockets # default, may be omitted
+port: 57175 # the primary port; always bound
+listen_mode: sockets # the default, may be omitted
 ```
 
 This mode is the simplest and works everywhere without root firewall changes, but every port costs file descriptors and one receive goroutine per address family, hence the ceiling. Budget roughly `0.6 MB` of resident memory per range port (receive buffers plus socket overhead): a 500-port range sits around 300 MB above the daemon baseline, and the full 4096-port ceiling around 2.5 GB. Plan file descriptors accordingly — the range needs about `2 × ports` descriptors (IPv4+IPv6) plus headroom; `LimitNOFILE=8192` (as shipped in `nylon.service`) covers ranges up to a few thousand ports. A bind failure is fatal at startup by design — the daemon refuses to run with a half-open range — so a *running* daemon either has the full range or none of it.
 
 ### Netfilter DNAT mode (daemon-managed, arbitrarily wide ranges)
 
-For wide ranges, `listen_mode: nftables` keeps the daemon on its single primary-port socket and lets the kernel do the range: at startup the daemon installs (and at shutdown removes) an nftables table that redirects the whole listen range to the primary port, and conntrack mirrors the reverse direction:
+For wide unions, `listen_mode: nftables` keeps the daemon on its single primary-port socket and lets the kernel do the ranges: at startup the daemon installs (and at shutdown removes) an nftables table that redirects every range of the derived union to the primary port, and conntrack mirrors the reverse direction:
+
+```yaml title="central.yaml (excerpt)"
+obf:
+  strategy:
+    hopping:
+      ports: "1024-65535" # no width ceiling in this mode
+```
 
 ```yaml title="node.yaml (server)"
 port: 57175
-listen_ports: 1024-65535 # must contain the primary port; no width ceiling in this mode
 listen_mode: nftables
 ```
 
@@ -65,27 +77,35 @@ Requirements and behaviour:
 - Pick ranges that do not overlap other services on the host, and make sure the firewall allows the whole UDP range — a rule for the primary port alone is not enough (the redirect happens in `prerouting`, before any filter policy you may add).
 - Hub-initiated traffic to a peer (probes before the peer ever contacts us) leaves from the primary port; it is still attributed correctly by range-aware peers, and reply traffic to an active peer rides that peer's own conntrack mapping, i.e. rotates in lockstep with the peer's hops.
 
-If you prefer to manage the firewall yourself, the mode also works with hand-written rules: omit `listen_mode` (or set `sockets` but *not* `listen_ports`), bind only `port: 57175` and install the table above manually — the daemon then simply never learns about the range, and `nylon verify` cannot check it for you.
+If you prefer to manage the firewall yourself, the mode also works with hand-written rules: keep `listen_mode: sockets` and do not advertise any strategy on the node's own endpoints (the derived union is then empty), bind only `port: 57175` and install the table above manually — the daemon then simply never learns about the ranges, and `nylon verify` cannot check them for you.
 
 ## Client side
 
 Two config entries enable hopping on the client:
 
-1. The server's entry in `central.yaml` advertises a **range endpoint**:
+1. The server's entry in `central.yaml` advertises the **strategy** — the strategy carries the ports and the rotation policy:
 
 ```yaml title="central.yaml (excerpt)"
+obf:
+  strategy:
+    hopping:
+      ports: "30000-40000"        # any port in [30000, 40000]
+      port_hopping_mode: proactive # static | reactive | proactive | timed
+      port_hopping:
+        budget_packets: 12
+
 routers:
   - id: server
     # ...
     endpoints:
-      - "203.0.113.7:30000-40000"   # port range: any port in [30000, 40000]
+      - "203.0.113.7[hopping]" # the strategy tag names the ports
       # additional concrete endpoints (e.g. a LAN IP) may be listed and are
       # used by the stock failover machinery as usual
 ```
 
-2. The client opts in with an explicit `port_hopping_mode` (and its policy knobs):
+2. The client needs nothing in `node.yaml`: every strategy the peer's endpoints name contributes its candidate ports, and the carrying endpoint's strategy supplies the effective rotation policy (per-strategy — see the mode table below). The knob block itself lives on the strategy, with these defaults:
 
-```yaml title="node.yaml (client)"
+```yaml title="central.yaml — the rotation knobs live on the strategy"
 port_hopping_mode: proactive    # static | reactive | proactive | timed
 port_hopping:
   budget_packets: 12   # proactive: rotate the carrying port after N wire packets (default 12)
@@ -99,7 +119,7 @@ port_hopping:
 
 ### Rotation modes
 
-`port_hopping_mode` decides **when** the carrying endpoint of a range-configured peer changes (the knob was renamed from `port_mode` to share the `port_hopping` prefix). It governs the node's outgoing connections only — the listen half (`listen_ports`/`listen_mode`) is orthogonal, so a hub may serve a wide range while itself running any mode.
+`port_hopping_mode` on a strategy decides **when** the carrying endpoint drawn from that strategy's ports changes. It governs outgoing connections only — the listen half (the union served per `listen_mode`) is orthogonal, so a hub may serve a wide union while itself drawing from strategies of any mode. A peer whose endpoints tag several strategies rotates across all their ports; the policy in effect is the one of the CURRENT carrying candidate's strategy (journalled as `port hop: carrying strategy switched` when it changes).
 
 | Mode | Rotates | Required knobs | When to use |
 | --- | --- | --- | --- |
@@ -110,22 +130,19 @@ port_hopping:
 
 `dynamic` (proactive with an automatically sized budget) and `auto` (automatic mode switching) are reserved names: the parser accepts them, validation rejects them with a not-implemented error until their branches land.
 
-The policy can also live in `central.yaml` on the router entry — and when it does, it wins **wholesale** over `node.yaml`:
+The rotation policy is **per strategy** — there is no node-level or router-level `port_hopping_mode` any more, and the central router entry carries none:
 
-```yaml title="central.yaml (excerpt, router entry)"
-routers:
-  - id: client-node
-    port_hopping_mode: proactive
-    port_hopping:
-      budget_packets: 12
-      cooldown_seconds: 180
-      recycle_seconds: 1
+```yaml title="central.yaml (excerpt)"
+# routers:
+#   - id: client-node
+#     endpoints:
+#       - "server.example.com[hopping]"  # tag the strategy, not the knobs
 ```
 
-Precedence: the central router entry (when it sets `port_hopping_mode` or `port_hopping`) overrides the node's `node.yaml` hop fields entirely; otherwise `node.yaml` applies; otherwise the `static` default. The active policy is journaled on every change, including the knobs you can tune live: `port hop policy applied mode=proactive source=central budget=12 cooldown=3m0s recycle_seconds=1s` (timed lines carry `period`/`jitter_pct`, reactive lines omit `budget`; every rotating mode carries `cooldown` and `recycle_seconds`).
+The active policy of every strategy a node may use is journaled on every change, including the knobs you can tune live: `port hop policy applied strategy=hopping mode=proactive budget=12 cooldown=3m0s recycle_seconds=1s` (timed lines carry `period`/`jitter_pct`, reactive lines omit `budget`; every rotating mode carries `cooldown` and `recycle_seconds`).
 
 ::::caution
-**Migration from pre-`port_mode` builds:** earlier builds rotated by packet budget implicitly whenever `port_hopping` was set. This build refuses to guess: a `port_hopping` block without a `port_hopping_mode` (in the same file) fails validation with an explanation. Add `port_hopping_mode: proactive` to keep the previous behaviour — and if you are coming from an interim build that used the short name `port_mode`, rename it to `port_hopping_mode`.
+**Migration from the pre-reform config:** `port_hopping_mode` / `port_hopping` at the node or router level, `listen_ports` in `node.yaml`, and inline endpoint port ranges (`host:30000-40000`) all moved into the central `obf:` strategies. The retired keys still parse but fail validation with a pointer to the new location; inline ranges in endpoints are rejected at parse time. Move the knobs onto the strategy that carries the ports, tag the endpoints that use it, and drop the rest.
 ::::
 
 Notes per mode:
@@ -190,19 +207,19 @@ Range endpoints may list **different IPs** (the natural Stage-2 extension):
 
 ```yaml
 endpoints:
-  - "203.0.113.7:30000-40000"
-  - "198.51.100.9:30000-40000"
+  - "203.0.113.7[hopping]"
+  - "198.51.100.9[hopping]"
 ```
 
 When drawing a new carrying port, the pool scores candidates by dissimilarity to the currently active window and prefers, in order: a **different IP subnet** → a **different IP in the same subnet** → the same IP on a different port. Ties break randomly, so port usage stays unpredictable. If TSPU ever bans one path or prefix wholesale, the next rotation moves the tunnel to another address family of your endpoint set.
 
 ## Observability
 
-Every policy change is journaled with its winning source:
+Every policy change is journaled with the strategy it belongs to (one line per strategy the node may draw from):
 
 ```
-INFO port hop policy applied mode=proactive source=central budget=12
-INFO port hop policy applied mode=timed source=node period=5m0s jitter_pct=10
+INFO port hop policy applied strategy=hopping mode=proactive budget=12
+INFO port hop policy applied strategy=beacon mode=timed period=5m0s jitter_pct=10
 ```
 
 Per-rotation logs (`port hop: carrying endpoint rotated`, with peer and endpoint) land at INFO — at most one line per second under load, carrying a `rotations=N` counter of the rotations it covers, and a `reason` attribute on externally driven rotations (`reason="timed schedule"`, `reason="dead carrying link"`, `reason="unanswered carrying probes"`). Static mode logs its pin once (`port hop: static carrying endpoint pinned`). The device UAPI (`wg show nylon dump`) reports per-peer:
@@ -220,26 +237,27 @@ hop_budget_left=7
 On the server, the startup log confirms which server-half mode is active:
 
 ```
-INFO port hopping range listener active listen_ports=57175-57575 ports=401 primary_port=57175
-INFO port hopping nftables redirect active listen_ports=1024-65535 ports=64512 primary_port=57175 table=inet nylon
+INFO obf strategy range listener active listen_ports=57175-57575 ports=401 primary_port=57175
+INFO obf strategy listen union served by nftables redirect listen_ports=1024-65535 ports=64512 primary_port=57175 table=inet nylon
 ```
 
 Sockets mode — two checks are definitive:
 
 ```bash
-# 1. the UAPI dump carries the range (absent => old binary or missing listen_ports)
+# 1. the UAPI dump carries the derived union (absent => no strategy endpoint
+#    advertised, or an old binary)
 wg show nylon dump | grep listen_ports
-#    listen_ports=57175-57575
+#    listen_ports=57175-57575,51820
 
 # 2. the sockets exist (UDP has no LISTEN state — netstat -aon | grep LISTEN
 #    shows only TCP/unix and never lists a UDP range)
 ss -ulnp | grep -c 57175 # ~2 per port: one v4 + one v6 line
 ```
 
-Nftables mode — the daemon-owned table is the state:
+Nftables mode — the daemon-owned table is the state (one redirect rule per range of the union):
 
 ```bash
-nft list table inet nylon # the redirect rule must cover the whole range
+nft list table inet nylon # the redirect rules must cover the whole union
 ```
 
 A hopping client that logs endless `carrying endpoint rotated` lines while the tunnel passes no traffic is rotating through dead ports: on the server, confirm the startup log for the active mode, the sockets / `nft list table inet nylon` state, then check the firewall (`nft list ruleset`, `ufw status`) allows the whole UDP range — a rule for the primary port alone is not enough.

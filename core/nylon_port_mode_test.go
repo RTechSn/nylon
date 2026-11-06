@@ -11,16 +11,39 @@ import (
 	"github.com/encodeous/nylon/state"
 )
 
+// hopTestCandidates builds one draw candidate set for the hop-fixtures
+// tests: a single strategy "hop" over the given host and port range, with a
+// proactive rotation policy (the fixtures that need other modes overwrite
+// the policy map explicitly).
+func hopTestCandidates(host string, first, last uint16) []hopCandidate {
+	p := state.DefaultPortHoppingPolicy()
+	p.Mode = state.HopModeProactive
+	p.Budget = 12
+	return []hopCandidate{{host: host, ports: state.PortRange{First: first, Last: last}, strategy: "hop",
+		policy: p}}
+}
+
+// hopTestFactory builds a factory literal in the fixture style: proactive
+// rotation over one strategy ("hop") on the given host and range.
+func hopTestFactory(n *Nylon, host string, first, last uint16, pool *state.PortPool) *portFactory {
+	cands := hopTestCandidates(host, first, last)
+	return &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
+		candidates: cands, policies: candidatePolicies(cands), currentStrategy: "hop",
+		mode: state.HopModeProactive}
+}
+
 // portModeFactory builds a factory literal in the style of the hop-fixtures
 // tests, with the rotation policy preset for the given mode.
 func portModeFactory(t *testing.T, n *Nylon, mode string, period time.Duration, jitter uint32) *portFactory {
 	t.Helper()
 	ip := netip.MustParseAddr("192.168.1.2")
 	f := &portFactory{n: n, node: "b", pool: hopTestPool(ip, 30000, 30009), bind: conn.NewStdNetBind(),
-		specs:     []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30009}}},
-		mode:      mode,
-		period:    period,
-		jitterPct: jitter,
+		candidates:      hopTestCandidates(ip.String(), 30000, 30009),
+		policies:        map[string]state.PortHoppingPolicy{"hop": {Mode: mode, Period: period, JitterPct: jitter}},
+		currentStrategy: "hop",
+		mode:            mode,
+		period:          period,
+		jitterPct:       jitter,
 	}
 	return f
 }
@@ -85,7 +108,7 @@ func TestPortModeStaticRepinOnRangeChange(t *testing.T) {
 
 	// the operator narrows the range: 30200-30209
 	f.mu.Lock()
-	f.specs = []state.EndpointSpec{{Host: "192.168.1.2", Ports: state.PortRange{First: 30200, Last: 30209}}}
+	f.candidates = hopTestCandidates("192.168.1.2", 30200, 30209)
 	f.mu.Unlock()
 	f.refreshGroups()
 
@@ -222,36 +245,44 @@ func TestJitterIntervalBounds(t *testing.T) {
 	}
 }
 
-// TestResolveHopPolicyNylonWrapper verifies the Nylon-level policy
-// resolution used by ensurePortFactories: central router entry wins over
-// node.yaml, node.yaml wins when central has no hop fields.
-func TestResolveHopPolicyNylonWrapper(t *testing.T) {
+// TestPeerCandidatesExpansion verifies the Nylon-level candidate expansion
+// used by ensurePortFactories: tagged endpoints contribute one candidate per
+// named strategy carrying that strategy's resolved rotation policy, while
+// raw host:port endpoints contribute nothing.
+func TestPeerCandidatesExpansion(t *testing.T) {
 	n := newHopFixturesNylon(t, time.Hour)
-
-	// no hop fields anywhere: the static default
-	p, src := n.resolveHopPolicy()
-	if p.Mode != state.HopModeStatic || src != "default" {
-		t.Fatalf("default policy: %+v source=%q", p, src)
-	}
-
-	// node.yaml pair applies when central has none
-	n.LocalCfg.PortHoppingMode = state.HopModeTimed
 	secs := uint32(90)
-	n.LocalCfg.PortHopping = &state.PortHoppingCfg{PeriodSeconds: &secs}
-	p, src = n.resolveHopPolicy()
-	if p.Mode != state.HopModeTimed || p.Period != 90*time.Second || src != "node" {
-		t.Fatalf("node policy: %+v source=%q", p, src)
+	n.CentralCfg.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
+		"hopping": {
+			Ports:           "30000-30009",
+			PortHoppingMode: state.HopModeTimed,
+			PortHopping:     &state.PortHoppingCfg{PeriodSeconds: &secs},
+		},
+		"fixed": {Ports: "40000"},
+	}}
+	cfg := state.RouterCfg{
+		NodeCfg:   state.NodeCfg{Id: "b"},
+		Endpoints: []string{"192.168.1.2[hopping]", "192.168.1.3:51820"},
+	}
+	cands, err := n.peerCandidates(&cfg)
+	if err != nil {
+		t.Fatalf("peerCandidates: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("candidates = %d, want 1 (raw endpoints contribute nothing)", len(cands))
+	}
+	if cands[0].host != "192.168.1.2" || cands[0].strategy != "hopping" || cands[0].ports.First != 30000 || cands[0].ports.Last != 30009 {
+		t.Fatalf("candidate mismatch: %+v", cands[0])
+	}
+	if cands[0].policy.Mode != state.HopModeTimed || cands[0].policy.Period != 90*time.Second {
+		t.Fatalf("candidate policy not resolved from the strategy: %+v", cands[0].policy)
 	}
 
-	// a central entry for THIS node wins wholesale
-	n.CentralCfg.Routers = append(n.CentralCfg.Routers, state.RouterCfg{
-		NodeCfg:         state.NodeCfg{Id: "a"},
-		PortHoppingMode: state.HopModeProactive,
-		PortHopping:     &state.PortHoppingCfg{BudgetPackets: uint32ptr2(24)},
-	})
-	p, src = n.resolveHopPolicy()
-	if p.Mode != state.HopModeProactive || p.Budget != 24 || src != "central" {
-		t.Fatalf("central policy: %+v source=%q", p, src)
+	// untagged endpoints expand to every strategy
+	cfg.Endpoints = []string{"192.168.1.2"}
+	cands, err = n.peerCandidates(&cfg)
+	if err != nil || len(cands) != 2 {
+		t.Fatalf("untagged expansion: %v %v", cands, err)
 	}
 }
 
@@ -305,8 +336,10 @@ func TestHopAutoRecycleRestartsExhaustedPool(t *testing.T) {
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30000}}},
 		state.PortPoolConfig{Recent: 4, Cooldown: time.Hour, Samples: 4})
 	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
-		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30000}}},
-		mode:  state.HopModeProactive}
+		candidates:      hopTestCandidates(ip.String(), 30000, 30000),
+		policies:        candidatePolicies(hopTestCandidates(ip.String(), 30000, 30000)),
+		currentStrategy: "hop",
+		mode:            state.HopModeProactive}
 
 	f.drawAndMaterialize()
 	f.mu.Lock()
@@ -420,8 +453,10 @@ func TestHopAutoRecycleFiresOncePerFullSweep(t *testing.T) {
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: first, Last: last}}},
 		state.PortPoolConfig{Recent: 512, Cooldown: time.Hour, Samples: 32})
 	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
-		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: first, Last: last}}},
-		mode:  state.HopModeProactive}
+		candidates:      hopTestCandidates(ip.String(), first, last),
+		policies:        candidatePolicies(hopTestCandidates(ip.String(), first, last)),
+		currentStrategy: "hop",
+		mode:            state.HopModeProactive}
 	f.mu.Lock()
 	// a nanosecond floor never refuses a recycle here: six draws take
 	// microseconds, so each epoch is older than the interval by the time

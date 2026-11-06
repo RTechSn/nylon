@@ -44,9 +44,9 @@ type Device struct {
 		sync.RWMutex
 		bind          conn.Bind // bind interface
 		netlinkCancel *rwcancel.RWCancel
-		port          uint16         // listening port
-		portRange     conn.PortRange // optional additional listen range (port hopping, server side)
-		fwmark        uint32         // mark value (0 = disabled)
+		port          uint16           // listening port
+		portRanges    []conn.PortRange // optional additional listen ranges (obf strategies / port hopping, server side); served disjoint, port-keyed
+		fwmark        uint32           // mark value (0 = disabled)
 		brokenRoaming bool
 		// tosMarkFallback latches the one-time notice that the bind
 		// cannot stamp outer packets (no conn.TOSBind); in-tunnel QoS
@@ -601,22 +601,27 @@ func (device *Device) BindUpdate() error {
 	// are started with a capped batch (see ExtraPortReceiveBatchSize)
 	primaryRecvFns := len(recvFns)
 
-	// open the additional listen range, if configured (port hopping)
-	if netc.portRange.Valid() {
+	// open the additional listen ranges, if configured (obf strategies /
+	// port hopping). Ranges arrive merged and disjoint (config layer), and
+	// the MultiBind keys its extra sockets by port, so each range opens
+	// independently — overlapping ranges fail loudly on the first collision.
+	if len(netc.portRanges) > 0 {
 		ro, ok := netc.bind.(conn.RangeOpener)
 		if !ok {
 			netc.bind.Close()
 			netc.port = 0
-			return fmt.Errorf("listen range %s configured but the bind does not support ranges", netc.portRange)
+			return fmt.Errorf("listen ranges %s configured but the bind does not support ranges", conn.RangesString(netc.portRanges))
 		}
-		extraFns, err := ro.OpenRange(netc.port, netc.portRange)
-		if err != nil {
-			netc.bind.Close()
-			netc.port = 0
-			return err
+		for _, pr := range netc.portRanges {
+			extraFns, err := ro.OpenRange(netc.port, pr)
+			if err != nil {
+				netc.bind.Close()
+				netc.port = 0
+				return err
+			}
+			recvFns = append(recvFns, extraFns...)
+			device.Log.Verbosef("Listening on port range %s", pr)
 		}
-		recvFns = append(recvFns, extraFns...)
-		device.Log.Verbosef("Listening on port range %s", netc.portRange)
 	}
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)

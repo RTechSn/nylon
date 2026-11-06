@@ -45,18 +45,22 @@ func TestPortAsEndpointIdleActorStall(t *testing.T) {
 	}
 
 	bIdx := vh.IndexOf("b")
+	// the hopping policy from the rig (recent=64, cooldown=180)
+	vh.Central.Obf = &state.CentralObf{Strategy: map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           bPorts.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(180),
+				RecentPorts:      uint32ptr(64),
+				CandidateSamples: uint32ptr(16),
+			},
+		},
+	}}
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+bPorts.String())
-
-	// the client runs the hopping policy from the rig (recent=64, cooldown=180)
+		bRange+"[hop]")
 	aIdx := vh.IndexOf("a")
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(180),
-		RecentPorts:      uint32ptr(64),
-		CandidateSamples: uint32ptr(16),
-	}
 
 	// clean links, NO middlebox budget: the rig stalls on a plain LAN
 	vh.AddLinkRange(a1, "b", bRange, bPorts)
@@ -137,41 +141,40 @@ traffic:
 	}
 }
 
-// hopDeadlockObfProfile is a minimal AWG 2.0 profile (from the field rig): the
-// junk packets (jc=5) plus the sender-local I1-I5 make every handshake
-// initiation an 11-buffer batch. With a 12-packet rotation budget, a handshake
-// that starts with 0 < budget-left < 11 rotates MID-BATCH inside
+// hopDeadlockObfProfile is a minimal AWG 2.0 dialect (from the field rig):
+// S/H only — the junk trio rides the strategy below. The junk packets
+// (jc=5) plus the sender-local I1-I5 make every handshake initiation an
+// 11-buffer batch. With a 12-packet rotation budget, a handshake that
+// starts with 0 < budget-left < 11 rotates MID-BATCH inside
 // Peer.SendBuffers — the exact shape that deadlocked the field rig.
 var hopDeadlockObfProfile = state.ObfProfile{
-	Jc:   5,
-	Jmin: 250,
-	Jmax: 800,
-	S1:   32,
-	S2:   28,
-	S3:   20,
-	S4:   16,
-	H1:   state.ObfHeaderRange{Min: 100, Max: 5000000},
-	H2:   state.ObfHeaderRange{Min: 10000000, Max: 200000000},
-	H3:   state.ObfHeaderRange{Min: 400000000, Max: 800000000},
-	H4:   state.ObfHeaderRange{Min: 1000000000, Max: 2100000000},
+	S1: 32,
+	S2: 28,
+	S3: 20,
+	S4: 16,
+	H1: state.ObfHeaderRange{Min: 100, Max: 5000000},
+	H2: state.ObfHeaderRange{Min: 10000000, Max: 200000000},
+	H3: state.ObfHeaderRange{Min: 400000000, Max: 800000000},
+	H4: state.ObfHeaderRange{Min: 1000000000, Max: 2100000000},
 }
 
-var hopDeadlockObfA = &state.ObfPeerParams{
-	Protocol: "random",
-	I1:       "<rd 40><rd 38><r 26><rc 23>",
-	I2:       "<rc 21><r 34><r 22><rd 36><r 29>",
-	I3:       "<r 25><rd 12><b 0xb249c082c55904a210a6b008><r 37>",
-	I4:       "<r 28><b 0xf530397c9e3ec6ffda464d51d200><r 13><b 0xf1f76e9a95afb26b718229><b 0x430ecb5e90aa5cf199f732bd12>",
-	I5:       "<b 0x5f54aefac1a012fc79be5488><rd 23><t><r 10><rd 21>",
+// The two sender-local I-sets from the field rig (the per-node distinct
+// draws retired with the strategy model; the deadlock shape needs only one
+// shared set — A is wired onto the strategy below).
+var hopDeadlockISetA = [5]string{
+	"<rd 40><rd 38><r 26><rc 23>",
+	"<rc 21><r 34><r 22><rd 36><r 29>",
+	"<r 25><rd 12><b 0xb249c082c55904a210a6b008><r 37>",
+	"<r 28><b 0xf530397c9e3ec6ffda464d51d200><r 13><b 0xf1f76e9a95afb26b718229><b 0x430ecb5e90aa5cf199f732bd12>",
+	"<b 0x5f54aefac1a012fc79be5488><rd 23><t><r 10><rd 21>",
 }
 
-var hopDeadlockObfB = &state.ObfPeerParams{
-	Protocol: "random",
-	I1:       "<rd 29><r 13><r 23><t>",
-	I2:       "<rc 36><t><r 22><b 0x62ca887d><rc 31>",
-	I3:       "<rc 5><t><rd 9><r 18><b 0x2d39605eae2f>",
-	I4:       "<rc 8><b 0xc58f75cfbf88069660b5c2><rc 28><b 0xbeefc9fb><rd 19><rc 8>",
-	I5:       "<b 0x6dc7a7395fca4003c9><rc 18><rc 16><b 0xc3731e29422f9c><b 0x6062a6fb><r 8>",
+var hopDeadlockISetB = [5]string{
+	"<rd 29><r 13><r 23><t>",
+	"<rc 36><t><r 22><b 0x62ca887d><rc 31>",
+	"<rc 5><t><rd 9><r 18><b 0x2d39605eae2f>",
+	"<rc 8><b 0xc58f75cfbf88069660b5c2><rc 28><b 0xbeefc9fb><rd 19><rc 8>",
+	"<b 0x6dc7a7395fca4003c9><rc 18><rc 16><b 0xc3731e29422f9c><b 0x6062a6fb><r 8>",
 }
 
 // TestPortAsEndpointMidBatchRotationDeadlock pins the field-rig deadlock:
@@ -204,23 +207,33 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 	}
 
 	// AWG profile so handshake initiations are 11-buffer batches (5 junk + 5
-	// I-packets + the init itself), like the field rig
-	prof := hopDeadlockObfProfile
-	vh.Central.Obf = &prof
+	// I-packets + the init itself), like the field rig; the per-node distinct
+	// junk draws retired with the strategy model: one strategy carries one
+	// shared junk configuration — the jc/jmin/jmax trio and the I-set (the
+	// deadlock shape needs the I-packets' size)
 	bIdx := vh.IndexOf("b")
-	aIdx := vh.IndexOf("a")
-	vh.Central.Routers[aIdx].Obf = hopDeadlockObfA
-	vh.Central.Routers[bIdx].Obf = hopDeadlockObfB
-	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+bPorts.String())
-
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(180),
-		RecentPorts:      uint32ptr(64),
-		CandidateSamples: uint32ptr(16),
+	vh.Central.Obf = &state.CentralObf{
+		ObfProfile: hopDeadlockObfProfile,
+		Strategy: map[string]*state.ObfStrategy{
+			"hop": {
+				Ports:           bPorts.String(),
+				PortHoppingMode: state.HopModeProactive,
+				PortHopping: &state.PortHoppingCfg{
+					BudgetPackets:    uint32ptr(12),
+					CooldownSeconds:  uint32ptr(180),
+					RecentPorts:      uint32ptr(64),
+					CandidateSamples: uint32ptr(16),
+				},
+				Jc:   uint32ptr(5),
+				Jmin: uint32ptr(250),
+				Jmax: uint32ptr(800),
+				I1:   hopDeadlockISetA[0], I2: hopDeadlockISetA[1], I3: hopDeadlockISetA[2],
+				I4: hopDeadlockISetA[3], I5: hopDeadlockISetA[4],
+			},
+		},
 	}
+	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
+		bRange+"[hop]")
 
 	vh.AddLinkRange(a1, "b", bRange, bPorts)
 	vh.AddLinkFromAddr(bRange, a1)

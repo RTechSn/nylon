@@ -30,49 +30,47 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 	if node.Port == 0 {
 		return fmt.Errorf("port must be greater than 0")
 	}
+	// retired fields: fail loudly with migration pointers instead of
+	// silently ignoring keys a pre-reform config still carries
 	if node.ListenPorts != "" {
-		pr, err := ParsePortRange(node.ListenPorts)
-		if err != nil {
-			return fmt.Errorf("listen_ports: %w", err)
+		return retiredListenPortsError("node config")
+	}
+	if node.PortHoppingMode != "" || node.PortHopping != nil {
+		return retiredHopPolicyError("node config")
+	}
+	if node.ListenMode != "" && node.ListenMode != ListenModeSockets && node.ListenMode != ListenModeNftables {
+		return fmt.Errorf("listen_mode: unknown value %q (want %q or %q)", node.ListenMode, ListenModeSockets, ListenModeNftables)
+	}
+	// the listen union now derives from central obf strategies; enforce the
+	// in-daemon ceiling on the DERIVED set in sockets mode, and require a
+	// meaningful nftables mode (a redirect with nothing to redirect)
+	if central != nil && len(central.ObfStrategies()) > 0 {
+		var mine *RouterCfg
+		if central.IsRouter(node.Id) {
+			r := central.GetRouter(node.Id)
+			mine = &r
 		}
-		if !pr.Contains(node.Port) {
-			return fmt.Errorf("listen_ports %s must contain the primary port %d", pr, node.Port)
+		ranges, err := ListenUnionRanges(mine, central.ObfStrategies())
+		if err != nil {
+			return err
+		}
+		total := 0
+		for _, pr := range ranges {
+			total += pr.Size()
 		}
 		switch node.EffectiveListenMode() {
 		case ListenModeNftables:
-			// The kernel redirect covers arbitrarily wide ranges; no port
-			// ceiling applies. Platform and capability requirements are
-			// enforced at runtime by the daemon (configs stay portable, so
-			// `nylon verify` may run on a different OS than the target node).
-		case ListenModeSockets:
-			if pr.Size() > MaxInDaemonListenPorts {
-				return fmt.Errorf("listen_ports %s exceeds the %d-port ceiling of the in-daemon range listener; use listen_mode: nftables (daemon-managed DNAT redirect) or a narrower range (docs/guides/port-hopping.mdx)", pr, MaxInDaemonListenPorts)
+			if total == 0 {
+				return fmt.Errorf("listen_mode: nftables requires the node to serve obf strategy ports — advertise a strategy on one of your endpoints: host[<strategy>]")
 			}
-		default:
-			return fmt.Errorf("listen_mode: unknown value %q (want %q or %q)", node.ListenMode, ListenModeSockets, ListenModeNftables)
+		case ListenModeSockets:
+			if total > MaxInDaemonListenPorts {
+				return fmt.Errorf("the obf strategy listen union (%d ports over %s) exceeds the %d-port ceiling of the in-daemon range listener; use listen_mode: nftables (daemon-managed DNAT redirect) or narrower strategy ranges (docs/guides/port-hopping.mdx)", total, formatRanges(ranges), MaxInDaemonListenPorts)
+			}
 		}
-	} else if node.ListenMode != "" && node.ListenMode != ListenModeSockets {
-		return fmt.Errorf("listen_mode %q requires listen_ports to be set", node.ListenMode)
-	}
-	if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, "node config"); err != nil {
-		return err
 	}
 	if err := ValidatePriorityRules(node.PriorityRules, "node config"); err != nil {
 		return err
-	}
-	if node.PortHopping != nil {
-		if node.PortHopping.BudgetPackets != nil && *node.PortHopping.BudgetPackets == 0 {
-			return fmt.Errorf("port_hopping.budget_packets must be greater than 0 (or omitted for the default)")
-		}
-		if node.PortHopping.RecentPorts != nil && *node.PortHopping.RecentPorts > 65535 {
-			return fmt.Errorf("port_hopping.recent_ports must be at most 65535")
-		}
-		if node.PortHopping.CooldownSeconds != nil && *node.PortHopping.CooldownSeconds == 0 {
-			return fmt.Errorf("port_hopping.cooldown_seconds must be greater than 0 (or omitted for the default)")
-		}
-		if node.PortHopping.CandidateSamples != nil && *node.PortHopping.CandidateSamples == 0 {
-			return fmt.Errorf("port_hopping.candidate_samples must be greater than 0 (or omitted for the default)")
-		}
 	}
 	if node.Key == [32]byte{} {
 		return fmt.Errorf("private key must not be empty")
@@ -133,6 +131,17 @@ func NodeConfigValidator(central *CentralCfg, node *LocalCfg) error {
 		}
 		if node.NoTun && (len(centralNode.Addresses) != 0 || len(centralNode.Prefixes) != 0) {
 			return fmt.Errorf("no_tun node %s cannot advertise addresses or prefixes", node.Id)
+		}
+		if centralNode.Obf != nil {
+			return retiredNodeObfError(fmt.Sprintf("central entry of node %s", node.Id))
+		}
+		// the node's used-strategy junk must be coherent (the AWG 2.0 device
+		// emits one junk configuration; see EffectiveStrategyJunk)
+		if len(central.ObfStrategies()) > 0 {
+			used := NodeUsedStrategies(central, node.Id)
+			if _, _, err := EffectiveStrategyJunk(central.ObfStrategies(), used); err != nil {
+				return fmt.Errorf("node %s: %w", node.Id, err)
+			}
 		}
 	}
 	return nil
@@ -196,10 +205,15 @@ func AddrToPrefix(addr netip.Addr) netip.Prefix {
 }
 
 func CentralConfigValidator(cfg *CentralCfg) error {
-	if cfg.Obf != nil {
-		if err := cfg.Obf.Validate(); err != nil {
+	if profile := cfg.Profile(); profile != nil {
+		if err := profile.Validate(); err != nil {
 			return fmt.Errorf("invalid obf profile: %w", err)
 		}
+	}
+	// named obf strategies: names, ports, per-strategy rotation policy and
+	// junk trio, and the mesh-wide junk coherence across every tagged endpoint
+	if err := ValidateObfStrategies(cfg); err != nil {
+		return err
 	}
 	// mesh-wide default priority rules; each router's own list (validated
 	// below) wins wholesale over this one
@@ -215,13 +229,16 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 		if slices.Contains(nodes, string(node.Id)) {
 			return fmt.Errorf("duplicate router id %s", node.Id)
 		}
+		if node.Obf != nil {
+			return retiredNodeObfError(fmt.Sprintf("router %s", node.Id))
+		}
+		if node.PortHoppingMode != "" || node.PortHopping != nil {
+			return retiredHopPolicyError(fmt.Sprintf("router %s", node.Id))
+		}
 		for _, endpoint := range node.Endpoints {
 			if _, err := ParseEndpointSpec(endpoint); err != nil {
 				return fmt.Errorf("router %s has invalid endpoint: %w", node.Id, err)
 			}
-		}
-		if err := ValidateHopPolicyCfg(node.PortHoppingMode, node.PortHopping, fmt.Sprintf("router %s", node.Id)); err != nil {
-			return err
 		}
 		if err := ValidatePriorityRules(node.PriorityRules, fmt.Sprintf("router %s", node.Id)); err != nil {
 			return err
@@ -235,6 +252,9 @@ func CentralConfigValidator(cfg *CentralCfg) error {
 		}
 		if slices.Contains(nodes, string(node.Id)) {
 			return fmt.Errorf("duplicate client id %s", node.Id)
+		}
+		if node.Obf != nil {
+			return retiredNodeObfError(fmt.Sprintf("client %s", node.Id))
 		}
 		nodes = append(nodes, string(node.Id))
 	}

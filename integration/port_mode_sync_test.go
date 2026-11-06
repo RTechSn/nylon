@@ -34,7 +34,7 @@ import (
 // rotation period plus the tombstone grace plus probe slack — the zombie-port
 // guarantee of the earlier retired-port tests, now on both directions.
 func TestTimedReplyPortsSwitchSynchronously(t *testing.T) {
-	vh, aIdx, _, fwd, rev := portModeRig(t)
+	vh, _, _, fwd, rev := portModeRig(t)
 
 	// the ignition regime: relaxed probe interval (0.8 x 25s = 20s) >> the
 	// 3s rotation period — the reply-port switch must come from the traffic
@@ -43,8 +43,9 @@ func TestTimedReplyPortsSwitchSynchronously(t *testing.T) {
 	tun.LinkDeadThreshold = 25 * time.Second
 	vh.Tunables = &tun
 
-	vh.Local[aIdx].PortHoppingMode = state.HopModeTimed
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
+	hopPolicy := vh.Central.Obf.Strategy["hop"]
+	hopPolicy.PortHoppingMode = state.HopModeTimed
+	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		PeriodSeconds:   uint32ptr(3),
 		PeriodJitterPct: uint32ptr(0),
 		CooldownSeconds: uint32ptr(2),

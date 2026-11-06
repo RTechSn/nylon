@@ -121,8 +121,7 @@ func TestHopFactoryAdoptsDrawnEndpoint(t *testing.T) {
 	n := newHopFixturesNylon(t, time.Hour)
 	ip := netip.MustParseAddr("192.168.1.2")
 	pool := hopTestPool(ip, 30000, 30009)
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(),
-		specs: []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30009}}}}
+	f := hopTestFactory(n, ip.String(), 30000, 30009, pool)
 
 	// simulate the eager bootstrap having drawn and adopted a port
 	boot, err := pool.Select(nil)
@@ -227,9 +226,7 @@ func TestHopRotationStormKeepsEndpointHealthy(t *testing.T) {
 	// a wide range with a long cooldown: 60 rotations must not exhaust it
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30999}}},
 		state.PortPoolConfig{Recent: 16, Cooldown: time.Hour, Samples: 4})
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(), specs: []state.EndpointSpec{
-		{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30999}},
-	}}
+	f := hopTestFactory(n, ip.String(), 30000, 30999, pool)
 	neigh := n.RouterState.GetNeighbour("b")
 
 	// bootstrap: the first carrying endpoint is drawn and materialised, then

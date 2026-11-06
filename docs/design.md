@@ -161,7 +161,8 @@ Mechanics (from the ported code, not documentation claims):
   S/H live (atomic loads per message), so in-flight handshakes can fail for one rekey window —
   schedule it as a maintenance action, converging within a keepalive/rekey cycle. Mixed-profile
   meshes (some pairs compat, some obfuscated) are not representable with device-level S/H; full-mesh
-  uniformity is assumed (§3 genesis distributes one shared S/H/J profile).
+  uniformity is assumed (§3 genesis distributes one shared S/H dialect; the junk emission rides the
+  per-strategy knobs — see the obf strategies in the config reference).
 - **Release acceptance criterion:** pcap-verified interop matrix {vanilla polyamide ↔ polyamide-awg
   with compat profile; polyamide-awg ↔ polyamide-awg with obf profile; polyamide-awg ↔ reference
   AWG 2.0 peer} — exercised in PoC stages 1–2 (§8). Reference peer lineage: the `1b86b2a` tree
@@ -297,7 +298,7 @@ type MembershipTransport interface {
 
 ### 3.4 Genesis and join
 
-`node.yaml` gains a genesis block: `{key, id, sign-key, shared S/H/J profile, mesh-PSK, introducer
+`node.yaml` gains a genesis block: `{key, id, sign-key, shared S/H dialect, mesh-PSK, introducer
 endpoints, admin keys}`. Join flow: contact introducer → join-snapshot (full `RecordStore` state) →
 AWG handshakes with all members (full mesh default).
 

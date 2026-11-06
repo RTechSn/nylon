@@ -41,11 +41,11 @@ const nftRedirectChainName = "prerouting"
 // the daemon ever learning which port a peer targeted.
 type nftRangeRedirect struct {
 	primary uint16
-	rng     conn.PortRange
+	rngs    []conn.PortRange
 }
 
-func newNftRangeRedirect(primary uint16, rng conn.PortRange) *nftRangeRedirect {
-	return &nftRangeRedirect{primary: primary, rng: rng}
+func newNftRangeRedirects(primary uint16, rngs []conn.PortRange) *nftRangeRedirect {
+	return &nftRangeRedirect{primary: primary, rngs: rngs}
 }
 
 // Install (re)creates the owned nftables table with the redirect rule. It is
@@ -68,7 +68,9 @@ func (r *nftRangeRedirect) Install() error {
 	c.AddTable(tbl)
 	chain := nftRedirectChain(tbl)
 	c.AddChain(chain)
-	c.AddRule(nftRedirectRule(tbl, chain, r.primary, r.rng))
+	for _, rng := range r.rngs {
+		c.AddRule(nftRedirectRule(tbl, chain, r.primary, rng))
+	}
 	if err := c.Flush(); err != nil {
 		return wrapNftErr("install redirect", err)
 	}

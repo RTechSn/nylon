@@ -6,8 +6,10 @@
 package bindtest
 
 import (
+	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 
 	"github.com/encodeous/nylon/polyamide/conn"
@@ -34,6 +36,12 @@ type ChannelBind2 struct {
 	// Send records 0, SendTOS records the stamped byte).
 	tosMu     sync.Mutex
 	tosCounts map[ChannelEndpoint2]map[byte]uint64
+
+	// rangeMu guards openRanges: the listen ranges accepted via OpenRange
+	// (the in-memory net serves them at the link layer; recording them is
+	// the test seam for the obf strategy listen union).
+	rangeMu    sync.Mutex
+	openRanges []conn.PortRange
 }
 
 type ChannelEndpoint2 netip.AddrPort
@@ -136,6 +144,27 @@ func (c *ChannelBind2) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uin
 	c.closeSignal = make(chan bool)
 	fns = append(fns, c.makeReceiveFunc(*c.rx))
 	return fns, port, nil
+}
+
+// OpenRange implements conn.RangeOpener: the in-memory network serves every
+// port of the range at the link layer (the channel delivers by endpoint, not
+// by socket), so the bind ACCEPTS the range (recording it for assertions)
+// and contributes no extra receive functions.
+func (c *ChannelBind2) OpenRange(port uint16, r conn.PortRange) ([]conn.ReceiveFunc, error) {
+	if !r.Valid() {
+		return nil, errors.New("ChannelBind2.OpenRange: invalid listen range")
+	}
+	c.rangeMu.Lock()
+	c.openRanges = append(c.openRanges, r)
+	c.rangeMu.Unlock()
+	return nil, nil
+}
+
+// OpenRanges returns the listen ranges accepted via OpenRange (test seam).
+func (c *ChannelBind2) OpenRanges() []conn.PortRange {
+	c.rangeMu.Lock()
+	defer c.rangeMu.Unlock()
+	return slices.Clone(c.openRanges)
 }
 
 func (c *ChannelBind2) Close() error {
