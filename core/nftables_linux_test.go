@@ -96,7 +96,7 @@ func TestNftRedirectRuleset(t *testing.T) {
 // of a bare errno. On hosts that do have the capability, the install must
 // succeed and round-trip clean.
 func TestNftRedirectInstallWithoutCaps(t *testing.T) {
-	r := newNftRangeRedirect(57175, conn.PortRange{First: 30000, Last: 65535})
+	r := newNftRangeRedirects(57175, []conn.PortRange{{First: 30000, Last: 65535}})
 	err := r.Install()
 	if err == nil {
 		// the environment can manage nftables: verify the round-trip

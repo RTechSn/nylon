@@ -49,8 +49,9 @@ func (p *ObfProfile) Validate() error {
 	return nil
 }
 
-// ObfPeerParams carries the sender-local I-packet (CPS) parameters of one
-// node. Receivers ignore I/junk; only this node's sender path uses them.
+// ObfPeerParams is the RETIRED per-node obf block (protocol label + I1-I5).
+// Parse-only: a config that still carries it fails validation with a
+// migration error (the i-params moved into central obf strategies).
 type ObfPeerParams struct {
 	Protocol string `yaml:",omitempty"` // amnezigo template name, informational
 	I1       string `yaml:",omitempty"`
@@ -65,16 +66,21 @@ type NodeCfg struct {
 	PubKey    NyPublicKey
 	Addresses []netip.Addr          `yaml:",omitempty"`
 	Prefixes  []PrefixHealthWrapper `yaml:",omitempty"`
-	Obf       *ObfPeerParams        `yaml:"obf,omitempty"`
+	// Obf is the retired per-node obf block; parse-only, rejected by
+	// validation (i1..i5 moved into central obf strategies).
+	Obf *ObfPeerParams `yaml:"obf,omitempty"`
 }
 
 // RouterCfg represents a central representation of a node that can route
 type RouterCfg struct {
-	NodeCfg         `yaml:",inline"`
-	Endpoints       []string
-	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"` // client-side port rotation strategy for range endpoints (static|reactive|proactive|timed); wins wholesale over node.yaml
-	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`      // client-side rotation policy knobs (mode-dependent); wins wholesale over node.yaml
-	PriorityRules   []PriorityRule  `yaml:"priority_rules,omitempty"`    // in-tunnel QoS: inner protocol/port rules -> in-device priority + outer DSCP marking; wins wholesale over node.yaml (an empty list clears)
+	NodeCfg   `yaml:",inline"`
+	Endpoints []string
+	// PortHoppingMode/PortHopping are the RETIRED router-level rotation
+	// policy fields; parse-only, rejected by validation (the rotation
+	// policy moved into obf strategies — see ObfStrategy).
+	PortHoppingMode string          `yaml:"port_hopping_mode,omitempty"`
+	PortHopping     *PortHoppingCfg `yaml:"port_hopping,omitempty"`
+	PriorityRules   []PriorityRule  `yaml:"priority_rules,omitempty"` // in-tunnel QoS: inner protocol/port rules -> in-device priority + outer DSCP marking; wins wholesale over node.yaml (an empty list clears)
 }
 type ClientCfg struct {
 	NodeCfg `yaml:",inline"`
@@ -128,10 +134,11 @@ type CentralCfg struct {
 	Clients             []ClientCfg
 	Graph               []string
 	Timestamp           int64
-	ExcludeIPs          []netip.Prefix `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
-	DynamicPrefixRanges []netip.Prefix `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
-	Obf                 *ObfProfile    `yaml:"obf,omitempty"`                   // mesh-wide shared AWG 2.0 profile; nil = vanilla-compat
-	PriorityRules       []PriorityRule `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
+	ExcludeIPs          []netip.Prefix          `yaml:"exclude_ips,omitempty"`           // split tunnel, default excluded ip ranges for the whole network, if empty, all advertised prefixes will be included
+	DynamicPrefixRanges []netip.Prefix          `yaml:"dynamic_prefix_ranges,omitempty"` // ranges dynamic prefixes may be announced from (design §4.6); receivers drop announcements for prefixes outside their central prefixes and these ranges
+	AwgProfile          *ObfProfile             `yaml:"awg_profile,omitempty"`           // mesh-wide shared AWG 2.0 S/H/J dialect; nil = vanilla-compat. The i-packets moved into obf strategies.
+	ObfStrategies       map[string]*ObfStrategy `yaml:"obf,omitempty"`                   // named obf strategies: ports + per-strategy rotation policy + sender i-packets; referenced per-endpoint as host[strategy1,strategy2]
+	PriorityRules       []PriorityRule          `yaml:"priority_rules,omitempty"`        // in-tunnel QoS: mesh-wide default rule set — a node's own routers[] entry wins wholesale over this list, which wins wholesale over node.yaml (empty == absent at every level)
 }
 
 // TunablesOverrides carries optional router tunable overrides from the local
@@ -291,31 +298,20 @@ func (c *PortHoppingCfg) Resolve() PortHoppingPolicy {
 	return p
 }
 
-// ResolveHopPolicy merges the central router entry and the local node config
-// into the effective port rotation policy. The hop policy is atomic per
-// source: when the central router entry sets port_hopping_mode or port_hopping, the
-// central pair wins wholesale (node.yaml hop fields are ignored), and vice
-// versa; with no hop fields anywhere the static default applies. The second
-// return value names the winning source ("central", "node" or "default") for
-// the journal.
-func ResolveHopPolicy(central *RouterCfg, local *LocalCfg) (PortHoppingPolicy, string) {
-	if central != nil && (central.PortHoppingMode != "" || central.PortHopping != nil) {
-		p := central.PortHopping.Resolve()
-		p.Mode = central.PortHoppingMode
-		if p.Mode == "" {
-			p.Mode = HopModeStatic
-		}
-		return p, "central"
-	}
-	if local != nil && (local.PortHoppingMode != "" || local.PortHopping != nil) {
-		p := local.PortHopping.Resolve()
-		p.Mode = local.PortHoppingMode
-		if p.Mode == "" {
-			p.Mode = HopModeStatic
-		}
-		return p, "node"
-	}
-	return DefaultPortHoppingPolicy(), "default"
+// RetiredHopPolicyError is the shared migration error for the retired
+// port_hopping_mode / port_hopping / listen_ports fields (node-level,
+// router-level): the rotation policy and the served ports moved into central
+// obf strategies.
+func retiredHopPolicyError(where string) error {
+	return fmt.Errorf("%s: port_hopping_mode / port_hopping moved into obf strategies — define the rotation policy on the obf strategy that carries the ports (central top-level `obf:` block, e.g. obf.hopping.port_hopping_mode: timed), then tag the endpoints that use it: host[hopping]", where)
+}
+
+func retiredListenPortsError(where string) error {
+	return fmt.Errorf("%s: listen_ports moved into obf strategies — the listen half now derives from the strategies this node's own advertised endpoints name; define the ports on a central obf strategy (obf.<name>.ports) and advertise the strategy on an endpoint: host[<name>]", where)
+}
+
+func retiredNodeObfError(where string) error {
+	return fmt.Errorf("%s: the per-node obf block moved into central obf strategies — carry the i1..i5 junk-packet params on the obf strategy that uses them (central top-level `obf:` block); the `protocol` label may stay on the strategy as an informational field", where)
 }
 
 // ValidateHopPolicyCfg checks one file's hop policy for internal
@@ -392,13 +388,20 @@ func (c *LocalCfg) UsesNftListenMode() bool {
 // LocalCfg represents local node-level configuration
 type LocalCfg struct {
 	// Node Private Key
-	Key                NyPrivateKey
-	Id                 NodeId                // unique id for this node
-	Port               uint16                // Address that the data plane can be accessed by
-	ListenPorts        string                `yaml:"listen_ports,omitempty"`         // optional additional listen range, e.g. "30000-40000" (port hopping, server side)
-	ListenMode         string                `yaml:"listen_mode,omitempty"`          // how listen_ports is served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
-	PortHoppingMode    string                `yaml:"port_hopping_mode,omitempty"`    // client-side port rotation strategy for range endpoints: static (default) | reactive | proactive | timed
-	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`         // client-side rotation policy for range endpoints (mode-dependent knobs)
+	Key  NyPrivateKey
+	Id   NodeId // unique id for this node
+	Port uint16 // Address that the data plane can be accessed by (primary listen port; always bound)
+	// ListenPorts is the RETIRED node-level listen range; parse-only,
+	// rejected by validation (ports moved into central obf strategies —
+	// the listen half now derives from the strategies this node's own
+	// advertised endpoints name).
+	ListenPorts string `yaml:"listen_ports,omitempty"`
+	ListenMode  string `yaml:"listen_mode,omitempty"` // how the strategy-derived listen ranges are served: "sockets" (default, one socket per port) or "nftables" (daemon-managed DNAT redirect; Linux, CAP_NET_ADMIN)
+	// PortHoppingMode/PortHopping are the RETIRED node-level rotation
+	// policy fields; parse-only, rejected by validation (the rotation
+	// policy moved into obf strategies — see ObfStrategy).
+	PortHoppingMode    string                `yaml:"port_hopping_mode,omitempty"`
+	PortHopping        *PortHoppingCfg       `yaml:"port_hopping,omitempty"`
 	PriorityRules      []PriorityRule        `yaml:"priority_rules,omitempty"`       // in-tunnel QoS: inner protocol/port rules -> in-device priority + outer DSCP marking
 	Dist               *LocalDistributionCfg `yaml:",omitempty"`                     // distribution configuration
 	UseSystemRouting   bool                  `yaml:"use_system_routing,omitempty"`   // all packets from peers will come out of the TUN interface

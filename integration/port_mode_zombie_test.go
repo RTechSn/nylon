@@ -40,8 +40,9 @@ func TestTimedRetiredPortsGoQuiet(t *testing.T) {
 	tun.LinkDeadThreshold = 25 * time.Second
 	vh.Tunables = &tun
 
-	vh.Local[aIdx].PortHoppingMode = state.HopModeTimed
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
+	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy.PortHoppingMode = state.HopModeTimed
+	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		PeriodSeconds:   uint32ptr(2),
 		PeriodJitterPct: uint32ptr(0),
 		CooldownSeconds: uint32ptr(2),

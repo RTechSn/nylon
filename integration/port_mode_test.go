@@ -36,8 +36,11 @@ func portModeRig(t *testing.T) (*VirtualHarness, int, int, *VirtualLink, *Virtua
 	}
 
 	bIdx := vh.IndexOf("b")
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {Ports: portModeRange.String()},
+	}
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+portModeRange.String())
+		bRange+"[hop]")
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, portModeRange)
 	rev := vh.AddLinkFromAddr(bRange, a1)
@@ -69,10 +72,11 @@ func portModeDeliveries(vh *VirtualHarness) (*atomic.Int64, *atomic.Int64, chan 
 func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
 	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
-	vh.Local[aIdx].PortHoppingMode = state.HopModeStatic
+	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy.PortHoppingMode = state.HopModeStatic
 	// an explicitly configured budget is meaningless in static mode and must
 	// be ignored (not rejected) per the config contract
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
+	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		BudgetPackets: uint32ptr(12),
 	}
 
@@ -124,8 +128,9 @@ func TestPortModeStaticPinsTheRangeStart(t *testing.T) {
 func TestPortModeTimedRotatesOnSchedule(t *testing.T) {
 	vh, aIdx, bIdx, fwd, _ := portModeRig(t)
 
-	vh.Local[aIdx].PortHoppingMode = state.HopModeTimed
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
+	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy.PortHoppingMode = state.HopModeTimed
+	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		PeriodSeconds:   uint32ptr(2),
 		PeriodJitterPct: uint32ptr(0),
 		CooldownSeconds: uint32ptr(2),
@@ -194,8 +199,9 @@ func TestPortModeReactiveRotatesOnDeadCarryingLink(t *testing.T) {
 	tun.LinkDeadThreshold = 2 * time.Second
 	vh.Tunables = &tun
 
-	vh.Local[aIdx].PortHoppingMode = state.HopModeReactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
+	hopPolicy := vh.Central.ObfStrategies["hop"]
+	hopPolicy.PortHoppingMode = state.HopModeReactive
+	hopPolicy.PortHopping = &state.PortHoppingCfg{
 		CooldownSeconds: uint32ptr(2),
 		RecentPorts:     uint32ptr(32),
 	}

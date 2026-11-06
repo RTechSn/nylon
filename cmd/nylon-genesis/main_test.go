@@ -5,7 +5,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	amnezigo "github.com/Arsolitt/amnezigo"
@@ -18,12 +17,12 @@ import (
 //
 // Generation is driven by package-global crypto/rand, so the checks below
 // are structural only: exact output bytes are never asserted.
-func generate(t *testing.T, presetName string, random bool, protocol string, mtu int, peerIds string, compat bool) state.CentralCfg {
+func generate(t *testing.T, presetName string, random bool, protocol string, mtu int, strategyName string, strategyPorts string, compat bool) state.CentralCfg {
 	t.Helper()
 	outPath := filepath.Join(t.TempDir(), "out.yaml")
-	if err := run(presetName, random, protocol, mtu, peerIds, compat, outPath, false); err != nil {
-		t.Fatalf("run(preset=%q, random=%v, protocol=%q, mtu=%d, peers=%q, compat=%v) failed: %v",
-			presetName, random, protocol, mtu, peerIds, compat, err)
+	if err := run(presetName, random, protocol, mtu, strategyName, strategyPorts, compat, outPath, false); err != nil {
+		t.Fatalf("run(preset=%q, random=%v, protocol=%q, mtu=%d, strategy=%q, ports=%q, compat=%v) failed: %v",
+			presetName, random, protocol, mtu, strategyName, strategyPorts, compat, err)
 	}
 	data, err := os.ReadFile(outPath)
 	if err != nil {
@@ -38,13 +37,13 @@ func generate(t *testing.T, presetName string, random bool, protocol string, mtu
 
 // validateProfile re-runs the amnezigo obfuscation sub-validators over a
 // generated (non-compat) profile: per-H range viability plus the AWG 2.0
-// size invariant for every peer's I-packet lengths. It also asserts the
+// size invariant for the strategy's I-packet lengths. It also asserts the
 // GenerateHeaderRanges invariant: generated ranges stay clear of the
 // vanilla WG message type-ids 1..4.
-func validateProfile(t *testing.T, profile *state.ObfProfile, peers []*state.ObfPeerParams) {
+func validateProfile(t *testing.T, profile *state.ObfProfile, iSet [5]string) {
 	t.Helper()
 	if profile == nil {
-		t.Fatal("central obf profile is nil")
+		t.Fatal("central awg_profile is nil")
 	}
 	for i, h := range [4]state.ObfHeaderRange{profile.H1, profile.H2, profile.H3, profile.H4} {
 		if err := amnezigo.ValidateHeaderRange(amnezigo.HeaderRange{Min: h.Min, Max: h.Max}); err != nil {
@@ -54,108 +53,130 @@ func validateProfile(t *testing.T, profile *state.ObfProfile, peers []*state.Obf
 			t.Errorf("h%d min (%d) must exceed the vanilla WG type-id window 1..4", i+1, h.Min)
 		}
 	}
-	for _, p := range peers {
-		iSizes := []int{
-			amnezigo.CPSLength(p.I1),
-			amnezigo.CPSLength(p.I2),
-			amnezigo.CPSLength(p.I3),
-			amnezigo.CPSLength(p.I4),
-			amnezigo.CPSLength(p.I5),
-		}
-		if err := amnezigo.ValidatePacketSizes(
-			int(profile.S1), int(profile.S2), int(profile.S3), int(profile.S4),
-			iSizes, int(profile.Jmin), int(profile.Jmax),
-		); err != nil {
-			t.Errorf("packet sizes invalid for peer I-set %q: %v", p.I1, err)
-		}
+	iSizes := []int{
+		amnezigo.CPSLength(iSet[0]),
+		amnezigo.CPSLength(iSet[1]),
+		amnezigo.CPSLength(iSet[2]),
+		amnezigo.CPSLength(iSet[3]),
+		amnezigo.CPSLength(iSet[4]),
+	}
+	if err := amnezigo.ValidatePacketSizes(
+		int(profile.S1), int(profile.S2), int(profile.S3), int(profile.S4),
+		iSizes, int(profile.Jmin), int(profile.Jmax),
+	); err != nil {
+		t.Errorf("packet sizes invalid for strategy I-set %q: %v", iSet[0], err)
 	}
 }
 
-func TestGeneratePresetProfileValidates(t *testing.T) {
-	cfg := generate(t, "standard-1420", false, "quic", 1420, "node-a,node-b", false)
-
-	if len(cfg.Routers) != 2 {
-		t.Fatalf("expected exactly 2 routers, got %d", len(cfg.Routers))
+// strategyOf fetches the single generated strategy or fails the test.
+func strategyOf(t *testing.T, cfg state.CentralCfg) (string, *state.ObfStrategy) {
+	t.Helper()
+	if len(cfg.ObfStrategies) != 1 {
+		t.Fatalf("expected exactly 1 obf strategy, got %d (%v)", len(cfg.ObfStrategies), cfg.ObfStrategies)
 	}
-	for i, want := range []string{"node-a", "node-b"} {
-		if got := string(cfg.Routers[i].Id); got != want {
-			t.Errorf("routers[%d].Id = %q, want %q", i, got, want)
+	for name, s := range cfg.ObfStrategies {
+		return name, s
+	}
+	return "", nil
+}
+
+func TestGeneratePresetStrategyValidates(t *testing.T) {
+	cfg := generate(t, "standard-1420", false, "quic", 1420, "", "40000-41000", false)
+
+	if cfg.AwgProfile == nil {
+		t.Fatal("awg_profile is nil")
+	}
+	name, strat := strategyOf(t, cfg)
+	if name != "quic" {
+		t.Errorf("strategy name = %q, want %q (defaults to the protocol)", name, "quic")
+	}
+	if strat.Protocol != "quic" {
+		t.Errorf("strategy.Protocol = %q, want %q", strat.Protocol, "quic")
+	}
+	if strat.Ports != "40000-41000" {
+		t.Errorf("strategy.Ports = %q, want %q", strat.Ports, "40000-41000")
+	}
+	// Named protocol templates fill I1-I4; I5 is intentionally left empty
+	// by the amnezigo oracle (see DNSTemplate et al.).
+	for j, seq := range []string{strat.I1, strat.I2, strat.I3, strat.I4} {
+		if seq == "" {
+			t.Errorf("strategy.I%d is empty", j+1)
 		}
 	}
+	validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
 
-	var peers []*state.ObfPeerParams
-	for i, r := range cfg.Routers {
-		if r.Obf == nil {
-			t.Fatalf("routers[%d].Obf is nil", i)
-		}
-		if r.Obf.Protocol != "quic" {
-			t.Errorf("routers[%d].Obf.Protocol = %q, want %q", i, r.Obf.Protocol, "quic")
-		}
-		// Named protocol templates fill I1-I4; I5 is intentionally left
-		// empty by the amnezigo oracle (see DNSTemplate et al.).
-		for j, seq := range []string{r.Obf.I1, r.Obf.I2, r.Obf.I3, r.Obf.I4} {
-			if seq == "" {
-				t.Errorf("routers[%d].Obf.I%d is empty", i, j+1)
-			}
-		}
-		peers = append(peers, r.Obf)
+	// the fragment must validate as part of a full central config with a
+	// tagged endpoint using it (two routers so the graph pairing is valid)
+	cfg.Routers = []state.RouterCfg{
+		{
+			NodeCfg:   state.NodeCfg{Id: "hub", PubKey: state.GenerateKey().Pubkey()},
+			Endpoints: []string{"hub.example.com[quic]"},
+		},
+		{
+			NodeCfg:   state.NodeCfg{Id: "leaf", PubKey: state.GenerateKey().Pubkey()},
+			Endpoints: []string{"leaf.example.com[quic]"},
+		},
 	}
-
-	validateProfile(t, cfg.Obf, peers)
+	cfg.Graph = []string{"hub, leaf"}
+	if err := state.CentralConfigValidator(&cfg); err != nil {
+		t.Errorf("central config with the generated fragment does not validate: %v", err)
+	}
 }
 
 func TestGenerateCompatProfile(t *testing.T) {
-	cfg := generate(t, defaultPreset, false, "quic", 0, "node-a", true)
+	cfg := generate(t, defaultPreset, false, "quic", 0, "compat", "51820", true)
 
-	if cfg.Obf == nil {
-		t.Fatal("central obf profile is nil")
+	if cfg.AwgProfile == nil {
+		t.Fatal("central awg_profile is nil")
 	}
 	want := [4]state.ObfHeaderRange{
 		{Min: 1, Max: 1}, {Min: 2, Max: 2}, {Min: 3, Max: 3}, {Min: 4, Max: 4},
 	}
-	for i, h := range [4]state.ObfHeaderRange{cfg.Obf.H1, cfg.Obf.H2, cfg.Obf.H3, cfg.Obf.H4} {
+	for i, h := range [4]state.ObfHeaderRange{cfg.AwgProfile.H1, cfg.AwgProfile.H2, cfg.AwgProfile.H3, cfg.AwgProfile.H4} {
 		if h != want[i] {
 			t.Errorf("h%d = {%d,%d}, want {%d,%d}", i+1, h.Min, h.Max, want[i].Min, want[i].Max)
 		}
 	}
 	for name, v := range map[string]uint32{
-		"jc": cfg.Obf.Jc, "jmin": cfg.Obf.Jmin, "jmax": cfg.Obf.Jmax,
-		"s1": cfg.Obf.S1, "s2": cfg.Obf.S2, "s3": cfg.Obf.S3, "s4": cfg.Obf.S4,
+		"jc": cfg.AwgProfile.Jc, "jmin": cfg.AwgProfile.Jmin, "jmax": cfg.AwgProfile.Jmax,
+		"s1": cfg.AwgProfile.S1, "s2": cfg.AwgProfile.S2, "s3": cfg.AwgProfile.S3, "s4": cfg.AwgProfile.S4,
 	} {
 		if v != 0 {
 			t.Errorf("%s = %d, want 0 in compat profile", name, v)
 		}
 	}
 
-	if len(cfg.Routers) != 1 {
-		t.Fatalf("expected exactly 1 router, got %d", len(cfg.Routers))
+	_, strat := strategyOf(t, cfg)
+	if strat.Ports != "51820" {
+		t.Errorf("compat strategy.Ports = %q, want 51820", strat.Ports)
 	}
-	if cfg.Routers[0].Obf != nil {
-		t.Errorf("compat routers[0].Obf = %+v, want nil (no I blocks)", cfg.Routers[0].Obf)
+	for j, seq := range []string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5} {
+		if seq != "" {
+			t.Errorf("compat strategy.I%d must be empty (no junk in the vanilla-compat dialect)", j+1)
+		}
 	}
 }
 
-func TestGenerateRandomProfileValidates(t *testing.T) {
-	cfg := generate(t, "standard-1420", true, "dns", 1420, "x", false)
+func TestGenerateRandomStrategyValidates(t *testing.T) {
+	cfg := generate(t, "standard-1420", true, "dns", 1420, "", "51820", false)
 
-	if len(cfg.Routers) != 1 {
-		t.Fatalf("expected exactly 1 router, got %d", len(cfg.Routers))
+	_, strat := strategyOf(t, cfg)
+	// Named templates leave I5 empty by design (see the amnezigo oracle);
+	// I1-I4 must be filled.
+	for j, seq := range []string{strat.I1, strat.I2, strat.I3, strat.I4} {
+		if seq == "" {
+			t.Errorf("strategy.I%d is empty", j+1)
+		}
 	}
-	if cfg.Routers[0].Obf == nil {
-		t.Fatal("routers[0].Obf is nil")
-	}
-	validateProfile(t, cfg.Obf, []*state.ObfPeerParams{cfg.Routers[0].Obf})
+	validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
 }
 
-// TestGenerateFivePeerProfilesValidate drives both shared-profile sources
-// with enough peers that the per-peer redraw in generatePeerI is
-// load-bearing. With protocol "random" every peer's I lengths are drawn
-// independently (measured ~11% collision per peer at mtu 1420), so a single
-// unpreconditioned draw with five peers is invalid ~45% of the time: the
-// preset case failed 9 of 20 runs before the redraw existed, and the
-// 64-attempt budget leaves a ~0.45^64 residual failure probability.
-func TestGenerateFivePeerProfilesValidate(t *testing.T) {
-	ids := []string{"n1", "n2", "n3", "n4", "n5"}
+// TestGenerateRandomRedrawIsValid drives both shared-profile sources with
+// protocol "random": the strategy's I lengths are drawn independently of the
+// padded handshake sizes and a colliding draw is redrawn (measured ~11%
+// collision per draw at mtu 1420; the 64-attempt budget leaves a residual
+// failure probability far below a coin flip).
+func TestGenerateRandomRedrawIsValid(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		randomShared bool
@@ -164,55 +185,43 @@ func TestGenerateFivePeerProfilesValidate(t *testing.T) {
 		{name: "preset shared profile", randomShared: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := generate(t, "standard-1420", tc.randomShared, amnezigo.ProtocolRandom, 1420, strings.Join(ids, ","), false)
-
-			if len(cfg.Routers) != len(ids) {
-				t.Fatalf("expected exactly %d routers, got %d", len(ids), len(cfg.Routers))
+			cfg := generate(t, "standard-1420", tc.randomShared, amnezigo.ProtocolRandom, 1420, "obf_main", "30000-31000", false)
+			_, strat := strategyOf(t, cfg)
+			if strat.Protocol != amnezigo.ProtocolRandom {
+				t.Errorf("strategy.Protocol = %q, want %q", strat.Protocol, amnezigo.ProtocolRandom)
 			}
-			var peers []*state.ObfPeerParams
-			for i, want := range ids {
-				if got := string(cfg.Routers[i].Id); got != want {
-					t.Errorf("routers[%d].Id = %q, want %q", i, got, want)
-				}
-				obf := cfg.Routers[i].Obf
-				if obf == nil {
-					t.Fatalf("routers[%d].Obf is nil", i)
-				}
-				if obf.Protocol != amnezigo.ProtocolRandom {
-					t.Errorf("routers[%d].Obf.Protocol = %q, want %q", i, obf.Protocol, amnezigo.ProtocolRandom)
-				}
-				// Random mode fills every interval; named templates leave I5 empty.
-				for j, seq := range []string{obf.I1, obf.I2, obf.I3, obf.I4, obf.I5} {
-					if seq == "" {
-						t.Errorf("routers[%d].Obf.I%d is empty", i, j+1)
-					}
-				}
-				peers = append(peers, obf)
+			if strat.Ports != "30000-31000" {
+				t.Errorf("strategy.Ports = %q, want 30000-31000", strat.Ports)
 			}
-			validateProfile(t, cfg.Obf, peers)
-
-			// Each peer must keep its own draw: reusing one I-set for every peer
-			// would still satisfy the validators but violates the per-sender
-			// obfuscation contract this generator exists to produce.
-			shared := true
-			for _, p := range peers[1:] {
-				if *p != *peers[0] {
-					shared = false
-					break
+			// Random mode fills every interval.
+			for j, seq := range []string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5} {
+				if seq == "" {
+					t.Errorf("strategy.I%d is empty", j+1)
 				}
 			}
-			if shared {
-				t.Error("all peers share one I-set; per-peer I1-I5 draws collapsed into a single draw")
-			}
+			validateProfile(t, cfg.AwgProfile, [5]string{strat.I1, strat.I2, strat.I3, strat.I4, strat.I5})
 		})
 	}
 }
 
 func TestGenerateUnknownProtocolFails(t *testing.T) {
 	outPath := filepath.Join(t.TempDir(), "out.yaml")
-	err := run("standard-1420", false, "smtp", 1420, "node-a", false, outPath, false)
+	err := run("standard-1420", false, "smtp", 1420, "", "51820", false, outPath, false)
 	if err == nil {
 		t.Fatal("expected an error for unknown protocol, got nil")
+	}
+	if _, statErr := os.Stat(outPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("no output file should be created on error; stat err = %v", statErr)
+	}
+}
+
+func TestGenerateInvalidStrategyNameOrPortsFails(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "out.yaml")
+	if err := run("standard-1420", false, "quic", 1420, "Not Valid!", "51820", false, outPath, false); err == nil {
+		t.Error("invalid strategy name accepted")
+	}
+	if err := run("standard-1420", false, "quic", 1420, "", "not-ports", false, outPath, false); err == nil {
+		t.Error("invalid strategy ports accepted")
 	}
 	if _, statErr := os.Stat(outPath); !errors.Is(statErr, fs.ErrNotExist) {
 		t.Errorf("no output file should be created on error; stat err = %v", statErr)

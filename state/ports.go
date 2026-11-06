@@ -24,12 +24,27 @@ func ParsePortRange(s string) (PortRange, error) {
 	return conn.ParsePortRange(s)
 }
 
-// EndpointSpec is a parsed `endpoints` entry: a host plus an inclusive port
-// range. Single-port endpoints are the degenerate case Ports.IsSingle().
-// A bare host keeps the default port, exactly like the classic resolver.
+// EndpointSpec is a parsed `endpoints` entry. Three forms exist:
+//
+//	host                       bare host: default port, or — in a mesh with
+//	                           obf strategies — every strategy's ports
+//	host:port                  raw fixed-port endpoint, no strategy
+//	host[strategy1,strategy2]  strategy-tagged: the ports come from the named
+//	                           strategies ("*" or an untagged host = all)
+//
+// with IPv6 hosts bracketed as usual: "[2001:db8::1]:51820",
+// "[2001:db8::1][strats]". Inline port RANGES in endpoints are gone: they
+// moved into obf strategies (ParseEndpointSpec rejects them with a migration
+// error). Tagged specs carry no port of their own; the strategy provides it.
 type EndpointSpec struct {
-	Host  string
-	Ports PortRange
+	Host       string
+	Ports      PortRange
+	Strategies []string
+}
+
+// HasStrategies reports whether the spec selects obf strategies.
+func (s EndpointSpec) HasStrategies() bool {
+	return len(s.Strategies) > 0
 }
 
 // IsRange reports whether the spec covers more than one port.
@@ -43,15 +58,54 @@ func (s EndpointSpec) String() string {
 	if addr, err := netip.ParseAddr(host); err == nil && addr.Is6() && !addr.Is4In6() {
 		host = "[" + host + "]"
 	}
-	if !s.Ports.Valid() {
-		return host
+	var b strings.Builder
+	b.WriteString(host)
+	if s.Ports.Valid() {
+		b.WriteString(":")
+		b.WriteString(s.Ports.String())
 	}
-	return host + ":" + s.Ports.String()
+	if len(s.Strategies) > 0 {
+		b.WriteString("[")
+		b.WriteString(strings.Join(s.Strategies, ","))
+		b.WriteString("]")
+	}
+	return b.String()
 }
 
-// ParseEndpointSpec parses an endpoint string into a host and a port range.
-// Accepted forms: "host", "host:port", "host:portA-portB", with IPv6 hosts in
-// brackets. Bare hosts keep the default nylon port.
+// parseStrategyTagList parses the inside of a "[...]" strategy group:
+// comma-separated names ("*" alone means every defined strategy). Names are
+// validated with the shared node-name pattern so they cannot smuggle
+// separators or address syntax; the referenced strategies' existence is
+// checked against the strategy map by EndpointStrategyTags.
+func parseStrategyTagList(inner string) ([]string, error) {
+	parts := strings.Split(inner, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return nil, fmt.Errorf("empty obf strategy name in %q (remove the empty entry)", "["+inner+"]")
+		}
+		if p == "*" {
+			if len(parts) != 1 {
+				return nil, fmt.Errorf("the obf strategy wildcard %q must stand alone in the tag list", "*")
+			}
+			return []string{"*"}, nil
+		}
+		if err := NameValidator(p); err != nil {
+			return nil, fmt.Errorf("invalid obf strategy tag %q: %w", p, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// ParseEndpointSpec parses an endpoint string into a host, an optional fixed
+// port and an optional strategy tag list. Accepted forms: "host",
+// "host:port", "host[strats]", "host[*]", with IPv6 hosts in brackets.
+// Bare hosts keep the default nylon port when the mesh defines no strategies
+// (with strategies, the connect half expands them through every strategy).
+// Inline port ranges ("host:portA-portB") moved into obf strategies and are
+// rejected with a migration error.
 func ParseEndpointSpec(value string) (EndpointSpec, error) {
 	if value == "" {
 		return EndpointSpec{}, fmt.Errorf("endpoint is empty")
@@ -60,11 +114,51 @@ func ParseEndpointSpec(value string) (EndpointSpec, error) {
 		return EndpointSpec{}, fmt.Errorf("invalid endpoint %q", value)
 	}
 
-	// literal addr or addr:portrange fast paths
+	var strategies []string
+	if strings.HasSuffix(value, "]") {
+		if i := strings.LastIndexByte(value, '['); i >= 0 {
+			inner := value[i+1 : len(value)-1]
+			// A bracket group containing ':' is a bare IPv6 literal, not a
+			// strategy list ("[2001:db8::1]" alone).
+			if !strings.Contains(inner, ":") {
+				var err error
+				strategies, err = parseStrategyTagList(inner)
+				if err != nil {
+					return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: %w", value, err)
+				}
+				value = value[:i]
+				if value == "" {
+					return EndpointSpec{}, fmt.Errorf("invalid endpoint: strategy tags without a host")
+				}
+			}
+		} else {
+			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: unmatched ']'", value)
+		}
+	}
+
+	// bare bracketed host after tag stripping (e.g. "[2001:db8::1][awg]"):
+	// unbracket it before the fast paths
+	if len(strategies) > 0 && strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		if addr, err := netip.ParseAddr(value[1 : len(value)-1]); err == nil {
+			return EndpointSpec{Host: addr.String(), Strategies: strategies}, nil
+		}
+		return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: invalid bracketed host", value)
+	}
+
+	// literal addr fast path: a bare host (no port, no tags) keeps an
+	// invalid Ports — "explicit port" and "bare host" must stay
+	// distinguishable (the resolver and the strategy expansion each default
+	// it in their own way)
 	if addr, err := netip.ParseAddr(value); err == nil {
-		return EndpointSpec{Host: addr.String(), Ports: PortRange{First: DefaultPort, Last: DefaultPort}}, nil
+		if len(strategies) > 0 {
+			return EndpointSpec{Host: addr.String(), Strategies: strategies}, nil
+		}
+		return EndpointSpec{Host: addr.String()}, nil
 	}
 	if ap, err := netip.ParseAddrPort(value); err == nil {
+		if len(strategies) > 0 {
+			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: an explicit port cannot be combined with obf strategy tags — the strategy carries the ports", value)
+		}
 		return EndpointSpec{Host: ap.Addr().String(), Ports: PortRange{First: ap.Port(), Last: ap.Port()}}, nil
 	}
 
@@ -76,7 +170,8 @@ func ParseEndpointSpec(value string) (EndpointSpec, error) {
 			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: %w", value, err)
 		}
 		// bare hostname
-		return EndpointSpec{Host: value, Ports: PortRange{First: DefaultPort, Last: DefaultPort}}, nil
+		host = value
+		portString = ""
 	}
 	if host == "" {
 		return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: empty host", value)
@@ -85,11 +180,23 @@ func ParseEndpointSpec(value string) (EndpointSpec, error) {
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = host[1 : len(host)-1]
 	}
-	ports, err := ParsePortRange(portString)
-	if err != nil {
-		return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: %w", value, err)
+	spec := EndpointSpec{Host: host, Strategies: strategies}
+	if portString != "" {
+		if len(strategies) > 0 {
+			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: an explicit port cannot be combined with obf strategy tags — the strategy carries the ports", value)
+		}
+		if strings.Contains(portString, "-") {
+			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: inline port ranges moved into obf strategies — define a strategy with ports: %q and tag the endpoint host[strategy], or use a single port", value, portString)
+		}
+		port, err := ParsePort(portString)
+		if err != nil {
+			return EndpointSpec{}, fmt.Errorf("invalid endpoint %q: %w", value, err)
+		}
+		// an explicit port is the raw fixed-endpoint form; a bare host keeps
+		// an invalid Ports so consumers can tell the two apart
+		spec.Ports = PortRange{First: port, Last: port}
 	}
-	return EndpointSpec{Host: host, Ports: ports}, nil
+	return spec, nil
 }
 
 // FormatAddrPort renders addr:port in endpoint form (bracketed for IPv6).

@@ -12,71 +12,67 @@ func hopStr(v uint32) *uint32 { return &v }
 
 func hopBool(v bool) *bool { return &v }
 
-// TestHopModeParsingRoundtrip pins the YAML surface of the hop policy on both
-// the node (node.yaml) and the router (central.yaml) sides.
-func TestHopModeParsingRoundtrip(t *testing.T) {
-	const nodeYaml = `
-id: node1
-port: 30000
-port_hopping_mode: timed
-port_hopping:
-  period_seconds: 300
-  period_jitter_pct: 15
-  cooldown_seconds: 60
-`
-	var node LocalCfg
-	if err := yaml.Unmarshal([]byte(nodeYaml), &node); err != nil {
-		t.Fatalf("node yaml: %v", err)
-	}
-	if node.PortHoppingMode != HopModeTimed {
-		t.Errorf("port_hopping_mode = %q, want %q", node.PortHoppingMode, HopModeTimed)
-	}
-	if node.PortHopping == nil || node.PortHopping.PeriodSeconds == nil || *node.PortHopping.PeriodSeconds != 300 {
-		t.Fatalf("period_seconds not parsed: %+v", node.PortHopping)
-	}
-	if node.PortHopping.PeriodJitterPct == nil || *node.PortHopping.PeriodJitterPct != 15 {
-		t.Fatalf("period_jitter_pct not parsed: %+v", node.PortHopping)
-	}
-
+// TestHopModeStrategyParsingRoundtrip pins the YAML surface of the per-strategy
+// rotation policy in the central `obf:` block, and its marshal/unmarshal
+// roundtrip through CentralCfg.
+func TestHopModeStrategyParsingRoundtrip(t *testing.T) {
 	const centralYaml = `
-routers:
-- id: node2
-  port_hopping_mode: proactive
-  port_hopping:
-    budget_packets: 24
-  endpoints: []
+obf:
+  hopping:
+    ports: 40000-50000
+    port_hopping_mode: timed
+    port_hopping:
+      period_seconds: 300
+      period_jitter_pct: 15
+      cooldown_seconds: 60
+  awg_main:
+    ports: "40000"
+    protocol: quic
+    i1: "aabbcc"
 `
 	var central CentralCfg
-	if err := yaml.Unmarshal([]byte(centralYaml), &central); err != nil {
+	if err := yaml.UnmarshalWithOptions([]byte(centralYaml), &central, yaml.Strict()); err != nil {
 		t.Fatalf("central yaml: %v", err)
 	}
-	if len(central.Routers) != 1 {
-		t.Fatalf("routers = %d, want 1", len(central.Routers))
+	if len(central.ObfStrategies) != 2 {
+		t.Fatalf("strategies = %d, want 2", len(central.ObfStrategies))
 	}
-	r := central.Routers[0]
-	if r.PortHoppingMode != HopModeProactive {
-		t.Errorf("router port_hopping_mode = %q, want %q", r.PortHoppingMode, HopModeProactive)
+	h := central.ObfStrategies["hopping"]
+	if h.PortHoppingMode != HopModeTimed {
+		t.Errorf("hopping port_hopping_mode = %q, want %q", h.PortHoppingMode, HopModeTimed)
 	}
-	if r.PortHopping == nil || r.PortHopping.BudgetPackets == nil || *r.PortHopping.BudgetPackets != 24 {
-		t.Fatalf("budget_packets not parsed: %+v", r.PortHopping)
+	if h.PortHopping == nil || h.PortHopping.PeriodSeconds == nil || *h.PortHopping.PeriodSeconds != 300 {
+		t.Fatalf("period_seconds not parsed: %+v", h.PortHopping)
+	}
+	if h.PortHopping.PeriodJitterPct == nil || *h.PortHopping.PeriodJitterPct != 15 {
+		t.Fatalf("period_jitter_pct not parsed: %+v", h.PortHopping)
+	}
+	a := central.ObfStrategies["awg_main"]
+	if a.Ports != "40000" || a.Protocol != "quic" || a.I1 != "aabbcc" {
+		t.Errorf("awg_main not parsed: %+v", a)
 	}
 
-	// the router hop fields must survive a marshal/unmarshal roundtrip
+	// the strategy block must survive a marshal/unmarshal roundtrip
 	out, err := yaml.Marshal(&central)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	var central2 CentralCfg
-	if err := yaml.Unmarshal(out, &central2); err != nil {
+	if err := yaml.UnmarshalWithOptions(out, &central2, yaml.Strict()); err != nil {
 		t.Fatalf("re-unmarshal: %v (yaml: %s)", err, out)
 	}
-	if central2.Routers[0].PortHoppingMode != HopModeProactive || central2.Routers[0].PortHopping.BudgetPackets == nil {
-		t.Errorf("hop policy lost in roundtrip: %+v", central2.Routers[0])
+	h2 := central2.ObfStrategies["hopping"]
+	if h2.PortHoppingMode != HopModeTimed || h2.PortHopping == nil || h2.PortHopping.PeriodSeconds == nil || *h2.PortHopping.PeriodSeconds != 300 {
+		t.Errorf("hop policy lost in roundtrip: %+v", h2)
+	}
+	a2 := central2.ObfStrategies["awg_main"]
+	if a2.Ports != "40000" || a2.I1 != "aabbcc" || a2.Protocol != "quic" {
+		t.Errorf("strategy fields lost in roundtrip: %+v", a2)
 	}
 }
 
 // TestValidateHopPolicyCfgMatrix walks the full validation matrix of one
-// file's hop policy.
+// strategy's hop policy block (unchanged semantics, new location).
 func TestValidateHopPolicyCfgMatrix(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -106,7 +102,7 @@ func TestValidateHopPolicyCfgMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateHopPolicyCfg(tc.mode, tc.cfg, "test config")
+			err := ValidateHopPolicyCfg(tc.mode, tc.cfg, "obf strategy hop_test")
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -123,114 +119,88 @@ func TestValidateHopPolicyCfgMatrix(t *testing.T) {
 	}
 }
 
-// TestHopPolicyNodeValidation wires the hop rules into the node config
-// validator.
-func TestHopPolicyNodeValidation(t *testing.T) {
+// TestRetiredHopFieldsRejected pins the retired node- and router-level hop
+// fields: they still parse (so a pre-reform config is detected, not silently
+// reinterpreted) but fail validation with the migration pointer.
+func TestRetiredHopFieldsRejected(t *testing.T) {
 	base := func() *LocalCfg {
 		return &LocalCfg{Id: "node1", Port: 30000, Key: [32]byte{1}}
 	}
 
 	node := base()
 	node.PortHopping = &PortHoppingCfg{BudgetPackets: hopStr(12)}
-	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "port_hopping_mode is not set") {
-		t.Errorf("node port_hopping without port_hopping_mode: err = %v, want migration guard", err)
-	}
-
-	node = base()
-	node.PortHoppingMode = HopModeProactive
-	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "budget_packets") {
-		t.Errorf("node proactive without budget: err = %v, want requirement error", err)
+	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "moved into obf strategies") {
+		t.Errorf("retired node port_hopping: err = %v, want migration error", err)
 	}
 
 	node = base()
 	node.PortHoppingMode = HopModeTimed
-	node.PortHopping = &PortHoppingCfg{PeriodSeconds: hopStr(60)}
-	if err := NodeConfigValidator(nil, node); err != nil {
-		t.Errorf("node timed with period: unexpected error %v", err)
+	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "moved into obf strategies") {
+		t.Errorf("retired node port_hopping_mode: err = %v, want migration error", err)
 	}
 
 	node = base()
-	node.PortHoppingMode = HopModeAuto
-	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Errorf("node reserved mode: err = %v, want reserved error", err)
+	node.ListenPorts = "30000-40000"
+	if err := NodeConfigValidator(nil, node); err == nil || !strings.Contains(err.Error(), "listen_ports moved into obf strategies") {
+		t.Errorf("retired node listen_ports: err = %v, want migration error", err)
+	}
+
+	central := &CentralCfg{
+		Routers: []RouterCfg{{
+			NodeCfg:         NodeCfg{Id: "node1"},
+			PortHoppingMode: HopModeProactive,
+			PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(12)},
+		}},
+	}
+	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "moved into obf strategies") {
+		t.Errorf("retired router hop fields: err = %v, want migration error", err)
+	}
+
+	central = &CentralCfg{
+		Routers: []RouterCfg{{
+			NodeCfg: NodeCfg{Id: "node1", Obf: &ObfPeerParams{I1: "aabb"}},
+		}},
+	}
+	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "per-node obf block moved into central obf strategies") {
+		t.Errorf("retired per-node obf: err = %v, want migration error", err)
 	}
 }
 
-// TestHopPolicyCentralValidation wires the hop rules into the central config
-// validator (per-router).
-func TestHopPolicyCentralValidation(t *testing.T) {
-	mk := func(mode string, hop *PortHoppingCfg) *CentralCfg {
-		return &CentralCfg{
-			Routers: []RouterCfg{{
-				NodeCfg:         NodeCfg{Id: "node1"},
-				PortHoppingMode: mode,
-				PortHopping:     hop,
-			}},
-		}
+// TestResolveStrategyHopPolicy pins the per-strategy resolution: defaults,
+// knob resolution, and the static default for a knobless strategy.
+func TestResolveStrategyHopPolicy(t *testing.T) {
+	p := ResolveStrategyHopPolicy(nil)
+	if p.Mode != HopModeStatic || p.Budget != 12 || p.JitterPct != 10 {
+		t.Errorf("nil strategy policy: %+v", p)
 	}
 
-	if err := CentralConfigValidator(mk(HopModeProactive, nil)); err == nil || !strings.Contains(err.Error(), "router node1") {
-		t.Errorf("central proactive without budget: err = %v, want router-scoped requirement error", err)
+	p = ResolveStrategyHopPolicy(&ObfStrategy{})
+	if p.Mode != HopModeStatic {
+		t.Errorf("knobless strategy must resolve static: %+v", p)
 	}
-	if err := CentralConfigValidator(mk(HopModeTimed, &PortHoppingCfg{PeriodSeconds: hopStr(90)})); err != nil {
-		t.Errorf("central timed with period: unexpected error %v", err)
-	}
-	if err := CentralConfigValidator(mk("", &PortHoppingCfg{BudgetPackets: hopStr(12)})); err == nil || !strings.Contains(err.Error(), "port_hopping_mode is not set") {
-		t.Errorf("central knobs without mode: err = %v, want migration guard", err)
-	}
-}
 
-// TestResolveHopPolicyPrecedence pins the atomic central > node > default
-// precedence of the effective hop policy.
-func TestResolveHopPolicyPrecedence(t *testing.T) {
-	local := &LocalCfg{
+	p = ResolveStrategyHopPolicy(&ObfStrategy{
 		PortHoppingMode: HopModeTimed,
-		PortHopping: &PortHoppingCfg{
-			PeriodSeconds:   hopStr(60),
-			PeriodJitterPct: hopStr(20),
-		},
-	}
-
-	// central pair wins wholesale; node.yaml hop fields are ignored
-	central := &RouterCfg{
-		PortHoppingMode: HopModeProactive,
-		PortHopping: &PortHoppingCfg{
-			BudgetPackets: hopStr(40),
-		},
-	}
-	p, src := ResolveHopPolicy(central, local)
-	if src != "central" {
-		t.Fatalf("source = %q, want central", src)
-	}
-	if p.Mode != HopModeProactive || p.Budget != 40 {
-		t.Errorf("central policy not applied wholesale: %+v", p)
-	}
-	if p.Period != 0 {
-		t.Errorf("node period leaked into the central policy: %+v", p)
-	}
-
-	// no central hop fields: the node pair applies
-	p, src = ResolveHopPolicy(&RouterCfg{NodeCfg: NodeCfg{Id: "node1"}}, local)
-	if src != "node" {
-		t.Fatalf("source = %q, want node", src)
-	}
+		PortHopping:     &PortHoppingCfg{PeriodSeconds: hopStr(60), PeriodJitterPct: hopStr(20)},
+	})
 	if p.Mode != HopModeTimed || p.Period != 60*time.Second || p.JitterPct != 20 {
-		t.Errorf("node policy not applied: %+v", p)
+		t.Errorf("timed strategy policy: %+v", p)
 	}
 
-	// nothing anywhere: the static default
-	p, src = ResolveHopPolicy(nil, &LocalCfg{})
-	if src != "default" || p.Mode != HopModeStatic {
-		t.Errorf("default policy: %+v source=%q", p, src)
-	}
-	if p.Budget != 12 || p.JitterPct != 10 {
-		t.Errorf("default knobs drifted: %+v", p)
-	}
-
-	// knobs resolution: unset jitter keeps the default, explicit period wins
-	p, _ = ResolveHopPolicy(nil, &LocalCfg{PortHoppingMode: HopModeTimed, PortHopping: &PortHoppingCfg{PeriodSeconds: hopStr(5)}})
+	p = ResolveStrategyHopPolicy(&ObfStrategy{
+		PortHoppingMode: HopModeTimed,
+		PortHopping:     &PortHoppingCfg{PeriodSeconds: hopStr(5)},
+	})
 	if p.Period != 5*time.Second || p.JitterPct != 10 {
-		t.Errorf("timed knob resolution: %+v", p)
+		t.Errorf("timed knob resolution (default jitter): %+v", p)
+	}
+
+	p = ResolveStrategyHopPolicy(&ObfStrategy{
+		PortHoppingMode: HopModeProactive,
+		PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(40)},
+	})
+	if p.Mode != HopModeProactive || p.Budget != 40 {
+		t.Errorf("proactive strategy policy: %+v", p)
 	}
 }
 
@@ -252,27 +222,28 @@ func TestValidateHopMode(t *testing.T) {
 	}
 }
 
-// TestHopRecycleSecondsParsingAndResolve pins the recycle_seconds knob
-// surface: parsed on both config levels, defaulted off, resolved into the
-// policy's rate limit, and the interim auto_recycle key rejected with an
-// actionable error instead of being silently ignored.
-func TestHopRecycleSecondsParsingAndResolve(t *testing.T) {
-	const nodeYaml = `
-id: node1
-port: 30000
-port_hopping_mode: proactive
-port_hopping:
-  budget_packets: 24
-  recycle_seconds: 7
+// TestStrategyRecycleSeconds pins the recycle_seconds knob inside a strategy:
+// parsed there, defaulted off, resolved into the policy's rate limit, and the
+// interim auto_recycle key still rejected with an actionable error.
+func TestStrategyRecycleSeconds(t *testing.T) {
+	const centralYaml = `
+obf:
+  hop:
+    ports: 30000-30010
+    port_hopping_mode: proactive
+    port_hopping:
+      budget_packets: 24
+      recycle_seconds: 7
 `
-	var node LocalCfg
-	if err := yaml.Unmarshal([]byte(nodeYaml), &node); err != nil {
-		t.Fatalf("node yaml: %v", err)
+	var central CentralCfg
+	if err := yaml.UnmarshalWithOptions([]byte(centralYaml), &central, yaml.Strict()); err != nil {
+		t.Fatalf("central yaml: %v", err)
 	}
-	if node.PortHopping == nil || node.PortHopping.RecycleSeconds == nil || *node.PortHopping.RecycleSeconds != 7 {
-		t.Fatalf("recycle_seconds not parsed: %+v", node.PortHopping)
+	hop := central.ObfStrategies["hop"]
+	if hop.PortHopping == nil || hop.PortHopping.RecycleSeconds == nil || *hop.PortHopping.RecycleSeconds != 7 {
+		t.Fatalf("recycle_seconds not parsed: %+v", hop.PortHopping)
 	}
-	p := node.PortHopping.Resolve()
+	p := ResolveStrategyHopPolicy(hop)
 	if p.RecycleMinInterval != 7*time.Second {
 		t.Fatalf("recycle_seconds not resolved: %+v", p)
 	}
@@ -291,36 +262,97 @@ port_hopping:
 		t.Fatal("the default policy must not auto-recycle")
 	}
 
-	// central router entry carries it too (wholesale precedence)
-	central := &RouterCfg{
-		NodeCfg:         NodeCfg{Id: "n1"},
-		PortHoppingMode: HopModeProactive,
-		PortHopping:     &PortHoppingCfg{BudgetPackets: hopStr(12), RecycleSeconds: hopStr(60), CooldownSeconds: hopStr(45)},
-	}
-	pol, src := ResolveHopPolicy(central, &LocalCfg{})
-	if src != "central" || pol.RecycleMinInterval != time.Minute || pol.Cooldown != 45*time.Second {
-		t.Fatalf("central recycle_seconds policy: %+v source=%q", pol, src)
-	}
-
-	// the interim auto_recycle key parses (so it can be detected) but fails
-	// validation with the replacement spelled out
-	const legacyYaml = `
-id: node1
-port: 30000
-port_hopping_mode: proactive
-port_hopping:
-  budget_packets: 24
-  auto_recycle: true
-`
-	var legacy LocalCfg
-	if err := yaml.Unmarshal([]byte(legacyYaml), &legacy); err != nil {
-		t.Fatalf("legacy yaml: %v", err)
-	}
-	if legacy.PortHopping == nil || legacy.PortHopping.AutoRecycle == nil {
-		t.Fatalf("legacy auto_recycle not parsed: %+v", legacy.PortHopping)
-	}
-	err := ValidateHopPolicyCfg(legacy.PortHoppingMode, legacy.PortHopping, "node config")
+	// the interim auto_recycle key still fails with the replacement named
+	err := ValidateHopPolicyCfg(HopModeProactive, &PortHoppingCfg{BudgetPackets: hopStr(12), AutoRecycle: hopBool(true)}, "obf strategy hop")
 	if err == nil || !strings.Contains(err.Error(), "auto_recycle was replaced by recycle_seconds") {
 		t.Fatalf("legacy auto_recycle must fail validation with the replacement named, got: %v", err)
+	}
+}
+
+// TestStrategyIPacketsCoherence pins the i-set rule: the strategies a node
+// uses must agree on one non-empty i-set (the AWG 2.0 device prepends one
+// junk set to every handshake toward every peer).
+func TestStrategyIPacketsCoherence(t *testing.T) {
+	strats := func(a, b string) map[string]*ObfStrategy {
+		return map[string]*ObfStrategy{
+			"awg":     {Ports: "40000", I1: a, I2: b},
+			"hopping": {Ports: "40000-50000"},
+			"vanilla": {Ports: "51820"},
+		}
+	}
+
+	// one i-set among the used strategies: fine
+	_, src, err := EffectiveStrategyIPackets(strats("aabb", "ccdd"), []string{"awg", "hopping"})
+	if err != nil || src != "awg" {
+		t.Fatalf("single i-set: src=%q err=%v", src, err)
+	}
+
+	// two different i-sets both used: rejected
+	_, _, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", I1: "aabb"},
+		"awg2": {Ports: "40001", I1: "ccdd"},
+	}, []string{"awg", "awg2"})
+	if err == nil || !strings.Contains(err.Error(), "define different i1..i5") {
+		t.Fatalf("conflicting i-sets must be rejected, got: %v", err)
+	}
+
+	// identical i-sets across strategies: fine
+	_, src, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", I1: "aabb", I5: "ff00"},
+		"awg2": {Ports: "40001", I1: "aabb", I5: "ff00"},
+	}, []string{"awg", "awg2"})
+	if err != nil || src != "awg" {
+		t.Fatalf("identical i-sets: src=%q err=%v", src, err)
+	}
+
+	// unused strategies never restrict the used set
+	_, _, err = EffectiveStrategyIPackets(map[string]*ObfStrategy{
+		"awg":  {Ports: "40000", I1: "aabb"},
+		"awg2": {Ports: "40001", I1: "ccdd"},
+	}, []string{"awg"})
+	if err != nil {
+		t.Fatalf("unused strategy must not restrict: %v", err)
+	}
+
+	// the central validator catches it across every router endpoint
+	central := &CentralCfg{
+		ObfStrategies: map[string]*ObfStrategy{
+			"awg":  {Ports: "40000", I1: "aabb"},
+			"awg2": {Ports: "40001", I1: "ccdd"},
+		},
+		Routers: []RouterCfg{
+			{NodeCfg: NodeCfg{Id: "r1"}, Endpoints: []string{"1.2.3.4[awg]"}},
+			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"1.2.3.5[awg2]"}},
+		},
+	}
+	if err := CentralConfigValidator(central); err == nil || !strings.Contains(err.Error(), "define different i1..i5") {
+		t.Errorf("mesh-wide i-set conflict: err = %v, want coherence error", err)
+	}
+}
+
+// TestNodeUsedStrategies pins the used-set derivation: tags of every router
+// endpoint (own + peers'), untagged endpoints expanding to all strategies.
+func TestNodeUsedStrategies(t *testing.T) {
+	central := &CentralCfg{
+		ObfStrategies: map[string]*ObfStrategy{
+			"awg":     {Ports: "40000"},
+			"hopping": {Ports: "40000-50000"},
+			"vanilla": {Ports: "51820"},
+		},
+		Routers: []RouterCfg{
+			{NodeCfg: NodeCfg{Id: "hub"}, Endpoints: []string{"hub.example.com[hopping,vanilla]"}},
+			{NodeCfg: NodeCfg{Id: "r2"}, Endpoints: []string{"r2.example.com"}},
+		},
+	}
+	used := NodeUsedStrategies(central, "hub")
+	want := "awg,hopping,vanilla" // own tagged {hopping,vanilla} + r2's untagged = all
+	if strings.Join(used, ",") != want {
+		t.Errorf("used = %v, want %s", used, want)
+	}
+
+	// no strategies defined: no used set
+	used = NodeUsedStrategies(&CentralCfg{Routers: []RouterCfg{{NodeCfg: NodeCfg{Id: "hub"}, Endpoints: []string{"hub.example.com"}}}}, "hub")
+	if len(used) != 0 {
+		t.Errorf("strategyless mesh must yield no used set, got %v", used)
 	}
 }

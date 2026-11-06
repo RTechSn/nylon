@@ -103,7 +103,13 @@ func (n *Nylon) reconcileRouterState(next *state.CentralCfg) error {
 			continue
 		}
 		// configure existing neighbours
-		reconcileConfiguredEndpoints(neigh, cfg.Endpoints, &n.RouterTunables)
+		candidates, cerr := n.peerCandidates(&cfg)
+		if cerr != nil {
+			// already journalled by ensurePortFactories; a broken
+			// expansion must not wedge the reconcile loop
+			candidates = nil
+		}
+		reconcileConfiguredEndpoints(neigh, cfg.Endpoints, candidates, &n.RouterTunables)
 		neighs = append(neighs, neigh)
 		delete(desired, neigh.Id)
 	}
@@ -122,9 +128,10 @@ func (n *Nylon) reconcileRouterState(next *state.CentralCfg) error {
 			Eps:    make([]state.Endpoint, 0, len(cfg.Endpoints)),
 		}
 		for _, ep := range cfg.Endpoints {
-			// port hopping: range-form endpoints are owned by the
-			// port factory; only concrete endpoints become links
-			if spec, err := state.ParseEndpointSpec(ep); err == nil && spec.IsRange() {
+			// obf strategies: endpoints that expand into strategy
+			// candidates are owned by the port factory; only
+			// concrete raw endpoints become links
+			if n.endpointFactoryOwned(ep) {
 				continue
 			}
 			stNeigh.Eps = append(stNeigh.Eps, state.NewEndpoint(ep, false, nil, &n.RouterTunables))
@@ -154,29 +161,24 @@ func (n *Nylon) reconcileRouterState(next *state.CentralCfg) error {
 	return nil
 }
 
-func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, t *state.RouterTunables) {
+func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, candidates []hopCandidate, t *state.RouterTunables) {
 	desiredAddresses := make(map[string]struct{}, len(desired))
-	var rangeSpecs []state.EndpointSpec
 	for _, address := range desired {
 		desiredAddresses[address] = struct{}{}
-		// port hopping: remember range-form entries so materialised
-		// hop links (addr:port inside a configured range) survive the
-		// reconcile instead of being dropped as unknown
-		if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
-			rangeSpecs = append(rangeSpecs, spec)
-		}
 	}
 	// hopLinkWithinRange reports whether a concrete link address falls
-	// inside one of the configured ranges (i.e. was materialised by a hop
-	// factory for this neighbour)
+	// inside one of the candidate ranges (i.e. was materialised by a hop
+	// factory for this neighbour). Only literal-IP candidates can match
+	// here — hostname candidates resolve to link addresses the resolver
+	// owns (same limitation as the pre-reform range specs).
 	hopLinkWithinRange := func(address string) bool {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
 			return false
 		}
-		for _, spec := range rangeSpecs {
-			if addr, err := netip.ParseAddr(spec.Host); err == nil {
-				if addr.Unmap() == ap.Addr() && spec.Ports.Contains(ap.Port()) {
+		for _, c := range candidates {
+			if addr, err := netip.ParseAddr(c.host); err == nil {
+				if addr.Unmap() == ap.Addr() && c.ports.Contains(ap.Port()) {
 					return true
 				}
 			}
@@ -193,7 +195,7 @@ func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, t *s
 			continue
 		}
 		// only keep if desired, or if it is a hop link inside a
-		// configured range (owned by the port factory)
+		// configured candidate range (owned by the port factory)
 		if _, ok := desiredAddresses[nep.Address]; ok {
 			eps = append(eps, ep)
 			seen[nep.Address] = struct{}{}
@@ -205,11 +207,26 @@ func reconcileConfiguredEndpoints(neigh *state.Neighbour, desired []string, t *s
 		if _, ok := seen[address]; ok {
 			continue
 		}
-		// port hopping: range-form entries are not links
-		if spec, err := state.ParseEndpointSpec(address); err == nil && spec.IsRange() {
-			continue
-		}
 		eps = append(eps, state.NewEndpoint(address, false, nil, t))
 	}
 	neigh.Eps = eps
+}
+
+// endpointFactoryOwned reports whether a configured endpoint string expands
+// into obf strategy candidates (the port factory owns its links) instead of
+// a concrete raw link: strategy-tagged endpoints and bare hosts in a mesh
+// with obf strategies. Raw host:port endpoints — and bare hosts in a
+// strategyless mesh — stay stock configured links.
+func (n *Nylon) endpointFactoryOwned(addr string) bool {
+	if len(n.CentralCfg.ObfStrategies) == 0 {
+		return false
+	}
+	spec, err := state.ParseEndpointSpec(addr)
+	if err != nil {
+		return false
+	}
+	if spec.HasStrategies() {
+		return true
+	}
+	return !spec.Ports.Valid()
 }

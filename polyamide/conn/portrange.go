@@ -89,3 +89,34 @@ type RangeOpener interface {
 	// called after a successful Open.
 	OpenRange(port uint16, r PortRange) ([]ReceiveFunc, error)
 }
+
+// ParsePortRanges parses a comma-separated list of port ranges:
+// "40000-50000,51820". Single ports are the degenerate ranges.
+func ParsePortRanges(s string) ([]PortRange, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("empty port range list")
+	}
+	parts := strings.Split(s, ",")
+	out := make([]PortRange, 0, len(parts))
+	for _, p := range parts {
+		pr, err := ParsePortRange(strings.TrimSpace(p))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pr)
+	}
+	return out, nil
+}
+
+// RangesString renders a range list in the comma-separated UAPI form:
+// "40000-50000,51820". Nil renders "0" like an invalid single range.
+func RangesString(prs []PortRange) string {
+	if len(prs) == 0 {
+		return "0"
+	}
+	parts := make([]string, 0, len(prs))
+	for _, pr := range prs {
+		parts = append(parts, pr.String())
+	}
+	return strings.Join(parts, ",")
+}

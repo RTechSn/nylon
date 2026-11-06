@@ -16,14 +16,17 @@ import (
 func recycleTestFactory(t *testing.T, n *Nylon, recycleMin time.Duration) *portFactory {
 	t.Helper()
 	ip := netip.MustParseAddr("192.168.1.2")
+	cands := hopTestCandidates(ip.String(), 30000, 30004)
 	return &portFactory{
-		n:          n,
-		node:       "b",
-		pool:       hopTestPool(ip, 30000, 30004),
-		bind:       conn.NewStdNetBind(),
-		specs:      []state.EndpointSpec{{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30004}}},
-		mode:       state.HopModeProactive,
-		recycleMin: recycleMin,
+		n:               n,
+		node:            "b",
+		pool:            hopTestPool(ip, 30000, 30004),
+		bind:            conn.NewStdNetBind(),
+		candidates:      cands,
+		policies:        candidatePolicies(cands),
+		currentStrategy: "hop",
+		mode:            state.HopModeProactive,
+		recycleMin:      recycleMin,
 	}
 }
 

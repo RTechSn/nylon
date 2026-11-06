@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strings"
 
 	amnezigo "github.com/Arsolitt/amnezigo"
 	"github.com/encodeous/nylon/internal/buildinfo"
@@ -31,23 +30,28 @@ func main() {
 
 func newRootCmd() *cobra.Command {
 	var (
-		presetName string
-		random     bool
-		protocol   string
-		mtu        int
-		peerIds    string
-		compat     bool
-		outPath    string
-		verbose    bool
+		presetName    string
+		random        bool
+		protocol      string
+		mtu           int
+		strategyName  string
+		strategyPorts string
+		compat        bool
+		outPath       string
+		verbose       bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "nylon-genesis",
-		Short: "Generate an AWG 2.0 obfuscation profile fragment for a nylon central config",
-		Long: `Generates a paste-ready YAML fragment: a mesh-wide shared obf profile
-(S/H/J, uniform by construction) plus per-node obf blocks with sender-local
-I1-I5 CPS sequences. Parameters come from the amnezigo oracle and are
-validated before anything is emitted.
+		Short: "Generate an AWG 2.0 obfuscation fragment for a nylon central config",
+		Long: `Generates a paste-ready YAML fragment: the mesh-wide shared awg_profile
+(S/H/J dialect, uniform by construction — wire compatibility requires it)
+plus ONE named obf strategy carrying the sender-local I1-I5 CPS sequences.
+
+The strategy fragment lands in the central config's top-level obf: map; tag
+endpoints with the strategy name (host[<strategy>]) to use it, and adjust
+its ports to your deployment. Parameters come from the amnezigo oracle and
+are validated before anything is emitted.
 
 --compat emits the fixed vanilla-compat profile (H1..H4 pinned to the
 WireGuard message types, no padding/junk/I) for the version-skew window
@@ -55,15 +59,16 @@ where plain-WireGuard peers must interoperate.`,
 		Version:      buildinfo.Version,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(presetName, random, protocol, mtu, peerIds, compat, outPath, verbose)
+			return run(presetName, random, protocol, mtu, strategyName, strategyPorts, compat, outPath, verbose)
 		},
 	}
 
 	cmd.Flags().StringVar(&presetName, "preset", defaultPreset, "amnezigo preset name for the shared profile")
 	cmd.Flags().BoolVar(&random, "random", false, "generate a random profile via amnezigo GenerateConfig instead of a preset")
-	cmd.Flags().StringVar(&protocol, "protocol", amnezigo.ProtocolRandom, "protocol template for per-peer I1-I5 (quic|dns|dtls|stun|sip|rtp|random)")
+	cmd.Flags().StringVar(&protocol, "protocol", amnezigo.ProtocolRandom, "protocol template for the strategy's I1-I5 (quic|dns|dtls|stun|sip|rtp|random)")
 	cmd.Flags().IntVar(&mtu, "mtu", 0, "underlay MTU clamping for I/junk sizes (0 = preset default)")
-	cmd.Flags().StringVar(&peerIds, "peers", "", "comma-separated node ids to generate per-node I1-I5 for")
+	cmd.Flags().StringVar(&strategyName, "strategy", "", "name of the generated obf strategy (default: the protocol template name)")
+	cmd.Flags().StringVar(&strategyPorts, "strategy-ports", "51820", "ports of the generated obf strategy (a single port or an inclusive range; adjust to your deployment)")
 	cmd.Flags().BoolVar(&compat, "compat", false, "emit the fixed vanilla-compat profile (ignores preset/protocol)")
 	cmd.Flags().StringVar(&outPath, "out", "", "write to FILE instead of stdout")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "log debug detail to stderr")
@@ -73,17 +78,14 @@ where plain-WireGuard peers must interoperate.`,
 
 // peerFragment mirrors the CentralCfg/NodeCfg yaml shape so the output is
 // paste-ready and unmarshals into state.CentralCfg without noise fields.
-type peerFragment struct {
-	Id  string               `yaml:"id"`
-	Obf *state.ObfPeerParams `yaml:"obf,omitempty"`
-}
-
+// The i-params moved from per-node obf blocks into the central obf strategy
+// map (see state.ObfStrategy): one strategy carries one shared I-set.
 type outputFragment struct {
-	Obf     *state.ObfProfile `yaml:"obf,omitempty"`
-	Routers []peerFragment    `yaml:"routers,omitempty"`
+	AwgProfile *state.ObfProfile             `yaml:"awg_profile,omitempty"`
+	Obf        map[string]*state.ObfStrategy `yaml:"obf,omitempty"`
 }
 
-func run(presetName string, random bool, protocol string, mtu int, peerIds string, compat bool, outPath string, verbose bool) error {
+func run(presetName string, random bool, protocol string, mtu int, strategyName string, strategyPorts string, compat bool, outPath string, verbose bool) error {
 	level, err := logging.Resolve("", verbose)
 	if err != nil {
 		return err
@@ -96,6 +98,15 @@ func run(presetName string, random bool, protocol string, mtu int, peerIds strin
 	if !slices.Contains(amnezigo.ListProtocols(), protocol) {
 		return fmt.Errorf("unknown protocol %q; valid: %v", protocol, amnezigo.ListProtocols())
 	}
+	if strategyName == "" {
+		strategyName = protocol
+	}
+	if err := state.NameValidator(strategyName); err != nil {
+		return fmt.Errorf("invalid strategy name: %w", err)
+	}
+	if _, err := state.ParsePortRange(strategyPorts); err != nil {
+		return fmt.Errorf("invalid --strategy-ports %q: %w", strategyPorts, err)
+	}
 
 	preset, err := amnezigo.GetPreset(presetName)
 	if err != nil {
@@ -105,21 +116,14 @@ func run(presetName string, random bool, protocol string, mtu int, peerIds strin
 		mtu = preset.MTU
 	}
 
-	var peers []string
-	for _, id := range strings.Split(peerIds, ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			peers = append(peers, id)
-		}
-	}
-
 	var profile state.ObfProfile
 	var server amnezigo.ServerObfuscationConfig
-	var peerParams map[string]*state.ObfPeerParams
+	var iSet [5]string
 
 	if compat {
 		// The compat profile deliberately pins H1..H4 to the vanilla WG
 		// message type ids; header-range validation is skipped because
-		// excluding 1..4 is exactly what it would reject.
+		// excluding 1..4 is exactly what it would reject. No junk.
 		profile = state.ObfProfile{
 			H1: state.ObfHeaderRange{Min: 1, Max: 1},
 			H2: state.ObfHeaderRange{Min: 2, Max: 2},
@@ -132,52 +136,48 @@ func run(presetName string, random bool, protocol string, mtu int, peerIds strin
 	} else {
 		if random {
 			// One attempt draws the shared S/H/J (mesh-uniform by
-			// construction) plus one I-set per peer; a draw can collide a
-			// peer's I-packet length with a padded handshake size, so the
-			// whole attempt is redrawn until it validates.
-			profile, peerParams, err = generateRandomProfile(protocol, mtu, preset.S1, preset.Jc, peers)
+			// construction) plus the strategy's I-set; a draw can
+			// collide an I-packet length with a padded handshake
+			// size, so the whole attempt is redrawn until it
+			// validates.
+			profile, iSet, err = generateRandomProfile(protocol, mtu, preset.S1, preset.Jc)
 			if err != nil {
 				return err
 			}
 			log.Debug("validated profile")
-			for _, id := range peers {
-				p := peerParams[id]
-				log.Debug("peer profile", "peer", id, "protocol", p.Protocol, "I1", p.I1, "I2", p.I2, "I3", p.I3, "I4", p.I4, "I5", p.I5)
-			}
 		} else {
 			server = preset.ToServerObfuscation()
 			profile = profileFromServer(server)
 
-			if err := validateGenerated(&profile, server, peers, protocol); err != nil {
+			if err := validateGenerated(&profile, server, protocol); err != nil {
 				return err
 			}
 			log.Debug("validated profile")
 
-			peerParams, err = generatePeerParams(&profile, protocol, mtu, peers)
+			iSet, err = generateISet(&profile, protocol, mtu)
 			if err != nil {
 				return err
 			}
-			for _, id := range peers {
-				p := peerParams[id]
-				log.Debug("peer profile", "peer", id, "protocol", p.Protocol, "I1", p.I1, "I2", p.I2, "I3", p.I3, "I4", p.I4, "I5", p.I5)
-			}
 		}
+		log.Debug("validated strategy I-set", "strategy", strategyName, "protocol", protocol)
 	}
 
-	frag := outputFragment{Obf: &profile}
-	for _, id := range peers {
-		pf := peerFragment{Id: id}
-		if peerParams != nil {
-			pf.Obf = peerParams[id]
-		}
-		frag.Routers = append(frag.Routers, pf)
+	frag := outputFragment{
+		AwgProfile: &profile,
+		Obf: map[string]*state.ObfStrategy{
+			strategyName: {
+				Protocol: protocol,
+				Ports:    strategyPorts,
+				I1:       iSet[0], I2: iSet[1], I3: iSet[2], I4: iSet[3], I5: iSet[4],
+			},
+		},
 	}
 
 	output := outPath
 	if output == "" {
 		output = "stdout"
 	}
-	log.Info("generated profile", "preset", presetName, "protocol", protocol, "mtu", mtu, "peers", len(peers), "output", output)
+	log.Info("generated obf fragment", "preset", presetName, "protocol", protocol, "mtu", mtu, "strategy", strategyName, "ports", strategyPorts, "output", output)
 
 	data, err := yaml.Marshal(frag)
 	if err != nil {
@@ -202,70 +202,53 @@ func run(presetName string, random bool, protocol string, mtu int, peerIds strin
 const randomProfileAttempts = 64
 
 // generateRandomProfile draws an amnezigo random profile: one shared
-// mesh-uniform S/H/J per attempt plus a distinct per-peer I1-I5 draw, the
-// same shape the preset path emits. Every attempt is validated with the same
-// validators as the preset path (validateGenerated, then validatePeerI per
-// peer); the first fully valid attempt wins, and an invalid attempt is
+// mesh-uniform S/H/J per attempt plus the strategy's I-set, the same shape
+// the preset path emits. Every attempt is validated with the same
+// validators as the preset path (validateGenerated, then the I-set size
+// check); the first fully valid attempt wins, and an invalid attempt is
 // redrawn rather than surfaced, because a padded-size collision is an
 // artifact of a single random draw and not a property of the inputs.
-func generateRandomProfile(protocol string, mtu, s1, jc int, peers []string) (state.ObfProfile, map[string]*state.ObfPeerParams, error) {
+func generateRandomProfile(protocol string, mtu, s1, jc int) (state.ObfProfile, [5]string, error) {
 	var lastErr error
 	for range randomProfileAttempts {
 		server := amnezigo.GenerateConfig(protocol, mtu, s1, jc).ServerObfuscationConfig
 		profile := profileFromServer(server)
-		if err := validateGenerated(&profile, server, peers, protocol); err != nil {
+		if err := validateGenerated(&profile, server, protocol); err != nil {
 			lastErr = err
 			continue
 		}
 
-		peerParams, err := generatePeerParams(&profile, protocol, mtu, peers)
+		iSet, err := generateISet(&profile, protocol, mtu)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return profile, peerParams, nil
+		return profile, iSet, nil
 	}
-	return state.ObfProfile{}, nil, fmt.Errorf("no valid random profile after %d attempts: %w", randomProfileAttempts, lastErr)
+	return state.ObfProfile{}, [5]string{}, fmt.Errorf("no valid random profile after %d attempts: %w", randomProfileAttempts, lastErr)
 }
 
-// generatePeerParams draws one I-set per peer and validates it against the
-// shared profile, redrawing a peer's draw while it collides with one of the
-// profile's four padded handshake sizes.
-func generatePeerParams(profile *state.ObfProfile, protocol string, mtu int, peers []string) (map[string]*state.ObfPeerParams, error) {
-	peerParams := make(map[string]*state.ObfPeerParams, len(peers))
-	for _, id := range peers {
-		params, err := generatePeerI(profile, protocol, mtu, id)
-		if err != nil {
-			return nil, err
-		}
-		peerParams[id] = params
-	}
-	return peerParams, nil
-}
-
-// generatePeerI draws one peer's I1-I5 until it satisfies the size invariant
-// against profile. Public amnezigo GenerateCPS draws against an empty
-// forbidden set — its documentation defers collision avoidance to
-// GenerateConfig — so a draw collides with a padded handshake size now and
-// then. With the random protocol the I lengths vary per draw and a redraw
-// resolves it; a named template has one fixed length per (protocol, mtu, S1),
-// so an incompatible combination simply never validates and the budget turns
-// it into one clear error instead of a coin flip.
-func generatePeerI(profile *state.ObfProfile, protocol string, mtu int, id string) (*state.ObfPeerParams, error) {
+// generateISet draws the strategy's I1-I5 until it satisfies the size
+// invariant against profile, redrawing a colliding draw (a padded handshake
+// size). Public amnezigo GenerateCPS draws against an empty forbidden set —
+// its documentation defers collision avoidance to GenerateConfig — so a draw
+// collides with a padded handshake size now and then. With the random
+// protocol the I lengths vary per draw and a redraw resolves it; a named
+// template has one fixed length per (protocol, mtu, S1), so an incompatible
+// combination simply never validates and the budget turns it into one clear
+// error instead of a coin flip.
+func generateISet(profile *state.ObfProfile, protocol string, mtu int) ([5]string, error) {
 	var lastErr error
 	for range randomProfileAttempts {
 		i1, i2, i3, i4, i5 := amnezigo.GenerateCPS(protocol, mtu, int(profile.S1), 0)
-		params := &state.ObfPeerParams{
-			Protocol: protocol,
-			I1:       i1, I2: i2, I3: i3, I4: i4, I5: i5,
-		}
-		if err := validatePeerI(profile, params); err != nil {
+		iSet := [5]string{i1, i2, i3, i4, i5}
+		if err := validateISet(profile, iSet); err != nil {
 			lastErr = err
 			continue
 		}
-		return params, nil
+		return iSet, nil
 	}
-	return nil, fmt.Errorf("peer %s: no collision-free I-set in %d draws: %w", id, randomProfileAttempts, lastErr)
+	return [5]string{}, fmt.Errorf("no collision-free I-set in %d draws: %w", randomProfileAttempts, lastErr)
 }
 
 func profileFromServer(s amnezigo.ServerObfuscationConfig) state.ObfProfile {
@@ -292,7 +275,7 @@ func profileFromServer(s amnezigo.ServerObfuscationConfig) state.ObfProfile {
 // S-padded handshake sizes and the junk range. (amnezigo's ValidateServerConfig
 // additionally requires interface fields a profile fragment does not carry,
 // so its obfuscation sub-checks are invoked directly instead.)
-func validateGenerated(profile *state.ObfProfile, server amnezigo.ServerObfuscationConfig, peers []string, protocol string) error {
+func validateGenerated(profile *state.ObfProfile, server amnezigo.ServerObfuscationConfig, protocol string) error {
 	if err := profile.Validate(); err != nil {
 		return fmt.Errorf("invalid obf profile: %w", err)
 	}
@@ -310,15 +293,15 @@ func validateGenerated(profile *state.ObfProfile, server amnezigo.ServerObfuscat
 	return nil
 }
 
-// validatePeerI re-checks the size-classification invariant with the freshly
-// generated per-peer I lengths.
-func validatePeerI(profile *state.ObfProfile, params *state.ObfPeerParams) error {
+// validateISet re-checks the size-classification invariant with the freshly
+// generated strategy I lengths.
+func validateISet(profile *state.ObfProfile, iSet [5]string) error {
 	iSizes := []int{
-		amnezigo.CPSLength(params.I1),
-		amnezigo.CPSLength(params.I2),
-		amnezigo.CPSLength(params.I3),
-		amnezigo.CPSLength(params.I4),
-		amnezigo.CPSLength(params.I5),
+		amnezigo.CPSLength(iSet[0]),
+		amnezigo.CPSLength(iSet[1]),
+		amnezigo.CPSLength(iSet[2]),
+		amnezigo.CPSLength(iSet[3]),
+		amnezigo.CPSLength(iSet[4]),
 	}
 	return amnezigo.ValidatePacketSizes(
 		int(profile.S1), int(profile.S2), int(profile.S3), int(profile.S4),

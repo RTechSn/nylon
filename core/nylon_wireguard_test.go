@@ -27,8 +27,8 @@ func testObfProfile() *state.ObfProfile {
 
 func TestObfDeviceIPCNilProfileEmitsCompatDefaults(t *testing.T) {
 	want := "h1=1-1\nh2=2-2\nh3=3-3\nh4=4-4\n"
-	if got := obfDeviceIPC(nil, nil); got != want {
-		t.Errorf("obfDeviceIPC(nil, nil) = %q, want %q", got, want)
+	if got := obfDeviceIPC(nil, [5]string{}); got != want {
+		t.Errorf("obfDeviceIPC(nil, empty) = %q, want %q", got, want)
 	}
 }
 
@@ -36,17 +36,15 @@ func TestObfDeviceIPCFullProfile(t *testing.T) {
 	want := "jc=2\njmin=50\njmax=90\n" +
 		"s1=30\ns2=25\ns3=15\ns4=10\n" +
 		"h1=100-200\nh2=300-400\nh3=500-600\nh4=700-800\n"
-	if got := obfDeviceIPC(testObfProfile(), nil); got != want {
-		t.Errorf("obfDeviceIPC(profile, nil) = %q, want %q", got, want)
+	if got := obfDeviceIPC(testObfProfile(), [5]string{}); got != want {
+		t.Errorf("obfDeviceIPC(profile, empty) = %q, want %q", got, want)
 	}
 }
 
 func TestObfDeviceIPCLocalParams(t *testing.T) {
-	local := &state.ObfPeerParams{
-		Protocol: "quic",
-		I1:       "16-28-100-4",
-		I3:       "150-3-1",
-	}
+	// the i-set now arrives as the device-global [5]string resolved from
+	// the node's used obf strategies (see strategyIPacketSet)
+	local := [5]string{"16-28-100-4", "", "150-3-1", "", ""}
 
 	t.Run("compat profile keeps h lines before i lines", func(t *testing.T) {
 		want := "h1=1-1\nh2=2-2\nh3=3-3\nh4=4-4\n" +
@@ -75,10 +73,10 @@ func TestObfDeviceIPCLocalParams(t *testing.T) {
 		}
 	})
 
-	t.Run("empty local params emit no i lines", func(t *testing.T) {
+	t.Run("an empty i-set emits no i lines", func(t *testing.T) {
 		want := "h1=1-1\nh2=2-2\nh3=3-3\nh4=4-4\n"
-		if got := obfDeviceIPC(nil, &state.ObfPeerParams{Protocol: "quic"}); got != want {
-			t.Errorf("obfDeviceIPC(nil, empty local) = %q, want %q", got, want)
+		if got := obfDeviceIPC(nil, [5]string{}); got != want {
+			t.Errorf("obfDeviceIPC(nil, empty i-set) = %q, want %q", got, want)
 		}
 	})
 }
@@ -96,8 +94,8 @@ func TestResolveMTU(t *testing.T) {
 	}
 }
 
-func TestCentralCfgObfYAMLShape(t *testing.T) {
-	cfg := state.CentralCfg{Obf: testObfProfile()}
+func TestCentralCfgAwgProfileYAMLShape(t *testing.T) {
+	cfg := state.CentralCfg{AwgProfile: testObfProfile()}
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -108,33 +106,33 @@ func TestCentralCfgObfYAMLShape(t *testing.T) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("unmarshal marshaled CentralCfg into map: %v", err)
 	}
-	obf, ok := doc["obf"].(map[string]any)
+	obf, ok := doc["awg_profile"].(map[string]any)
 	if !ok {
-		t.Fatalf("marshaled YAML lacks an obf mapping:\n%s", data)
+		t.Fatalf("marshaled YAML lacks an awg_profile mapping:\n%s", data)
 	}
 
 	wantKeys := []string{"jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4"}
 	if len(obf) != len(wantKeys) {
-		t.Errorf("obf mapping has %d keys, want %d: %v", len(obf), len(wantKeys), obf)
+		t.Errorf("awg_profile mapping has %d keys, want %d: %v", len(obf), len(wantKeys), obf)
 	}
 	for _, k := range wantKeys {
 		if _, ok := obf[k]; !ok {
-			t.Errorf("obf mapping missing key %q", k)
+			t.Errorf("awg_profile mapping missing key %q", k)
 		}
 	}
 	for _, k := range []string{"h1", "h2", "h3", "h4"} {
 		h, ok := obf[k].(map[string]any)
 		if !ok {
-			t.Fatalf("obf.%s is not a mapping: %v", k, obf[k])
+			t.Fatalf("awg_profile.%s is not a mapping: %v", k, obf[k])
 		}
 		if len(h) != 2 {
-			t.Errorf("obf.%s has %d keys, want exactly min and max: %v", k, len(h), h)
+			t.Errorf("awg_profile.%s has %d keys, want exactly min and max: %v", k, len(h), h)
 		}
 		if _, ok := h["min"]; !ok {
-			t.Errorf("obf.%s missing key %q", k, "min")
+			t.Errorf("awg_profile.%s missing key %q", k, "min")
 		}
 		if _, ok := h["max"]; !ok {
-			t.Errorf("obf.%s missing key %q", k, "max")
+			t.Errorf("awg_profile.%s missing key %q", k, "max")
 		}
 	}
 
@@ -142,10 +140,10 @@ func TestCentralCfgObfYAMLShape(t *testing.T) {
 	if err := yaml.Unmarshal(data, &round); err != nil {
 		t.Fatalf("unmarshal marshaled CentralCfg: %v", err)
 	}
-	if round.Obf == nil {
-		t.Fatalf("round-trip lost the obf profile:\n%s", data)
+	if round.AwgProfile == nil {
+		t.Fatalf("round-trip lost the awg_profile:\n%s", data)
 	}
-	if *round.Obf != *cfg.Obf {
-		t.Errorf("round-trip mismatch: got %+v, want %+v", *round.Obf, *cfg.Obf)
+	if *round.AwgProfile != *cfg.AwgProfile {
+		t.Errorf("round-trip mismatch: got %+v, want %+v", *round.AwgProfile, *cfg.AwgProfile)
 	}
 }

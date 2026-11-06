@@ -45,18 +45,22 @@ func TestPortAsEndpointIdleActorStall(t *testing.T) {
 	}
 
 	bIdx := vh.IndexOf("b")
-	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+bPorts.String())
-
-	// the client runs the hopping policy from the rig (recent=64, cooldown=180)
-	aIdx := vh.IndexOf("a")
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(180),
-		RecentPorts:      uint32ptr(64),
-		CandidateSamples: uint32ptr(16),
+	// the hopping policy from the rig (recent=64, cooldown=180)
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           bPorts.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(180),
+				RecentPorts:      uint32ptr(64),
+				CandidateSamples: uint32ptr(16),
+			},
+		},
 	}
+	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
+		bRange+"[hop]")
+	aIdx := vh.IndexOf("a")
 
 	// clean links, NO middlebox budget: the rig stalls on a plain LAN
 	vh.AddLinkRange(a1, "b", bRange, bPorts)
@@ -206,21 +210,27 @@ func TestPortAsEndpointMidBatchRotationDeadlock(t *testing.T) {
 	// AWG profile so handshake initiations are 11-buffer batches (5 junk + 5
 	// I-packets + the init itself), like the field rig
 	prof := hopDeadlockObfProfile
-	vh.Central.Obf = &prof
+	vh.Central.AwgProfile = &prof
 	bIdx := vh.IndexOf("b")
-	aIdx := vh.IndexOf("a")
-	vh.Central.Routers[aIdx].Obf = hopDeadlockObfA
-	vh.Central.Routers[bIdx].Obf = hopDeadlockObfB
-	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+bPorts.String())
-
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(180),
-		RecentPorts:      uint32ptr(64),
-		CandidateSamples: uint32ptr(16),
+	// the per-node distinct junk draws retired with the strategy model:
+	// one strategy carries one shared I-set (the deadlock shape only
+	// needs the I-packets' size)
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           bPorts.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(180),
+				RecentPorts:      uint32ptr(64),
+				CandidateSamples: uint32ptr(16),
+			},
+			I1: hopDeadlockObfA.I1, I2: hopDeadlockObfA.I2, I3: hopDeadlockObfA.I3,
+			I4: hopDeadlockObfA.I4, I5: hopDeadlockObfA.I5,
+		},
 	}
+	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
+		bRange+"[hop]")
 
 	vh.AddLinkRange(a1, "b", bRange, bPorts)
 	vh.AddLinkFromAddr(bRange, a1)

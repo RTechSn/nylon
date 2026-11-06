@@ -29,40 +29,14 @@ tun_txqueuelen: 10000 # kernel tx queue length per TUN queue (default: 10000; 0 
 tun_backpressure: false # request IFF_BACKPRESSURE (default: false; requires kernel >= 6.15)
 dynamic_prefixes_dir: "" # directory watched for dynamic prefix JSON files, e.g. /etc/nylon/prefixes.d (empty = disabled)
 
-# Port hopping (server side): also listen on every port of this range and
-# answer peers from the port their packets targeted. The range must contain
-# `port`. Default: disabled.
-listen_ports: "" # e.g. "57175-57575"
-
-# How listen_ports is served: "sockets" (default) binds one extra UDP socket
-# per port, limited to 4096 ports; "nftables" keeps the single primary-port
-# socket and installs a daemon-managed netfilter redirect for the range
-# (Linux, CAP_NET_ADMIN; no width ceiling). Requires listen_ports.
+# Obf strategy listen mode: how the listen ranges DERIVED from the obf
+# strategies your own advertised endpoints name (central.yaml) are served:
+# "sockets" (default) binds one extra UDP socket per port, limited to 4096
+# ports total; "nftables" keeps the single primary-port socket and installs a
+# daemon-managed netfilter redirect per range (Linux, CAP_NET_ADMIN; no
+# width ceiling). Ports themselves live on the strategies (central.yaml `obf:`)
+# — the retired node-level listen_ports moved there.
 listen_mode: "" # "sockets" | "nftables"; empty = sockets
-
-# Port hopping (client side): rotation strategy for peers whose endpoints are
-# configured as port ranges in central.yaml. static (default) pins the first
-# port of the range and never rotates; reactive rotates only when the
-# carrying link is dead or our probes go unanswered; proactive rotates after
-# budget_packets wire packets (required); timed rotates every period_seconds
-# (required). dynamic and auto are reserved for future releases.
-port_hopping_mode: "" # "static" | "reactive" | "proactive" | "timed"; empty = static
-# (renamed from port_mode to share the port_hopping prefix)
-
-# Rotation policy knobs; which are meaningful depends on port_hopping_mode,
-# knobs the mode does not use are ignored. A port_hopping block without
-# port_hopping_mode is a config error (earlier builds rotated by budget
-# implicitly — be explicit). The central router entry
-# (port_hopping_mode/port_hopping in central.yaml) overrides these node-level
-# fields wholesale when it sets either.
-port_hopping:
-  budget_packets: 12     # proactive: rotate the carrying port after N wire packets
-  period_seconds: 300    # timed: rotate every N seconds (required in timed mode)
-  period_jitter_pct: 10  # timed: random jitter around the period, as % of it (max 50)
-  recent_ports: 512      # avoid redrawing the last N selected ports
-  cooldown_seconds: 180  # quarantine a retired port for this long (default 180s; at least the middlebox's per-flow recovery time). A live change applies without a restart: a shortened window also releases already-quarantined ports
-  candidate_samples: 32  # candidates scored per draw for IP/subnet diversity
-  recycle_seconds: 0     # opt-in auto-recycle: when every port is cooling down (pool exhausted), clear the retirement quarantine and restart the sweep, at most once per this many seconds (0 = off: stall until the cooldown elapses); applies to every rotating mode
 
 # In-tunnel QoS: classify inner packets by protocol/port and keep small
 # flows alive under bulk load. Matched flows ride ahead of bulk within
@@ -147,19 +121,11 @@ routers:
     endpoints:
       - "alice.example.com:57175" # domain name (re-resolved periodically)
       - "192.168.1.2:57175"       # LAN IP
-      # Port range (port hopping): peers with a port hopping policy draw
-      # carrying ports from this range instead of pinning one port; the
-      # server must accept the whole range (see guides/port-hopping).
-      # - "203.0.113.7:30000-40000"
-
-    # Port hopping policy (client half) for THIS router: when set here it
-    # overrides the node's node.yaml port_hopping_mode/port_hopping wholesale.
-    # Same semantics as the node-level fields (see node.yaml above).
-    # port_hopping_mode: proactive
-    # port_hopping:
-    #   budget_packets: 12
-    #   cooldown_seconds: 180
-    #   recycle_seconds: 1
+      # Obf strategy tags: the ports come from the named strategies defined
+      # in the top-level `obf:` map; untagged hosts default to ALL strategies
+      # when the mesh defines any. Inline port ranges moved into strategies.
+      # - "203.0.113.7[awg_main,hopping]"
+      # - "198.51.100.9[*]"
 
     # In-tunnel QoS rules for THIS router: a non-empty list here wins
     # wholesale over the mesh-wide top-level priority_rules and over the
@@ -198,12 +164,6 @@ routers:
     endpoints:
       - "192.168.1.1:57175"
       - "nylon.example.org" # port defaults to 57175 (the nylon default port)
-    # Optional per-node obfuscation params. They apply only to this node's
-    # sender path (receivers ignore them) and are normally generated by
-    # `nylon genesis`.
-    # obf:
-    #   protocol: quic # informational template name (quic|dns|dtls|stun|sip|rtp|random)
-    #   i1: <b 0xc0ff><r 8><t><r 40> # CPS spec; i2-i5 are optional, empty ones are omitted
 
   - id: eve
     pubkey: 2mXTTD+FYdtJm/v1vSHz8qimvCucjW9vY+nLYacXJFE=
@@ -257,11 +217,11 @@ dynamic_prefix_ranges:
   - 10.0.0.0/8
 
 # --- Obfuscation ---
-# Mesh-wide AmneziaWG 2.0 profile. Central placement keeps the S and H
+# Mesh-wide AmneziaWG 2.0 dialect (S/H/J). Central placement keeps the
 # parameters identical on every node by construction, which the wire format
 # requires. Omit the whole block for vanilla WireGuard-compatible behavior.
-# The values below are examples; generate a profile with `nylon genesis`.
-obf:
+# The values below are examples; generate one with `nylon genesis`.
+awg_profile:
   jc: 5
   jmin: 250 # must not exceed jmax
   jmax: 800
@@ -281,6 +241,26 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+
+# Named obf strategies: each entry bundles the ports a node listens on /
+# connects through, the client-side rotation policy for those ports, and the
+# sender junk packets (i1-i5). Endpoints reference strategies by name:
+#   endpoints:
+#     - "hub.example.com[hopping,vanilla]"
+# Untagged endpoints (or "[*]") mean "every defined strategy".
+obf:
+  awg_main:
+    protocol: quic      # informational: amnezigo template the i-params came from
+    ports: "40000"      # required: one port or an inclusive range "40000-50000"
+    i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
+  hopping:
+    ports: "40000-50000"
+    port_hopping_mode: timed   # static (default) | reactive | proactive | timed
+    port_hopping:              # knobs; which matter depends on the mode
+      period_seconds: 30
+      period_jitter_pct: 1
+  vanilla:
+    ports: "51820"
 
 # --- Graph ---
 # Defines which nodes will peer with each other. Only nodes connected in the graph
@@ -302,34 +282,43 @@ timestamp: 1740832962209309000
 
 A `metric` override behaves differently per check type. On a `ping` entry the value is advertised unconditionally from startup and suppresses failure retraction, so the prefix stays announced even when the probe target is down; leave it unset if you want health-driven withdrawal. On an `http` entry the override replaces only the healthy request-duration metric, and failures still retract. See [Dynamic Prefixes](/reference/dynamic-prefixes) for the full behavior.
 
-The `obf` profile and the per-node `i1`-`i5` specs are normally produced by `nylon genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
+The `awg_profile` dialect and the strategies' `i1`-`i5` specs are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
 
 ---
 
-## Obfuscation Fields
+## Obf Strategies
 
-Two independent `obf` blocks exist. The mesh-wide profile sits at the top level of `central.yaml`; per-node params sit under each `routers[]` entry (and are also accepted under `clients[]`, although `nylon genesis` emits them for routers only).
+Strategies are the multi-level named list at the top level of `central.yaml` (`obf:`). They are mesh-wide definitions; endpoints select among them per-host.
 
-### central.yaml `obf` (mesh-wide profile)
+| Field               | Type   | Default    | Notes                                                                                                                      |
+| ------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `ports`             | string | required   | one port (`"40000"`) or an inclusive range (`"40000-50000"`)                                                                 |
+| `protocol`          | string | omitted    | informational AmneziaWG template name (`quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, `random`); no runtime effect — the strategy's own name is the identifier, this field only records provenance from `nylon-genesis` |
+| `i1`-`i5`           | string | omitted    | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted to the device                        |
+| `port_hopping_mode` | string | `static`   | rotation strategy for the strategy's ports: `static` \| `reactive` \| `proactive` \| `timed`                                 |
+| `port_hopping`       | map    | omitted    | rotation knobs (`budget_packets`, `period_seconds`, `period_jitter_pct`, `recent_ports`, `cooldown_seconds`, `candidate_samples`, `recycle_seconds`) — same semantics as the pre-reform node-level block |
 
-| Field   | Type                            | Default             | Constraints                                                                                                        |
-| ------- | ------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `jc`    | uint32                          | `0`                 | —                                                                                                                  |
-| `jmin`  | uint32                          | `0`                 | must not exceed `jmax`                                                                                             |
-| `jmax`  | uint32                          | `0`                 | —                                                                                                                  |
-| `s1`-`s4` | uint32                        | `0`                 | —                                                                                                                  |
-| `h1`-`h4` | map with `min`/`max` (uint32) | `min: 0`, `max: 0`  | `min` must not exceed `max` within a range; ranges must not overlap (the device rejects overlaps at UAPI apply time with `headers must not overlap`) |
+**Listen half**: a node binds the union of `ports` over every strategy its OWN advertised endpoints name (untagged = all strategies), served per `listen_mode`. The primary port (`node.yaml`'s `port`) is always bound.
 
-Each `h1`-`h4` range maps to the AmneziaWG UAPI `min-max` form. Omitting the entire `obf` block keeps vanilla WireGuard-compatible header values (`h1` through `h4` pinned to `1-1`, `2-2`, `3-3`, and `4-4`). Ranges that `nylon genesis` generates avoid WireGuard message type ids 1-4.
+**Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
 
-### routers[].obf (per-node, sender-local)
+**Wire reality**: the AWG 2.0 device speaks exactly ONE dialect and emits ONE I-packet set, prepended to every handshake toward EVERY peer. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single non-empty `i1`-`i5` set — validation rejects conflicting sets with the strategies named. A strategy without `i`-params simply emits no junk.
 
-| Field      | Type   | Default             | Notes                                                                                                          |
-| ---------- | ------ | ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `protocol` | string | omitted             | Informational AmneziaWG template name: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`                 |
-| `i1`-`i5`  | string | omitted when empty  | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted                           |
+**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message.
 
-Receivers ignore `protocol` and `i1`-`i5`: these params shape only how this node's outgoing packets look, while the mesh-wide profile governs the receiving side.
+---
+
+## Endpoints
+
+Three forms exist (IPv6 hosts bracketed as usual: `[2001:db8::1]:51820`, `[2001:db8::1][strats]`):
+
+| Form                  | Meaning                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| `host:port`           | raw fixed-port endpoint, no strategy; a stock configured link                                     |
+| `host`                | bare host: every strategy's ports when the mesh defines any, else the default port (57175)          |
+| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies; `host[*]` is the same as untagged        |
+
+Inline port ranges (`host:30000-40000`) moved into strategies and are rejected with a migration error; combining an explicit port with tags (`host:9000[s1]`) is a contradiction and is rejected too.
 
 ---
 

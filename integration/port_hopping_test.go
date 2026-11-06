@@ -50,17 +50,21 @@ func TestPortAsEndpointHoppingGate(t *testing.T) {
 	// appended automatically by the harness and keeps a stock link alive too
 	bIdx := vh.IndexOf("b")
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+hopTestRange.String())
+		bRange+"[hop]")
 
-	// the client runs the hopping policy: rotate after 12 wire packets,
-	// short cooldown so the 100-port test range never runs dry
-	aIdx := vh.IndexOf("a")
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(5),
-		RecentPorts:      uint32ptr(32),
-		CandidateSamples: uint32ptr(16),
+	// the hopping strategy: rotate after 12 wire packets, short cooldown
+	// so the test range never runs dry
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           hopTestRange.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(5),
+				RecentPorts:      uint32ptr(32),
+				CandidateSamples: uint32ptr(16),
+			},
+		},
 	}
 
 	// client -> server: any port of the range reaches the server; the
@@ -157,17 +161,21 @@ func TestPortAsEndpointRangeOnlyHoppingGate(t *testing.T) {
 
 	bIdx := vh.IndexOf("b")
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+hopTestRange.String())
+		bRange+"[hop]")
 
-	// the client runs the hopping policy: rotate after 12 wire packets,
-	// short cooldown so the 100-port test range never runs dry
-	aIdx := vh.IndexOf("a")
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(5),
-		RecentPorts:      uint32ptr(32),
-		CandidateSamples: uint32ptr(16),
+	// the hopping strategy: rotate after 12 wire packets, short cooldown
+	// so the test range never runs dry
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           hopTestRange.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(5),
+				RecentPorts:      uint32ptr(32),
+				CandidateSamples: uint32ptr(16),
+			},
+		},
 	}
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, hopTestRange).WithFlowBudget(hopTestFlowBudget)
@@ -337,15 +345,22 @@ func TestPortAsEndpointNoGhostLinks(t *testing.T) {
 
 	bIdx := vh.IndexOf("b")
 	vh.Central.Routers[bIdx].Endpoints = append(vh.Central.Routers[bIdx].Endpoints,
-		bRange+":"+bPorts.String())
-
+		bRange+"[hop]")
 	aIdx := vh.IndexOf("a")
-	vh.Local[aIdx].PortHoppingMode = state.HopModeProactive
-	vh.Local[aIdx].PortHopping = &state.PortHoppingCfg{
-		BudgetPackets:    uint32ptr(12),
-		CooldownSeconds:  uint32ptr(5),
-		RecentPorts:      uint32ptr(32),
-		CandidateSamples: uint32ptr(16),
+
+	// the hopping strategy: rotate after 12 wire packets, short cooldown
+	// so the test range never runs dry
+	vh.Central.ObfStrategies = map[string]*state.ObfStrategy{
+		"hop": {
+			Ports:           bPorts.String(),
+			PortHoppingMode: state.HopModeProactive,
+			PortHopping: &state.PortHoppingCfg{
+				BudgetPackets:    uint32ptr(12),
+				CooldownSeconds:  uint32ptr(5),
+				RecentPorts:      uint32ptr(32),
+				CandidateSamples: uint32ptr(16),
+			},
+		},
 	}
 
 	fwd := vh.AddLinkRange(a1, "b", bRange, bPorts)

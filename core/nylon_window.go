@@ -2,7 +2,6 @@ package core
 
 import (
 	"errors"
-	"fmt"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -92,18 +91,26 @@ type portFactory struct {
 	n    *Nylon
 	node state.NodeId
 
-	// mu guards current, prev, specs, bind, the rotation-policy fields and
+	// mu guards current, prev, candidates, bind, the rotation-policy fields and
 	// the log-rate-limit fields; the pool has its own locking.
-	mu      sync.Mutex
-	specs   []state.EndpointSpec // range-form endpoints from the neighbour's config
-	pool    *state.PortPool
-	current netip.AddrPort // the endpoint currently carrying traffic
-	prev    netip.AddrPort // the endpoint retired by the latest rotation (seed source / tombstone candidate)
+	mu         sync.Mutex
+	candidates []hopCandidate // per (endpoint × strategy) draw candidates from the peer's config
+	pool       *state.PortPool
+	current    netip.AddrPort // the endpoint currently carrying traffic
+	prev       netip.AddrPort // the endpoint retired by the latest rotation (seed source / tombstone candidate)
 	// lastProbeAt is the last relaxed-cadence probe of the current link.
 	lastProbeAt time.Time
 
-	// rotation policy (refreshed by ensurePortFactories on every pass); the
-	// mode governs WHEN the carrying endpoint rotates (see state.HopMode*)
+	// policies maps every candidate's strategy to its resolved rotation
+	// policy (per-strategy now — the knobs moved INTO the obf strategies).
+	// The mode/period/jitter fields below mirror the CURRENT strategy's
+	// policy; they are re-synced whenever the carrying candidate switches
+	// strategy or the config refreshes.
+	policies        map[string]state.PortHoppingPolicy
+	currentStrategy string
+
+	// rotation policy of the CURRENT carrying candidate's strategy (see
+	// policies); the mode governs WHEN the carrying endpoint rotates
 	mode       string        // static | reactive | proactive | timed
 	period     time.Duration // timed: nominal rotation interval
 	jitterPct  uint32        // timed: jitter as a percentage of period
@@ -111,6 +118,11 @@ type portFactory struct {
 	// rotateReason decorates the next rotation's log line when the rotation
 	// is externally driven (reactive/timed); consumed by logRotation.
 	rotateReason string
+
+	// rewireStrategy is set on the send path when a rotation lands the
+	// carrying endpoint on a DIFFERENT strategy (whose mode/budget differ);
+	// reconcileLinks (dispatch loop) performs the SetHop re-wiring.
+	rewireStrategy string
 
 	// devPeer is the device peer this factory serves, cached on the dispatch
 	// loop (device peers are recreated on config re-applies). External
@@ -217,9 +229,108 @@ func (f *portFactory) bindIfReady() conn.Bind {
 	return f.bind
 }
 
-// hopFactories returns (creating if needed) the factory for a peer. Must be
-// called on the dispatch loop.
-func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, policy state.PortHoppingPolicy, wgPeer *device.Peer) *portFactory {
+// candidatePolicies collects the per-strategy resolved rotation policies of
+// a candidate set.
+func candidatePolicies(candidates []hopCandidate) map[string]state.PortHoppingPolicy {
+	m := make(map[string]state.PortHoppingPolicy, len(candidates))
+	for _, c := range candidates {
+		m[c.strategy] = c.policy
+	}
+	return m
+}
+
+// candidatePoolConfig derives the pool hygiene configuration from a
+// candidate set: the conservative MAXIMUM of the strategies' recent ring,
+// cooldown and candidate-sample knobs (the pool is one object shared by all
+// of the peer's strategies; the WHEN knobs — mode/budget/period — stay
+// per-strategy).
+func candidatePoolConfig(candidates []hopCandidate) state.PortPoolConfig {
+	cfg := state.PortPoolConfig{
+		Recent:   int(state.DefaultPortHoppingPolicy().Recent),
+		Cooldown: state.DefaultPortHoppingPolicy().Cooldown,
+		Samples:  int(state.DefaultPortHoppingPolicy().CandidateSamples),
+	}
+	for _, c := range candidates {
+		if int(c.policy.Recent) > cfg.Recent {
+			cfg.Recent = int(c.policy.Recent)
+		}
+		if c.policy.Cooldown > cfg.Cooldown {
+			cfg.Cooldown = c.policy.Cooldown
+		}
+		if int(c.policy.CandidateSamples) > cfg.Samples {
+			cfg.Samples = int(c.policy.CandidateSamples)
+		}
+	}
+	return cfg
+}
+
+// hopCandidate is ONE (endpoint host × obf strategy) draw target: the host
+// of a tagged (or untagged) peer endpoint, the strategy's parsed port range
+// and that strategy's resolved rotation policy. The factory draws carrying
+// endpoints across the whole candidate set; the policy in effect is the one
+// of the CURRENT carrying candidate's strategy.
+type hopCandidate struct {
+	host     string
+	ports    state.PortRange
+	strategy string
+	policy   state.PortHoppingPolicy
+}
+
+// candidatesOf returns a copy of the configured draw candidates.
+func (f *portFactory) candidatesOf() []hopCandidate {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.candidates)
+}
+
+// strategyForAp names the strategy whose candidate range contains ap
+// (resolving the candidate hosts like ownsEndpoint); "" when no candidate
+// matches (e.g. a stale link after a config change).
+func (f *portFactory) strategyForAp(ap netip.AddrPort) string {
+	for _, c := range f.candidatesOf() {
+		addr, ok := f.resolveCandidateAddr(c)
+		if !ok {
+			continue
+		}
+		if addr.Unmap() == ap.Addr().Unmap() && c.ports.Contains(ap.Port()) {
+			return c.strategy
+		}
+	}
+	return ""
+}
+
+// currentPolicyLocked returns the resolved policy of the given strategy,
+// falling back to the static default for unknown names (send-path safe:
+// never blocks, never allocates beyond a lookup).
+func (f *portFactory) policyOfLocked(strategy string) state.PortHoppingPolicy {
+	if p, ok := f.policies[strategy]; ok {
+		return p
+	}
+	// unknown (config removed the strategy mid-flight): behave statically
+	return state.DefaultPortHoppingPolicy()
+}
+
+// syncStrategyLocked mirrors the given strategy's policy into the active
+// rotation fields (mode/period/jitter/recycle) and re-arms the timed
+// schedule when entering timed mode. Callers hold f.mu.
+func (f *portFactory) syncStrategyLocked(strategy string, now time.Time) {
+	p := f.policyOfLocked(strategy)
+	modeChanged := f.mode != p.Mode || f.currentStrategy != strategy
+	f.currentStrategy = strategy
+	f.mode = p.Mode
+	f.period = p.Period
+	f.jitterPct = p.JitterPct
+	f.recycleMin = p.RecycleMinInterval
+	if modeChanged {
+		if p.Mode == state.HopModeTimed {
+			f.nextRotate = now.Add(jitterInterval(p.Period, p.JitterPct))
+		} else {
+			f.nextRotate = time.Time{}
+		}
+	}
+}
+
+func (n *Nylon) getPortFactory(peer state.NodeId, candidates []hopCandidate, poolCfg state.PortPoolConfig, wgPeer *device.Peer) *portFactory {
 	// CAUTION: the device bind must be acquired BEFORE any factory lock. The
 	// packet send path (Peer.SendBuffers) holds the device net lock in READ
 	// mode across its whole body — including the factory mutex sections inside
@@ -251,41 +362,30 @@ func (n *Nylon) getPortFactory(peer state.NodeId, specs []state.EndpointSpec, po
 		f = &portFactory{
 			n:    n,
 			node: peer,
-			pool: state.NewPortPool(nil, state.PortPoolConfig{
-				Recent:   int(policy.Recent),
-				Cooldown: policy.Cooldown,
-				Samples:  int(policy.CandidateSamples),
-			}),
+			pool: state.NewPortPool(nil, poolCfg),
 		}
 		n.portHopping.factories[peer] = f
 	}
 	f.mu.Lock()
-	f.specs = slices.Clone(specs)
-	// Bounded drawn-port registry sized from the hop policy's recent ring (see
-	// registerDrawn): covers the live window plus the grace horizon.
-	f.drawnCap = max(4*int(policy.Recent), hopDrawnRegistryCap)
+	f.candidates = slices.Clone(candidates)
+	f.policies = candidatePolicies(candidates)
+	// the pool hygiene knobs are the conservative maximum across the
+	// candidate strategies (the pool is one object; the WHEN knobs stay
+	// per-strategy through syncStrategyLocked)
+	f.drawnCap = max(4*poolCfg.Recent, hopDrawnRegistryCap)
 	// Refresh the bind cache on the dispatch loop (see the field comment: the
 	// send path must never acquire the device net write lock). The bind was
 	// acquired above, OUTSIDE every factory lock — see the CAUTION at the top
 	// of this function.
 	f.bind = bind
-	modeChanged := f.mode != policy.Mode
-	f.mode = policy.Mode
-	f.period = policy.Period
-	f.jitterPct = policy.JitterPct
-	f.recycleMin = policy.RecycleMinInterval
+	strategy := f.currentStrategy
+	if strategy == "" && len(candidates) > 0 {
+		strategy = candidates[0].strategy
+	}
+	f.syncStrategyLocked(strategy, time.Now())
 	f.devPeer = wgPeer
 	// a live change of cooldown_seconds applies without a restart
-	f.pool.SetCooldown(policy.Cooldown)
-	if modeChanged {
-		if policy.Mode == state.HopModeTimed {
-			// entering timed mode: schedule the first rotation one period from
-			// now (± jitter)
-			f.nextRotate = time.Now().Add(jitterInterval(policy.Period, policy.JitterPct))
-		} else {
-			f.nextRotate = time.Time{}
-		}
-	}
+	f.pool.SetCooldown(poolCfg.Cooldown)
 	f.mu.Unlock()
 	f.refreshGroups()
 	f.bootstrap()
@@ -307,15 +407,15 @@ func (f *portFactory) bootstrap() {
 		return
 	}
 
-	// resolve any hostname specs in the background, then refresh the pool
+	// resolve any hostname candidates in the background, then refresh the pool
 	// groups once results are cached (dispatch-loop safe)
 	go func() {
-		for _, spec := range f.specStrings() {
-			if _, err := netip.ParseAddr(spec.Host); err == nil {
+		for _, c := range f.candidatesOf() {
+			if _, err := netip.ParseAddr(c.host); err == nil {
 				continue // literal, nothing to resolve
 			}
-			if _, err := f.n.EndpointResolver.Resolve(net.JoinHostPort(spec.Host, strconv.Itoa(int(spec.Ports.First))), f.n.EndpointResolveExpiry); err != nil {
-				f.n.Log.Debug("port hop: failed to resolve range host", "peer", f.node, "host", spec.Host, "error", err)
+			if _, err := f.n.EndpointResolver.Resolve(net.JoinHostPort(c.host, strconv.Itoa(int(c.ports.First))), f.n.EndpointResolveExpiry); err != nil {
+				f.n.Log.Debug("port hop: failed to resolve strategy host", "peer", f.node, "host", c.host, "strategy", c.strategy, "error", err)
 			}
 		}
 		f.n.Dispatch(func() error {
@@ -338,11 +438,34 @@ func (f *portFactory) bootstrap() {
 	f.drawAndMaterialize()
 }
 
-// specStrings returns a copy of the configured range specs.
-func (f *portFactory) specStrings() []state.EndpointSpec {
+// specStrings returns a copy of the configured candidate hosts as concrete
+// first-port addresses (resolver warm-up targets).
+func (f *portFactory) candidateHosts() []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, c := range f.candidatesOf() {
+		target := net.JoinHostPort(c.host, strconv.Itoa(int(c.ports.First)))
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+	}
+	return out
+}
+
+// adoptCurrent syncs the active rotation fields to the strategy owning the
+// given carrying endpoint (rotation across strategies) and flags the device
+// peer for re-wiring when the strategy's mode/budget differ. Safe on both
+// paths (send and dispatch): it only touches factory fields.
+func (f *portFactory) adoptCurrent(ap netip.AddrPort) {
+	strategy := f.strategyForAp(ap)
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.specs)
+	if strategy != "" && strategy != f.currentStrategy {
+		f.syncStrategyLocked(strategy, time.Now())
+		f.rewireStrategy = strategy
+	}
+	f.mu.Unlock()
 }
 
 // drawAndMaterialize draws a fresh carrying endpoint (if the pool has usable
@@ -362,8 +485,8 @@ func (f *portFactory) drawAndMaterialize() {
 	if mode == state.HopModeStatic {
 		pinned, ok := f.pinnedEndpoint()
 		if !ok {
-			// no spec resolvable yet (hostname resolving): retried on the
-			// next SyncApplicationState pass
+			// no candidate resolvable yet (hostname resolving): retried on
+			// the next SyncApplicationState pass
 			return
 		}
 		ap = pinned
@@ -376,6 +499,7 @@ func (f *portFactory) drawAndMaterialize() {
 		}
 		ap = drawn
 	}
+	f.adoptCurrent(ap)
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
@@ -395,16 +519,17 @@ func (f *portFactory) drawAndMaterialize() {
 }
 
 // pinnedEndpoint returns the static-mode carrying endpoint: the first port
-// of the first resolvable range spec. The listen half serves every port of
-// the range (sockets mode binds them all; nftables mode redirects them all),
-// so the first port is always a valid wire target.
+// of the first resolvable candidate (config order: endpoints first, then
+// strategy order within an endpoint). The listen half serves every port of
+// every strategy (sockets mode binds them all; nftables mode redirects them
+// all), so the first port is always a valid wire target.
 func (f *portFactory) pinnedEndpoint() (netip.AddrPort, bool) {
-	for _, spec := range f.specStrings() {
-		addr, ok := f.resolveSpecAddr(spec)
+	for _, c := range f.candidatesOf() {
+		addr, ok := f.resolveCandidateAddr(c)
 		if !ok {
 			continue
 		}
-		return netip.AddrPortFrom(addr, spec.Ports.First), true
+		return netip.AddrPortFrom(addr, c.ports.First), true
 	}
 	return netip.AddrPort{}, false
 }
@@ -424,21 +549,19 @@ func (n *Nylon) dropPortFactory(peer state.NodeId) {
 	n.portHopping.mu.Unlock()
 }
 
-// refreshGroups re-resolves the configured range specs into pool groups
+// refreshGroups re-resolves the configured candidates into pool groups
 // (literal IPs parse directly; hostnames go through the shared resolver and
 // follow its cache expiry).
 func (f *portFactory) refreshGroups() {
-	f.mu.Lock()
-	specs := slices.Clone(f.specs)
-	f.mu.Unlock()
+	candidates := f.candidatesOf()
 
-	groups := make([]state.PortGroup, 0, len(specs))
-	for _, spec := range specs {
-		addr, ok := f.resolveSpecAddr(spec)
+	groups := make([]state.PortGroup, 0, len(candidates))
+	for _, c := range candidates {
+		addr, ok := f.resolveCandidateAddr(c)
 		if !ok {
 			continue
 		}
-		groups = append(groups, state.PortGroup{Addr: addr, Ports: spec.Ports})
+		groups = append(groups, state.PortGroup{Addr: addr, Ports: c.ports})
 	}
 	if !slices.EqualFunc(f.pool.Groups(), groups, func(a, b state.PortGroup) bool {
 		return a.Addr == b.Addr && a.Ports == b.Ports
@@ -447,14 +570,14 @@ func (f *portFactory) refreshGroups() {
 	}
 }
 
-// resolveSpecAddr resolves the host part of a range spec to an address.
-func (f *portFactory) resolveSpecAddr(spec state.EndpointSpec) (netip.Addr, bool) {
-	if addr, err := netip.ParseAddr(spec.Host); err == nil {
+// resolveCandidateAddr resolves the host part of a candidate to an address.
+func (f *portFactory) resolveCandidateAddr(c hopCandidate) (netip.Addr, bool) {
+	if addr, err := netip.ParseAddr(c.host); err == nil {
 		return addr.Unmap(), true
 	}
 	// hostname: resolve through the shared resolver by borrowing the first
-	// port of the range (materialised single-port addresses resolve natively)
-	ap, err := f.n.EndpointResolver.Get(net.JoinHostPort(spec.Host, strconv.Itoa(int(spec.Ports.First))))
+	// port of the strategy range (materialised single-port addresses resolve natively)
+	ap, err := f.n.EndpointResolver.Get(net.JoinHostPort(c.host, strconv.Itoa(int(c.ports.First))))
 	if err != nil {
 		return netip.Addr{}, false
 	}
@@ -462,15 +585,15 @@ func (f *portFactory) resolveSpecAddr(spec state.EndpointSpec) (netip.Addr, bool
 }
 
 // ownsEndpoint reports whether the addr:port lies inside one of the factory's
-// configured ranges, i.e. whether the link was materialised by this factory
+// candidate ranges, i.e. whether the link was materialised by this factory
 // (as opposed to a stock configured endpoint).
 func (f *portFactory) ownsEndpoint(ap netip.AddrPort) bool {
-	for _, spec := range f.specStrings() {
-		addr, ok := f.resolveSpecAddr(spec)
+	for _, c := range f.candidatesOf() {
+		addr, ok := f.resolveCandidateAddr(c)
 		if !ok {
 			continue
 		}
-		if addr.Unmap() == ap.Addr().Unmap() && spec.Ports.Contains(ap.Port()) {
+		if addr.Unmap() == ap.Addr().Unmap() && c.ports.Contains(ap.Port()) {
 			return true
 		}
 	}
@@ -592,7 +715,7 @@ func (f *portFactory) NextHopEndpoint(devPeer *device.Peer, exhausted conn.Endpo
 	f.drawsSinceRecycle++
 	f.mu.Unlock()
 	f.registerDrawn(ap)
-
+	f.adoptCurrent(ap)
 	// CAUTION: this runs on the packet send path, under Peer.SendBuffers'
 	// device.net READ lock. Never call n.Device.Bind() here — it takes the
 	// device.net WRITE lock and self-deadlocks. Use the cached bind.
@@ -625,6 +748,7 @@ func (f *portFactory) staticCarrying() (conn.Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.adoptCurrent(ap)
 	f.mu.Lock()
 	f.current = ap
 	f.lastProbeAt = time.Now()
@@ -737,7 +861,19 @@ func (f *portFactory) reconcileLinks() {
 	mode := f.mode
 	period := f.period
 	jitterPct := f.jitterPct
+	rewire := f.rewireStrategy
+	devPeer := f.devPeer
+	f.rewireStrategy = ""
 	f.mu.Unlock()
+
+	// a rotation landed the carrying endpoint on a different strategy:
+	// re-wire the device peer's hop source to that strategy's mode/budget
+	// (the send path only flags; device mutation lives here)
+	if rewire != "" && devPeer != nil {
+		f.wireDevPeer(devPeer)
+		f.n.Log.Info("port hop: carrying strategy switched",
+			"peer", f.node, "strategy", rewire, "mode", f.hopMode())
+	}
 
 	if !current.IsValid() {
 		return // nothing drawn yet (bootstrap in flight)
@@ -1047,39 +1183,85 @@ func (f *portFactory) scheduleTombstoneRemoval(addr string) {
 	f.n.scheduleExhaustedLinkRemoval(f.node, addr)
 }
 
+// wireDevPeer wires the device peer's hop source to the CURRENT strategy's
+// rotation mode: proactive budgets rotate on the send path; every other mode
+// rotates externally from the dispatch loop. Must run on the dispatch loop.
+func (f *portFactory) wireDevPeer(wgPeer *device.Peer) {
+	f.mu.Lock()
+	strategy := f.currentStrategy
+	f.mu.Unlock()
+	policy := f.policyOf(strategy)
+	if policy.Mode == state.HopModeProactive {
+		wgPeer.SetHop(f, int(policy.Budget))
+	} else {
+		// static/reactive/timed: the carrying endpoint never rotates on
+		// the send path; reactive/timed rotations are driven by the
+		// factory from the dispatch loop
+		wgPeer.SetHopExternal(f)
+	}
+}
+
+// policyOf is the lock-taking wrapper around policyOfLocked.
+func (f *portFactory) policyOf(strategy string) state.PortHoppingPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.policyOfLocked(strategy)
+}
+
+// peerCandidates expands a peer's advertised endpoints into draw candidates:
+// every tagged or bare-host endpoint contributes one candidate per strategy
+// its tags name (untagged = all strategies), carrying that strategy's parsed
+// ports and resolved rotation policy. Raw host:port endpoints contribute
+// nothing (stock configured links).
+func (n *Nylon) peerCandidates(cfg *state.RouterCfg) ([]hopCandidate, error) {
+	m := n.CentralCfg.ObfStrategies
+	if len(m) == 0 {
+		return nil, nil
+	}
+	var candidates []hopCandidate
+	seen := map[string]struct{}{}
+	for _, addr := range cfg.Endpoints {
+		spec, err := state.ParseEndpointSpec(addr)
+		if err != nil {
+			continue // validation owns the error path
+		}
+		if !spec.HasStrategies() && (spec.Ports.Valid() || len(m) == 0) {
+			continue // raw endpoint or strategyless mesh
+		}
+		tags, err := state.EndpointStrategyTags(spec, m)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range tags {
+			key := spec.Host + "|" + name
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			pr, err := state.StrategyPortRangeOf(m, name)
+			if err != nil {
+				return nil, err
+			}
+			s := m[name]
+			candidates = append(candidates, hopCandidate{
+				host:     spec.Host,
+				ports:    pr,
+				strategy: name,
+				policy:   state.ResolveStrategyHopPolicy(s),
+			})
+		}
+	}
+	return candidates, nil
+}
+
 // ensurePortFactories wires a HopSource into every device peer whose
-// neighbour is configured with port ranges, and unwires it when the ranges
-// disappear. Runs on the dispatch loop from SyncApplicationState.
+// neighbour's endpoints expand into obf strategy candidates, and unwires it
+// when they no longer do. Runs on the dispatch loop from SyncApplicationState.
 func (n *Nylon) ensurePortFactories() error {
 	if n.Device == nil {
 		return nil
 	}
-	policy, source := n.resolveHopPolicy()
-
-	// log the active policy whenever it changes (startup, config update,
-	// mode switch): the mode is a fleet-level decision and deserves its own
-	// line in the journal
-	sig := fmt.Sprintf("%s|%d|%s|%d|%s|%s", policy.Mode, policy.Budget, policy.Period, policy.JitterPct, policy.RecycleMinInterval, policy.Cooldown)
-	n.portHopping.mu.Lock()
-	policyChanged := sig != n.portHopping.appliedPolicy
-	n.portHopping.appliedPolicy = sig
-	n.portHopping.mu.Unlock()
-	if policyChanged {
-		attrs := []any{"mode", policy.Mode, "source", source}
-		switch policy.Mode {
-		case state.HopModeProactive:
-			attrs = append(attrs, "budget", policy.Budget,
-				"cooldown", policy.Cooldown.String(), "recycle_seconds", policy.RecycleMinInterval.String())
-		case state.HopModeTimed:
-			attrs = append(attrs, "period", policy.Period.String(),
-				"jitter_pct", policy.JitterPct, "cooldown", policy.Cooldown.String(),
-				"recycle_seconds", policy.RecycleMinInterval.String())
-		case state.HopModeReactive:
-			attrs = append(attrs, "cooldown", policy.Cooldown.String(),
-				"recycle_seconds", policy.RecycleMinInterval.String())
-		}
-		n.Log.Info("port hop policy applied", attrs...)
-	}
+	n.logStrategyHopPolicies()
 
 	for _, peer := range n.GetPeers(n.Id) {
 		if !n.IsRouter(peer) {
@@ -1087,52 +1269,93 @@ func (n *Nylon) ensurePortFactories() error {
 		}
 		cfg := n.GetRouter(peer)
 
-		var specs []state.EndpointSpec
-		for _, addr := range cfg.Endpoints {
-			spec, err := state.ParseEndpointSpec(addr)
-			if err != nil {
-				continue
+		candidates, err := n.peerCandidates(&cfg)
+		if err != nil {
+			// validation normally catches this at seal/startup;
+			// a live config swap that slipped through must not take
+			// the daemon down — drop the factory and journal loudly
+			n.Log.Error("port hop: dropping the factory, endpoint strategies failed to expand", "peer", peer, "error", err)
+			if n.hasPortFactory(peer) {
+				if wgPeer := n.Device.LookupPeer(device.NoisePublicKey(n.GetNode(peer).PubKey)); wgPeer != nil {
+					wgPeer.SetHop(nil, 0)
+				}
+				n.dropPortFactory(peer)
 			}
-			if spec.IsRange() {
-				specs = append(specs, spec)
-			}
+			continue
 		}
 
 		wgPeer := n.Device.LookupPeer(device.NoisePublicKey(n.GetNode(peer).PubKey))
 		if wgPeer == nil {
 			continue
 		}
-		if len(specs) == 0 {
-			// no ranges for this peer: make sure any stale hop state is gone
+		if len(candidates) == 0 {
+			// no strategy candidates for this peer: make sure any stale hop state is gone
 			if n.hasPortFactory(peer) {
 				wgPeer.SetHop(nil, 0)
 				n.dropPortFactory(peer)
 			}
 			continue
 		}
-		f := n.getPortFactory(peer, specs, policy, wgPeer)
-		if policy.Mode == state.HopModeProactive {
-			wgPeer.SetHop(f, int(policy.Budget))
-		} else {
-			// static/reactive/timed: the carrying endpoint never rotates on
-			// the send path; reactive/timed rotations are driven by the
-			// factory from the dispatch loop
-			wgPeer.SetHopExternal(f)
-		}
+		f := n.getPortFactory(peer, candidates, candidatePoolConfig(candidates), wgPeer)
+		f.wireDevPeer(wgPeer)
 	}
 	return nil
 }
 
-// resolveHopPolicy resolves this node's effective port rotation policy: the
-// central router entry wins wholesale over node.yaml, which wins over the
-// static default (see state.ResolveHopPolicy). Runs on the dispatch loop.
-func (n *Nylon) resolveHopPolicy() (state.PortHoppingPolicy, string) {
-	var rc *state.RouterCfg
-	if n.CentralCfg.IsRouter(n.LocalCfg.Id) {
-		router := n.CentralCfg.GetRouter(n.LocalCfg.Id)
-		rc = &router
+// logStrategyHopPolicies journals the effective rotation policy of every
+// strategy this node may draw from (its used set), one line per strategy,
+// whenever a policy changes (startup, config update). The knobs moved into
+// the strategies, so the journal names the strategy instead of a source.
+func (n *Nylon) logStrategyHopPolicies() {
+	m := n.CentralCfg.ObfStrategies
+	if len(m) == 0 {
+		return
 	}
-	return state.ResolveHopPolicy(rc, &n.LocalCfg)
+	used := state.NodeUsedStrategies(&n.CentralCfg, n.LocalCfg.Id)
+	n.portHopping.mu.Lock()
+	if n.portHopping.appliedPolicies == nil {
+		n.portHopping.appliedPolicies = make(map[string]string)
+	}
+	changed := map[string]bool{}
+	seen := map[string]struct{}{}
+	for _, name := range used {
+		s := m[name]
+		if s == nil {
+			continue
+		}
+		seen[name] = struct{}{}
+		sig := s.HopPolicySignature()
+		if n.portHopping.appliedPolicies[name] != sig {
+			n.portHopping.appliedPolicies[name] = sig
+			changed[name] = true
+		}
+	}
+	for name := range n.portHopping.appliedPolicies {
+		if _, ok := seen[name]; !ok {
+			delete(n.portHopping.appliedPolicies, name)
+		}
+	}
+	n.portHopping.mu.Unlock()
+	for _, name := range used {
+		if !changed[name] {
+			continue
+		}
+		p := state.ResolveStrategyHopPolicy(m[name])
+		attrs := []any{"strategy", name, "mode", p.Mode}
+		switch p.Mode {
+		case state.HopModeProactive:
+			attrs = append(attrs, "budget", p.Budget,
+				"cooldown", p.Cooldown.String(), "recycle_seconds", p.RecycleMinInterval.String())
+		case state.HopModeTimed:
+			attrs = append(attrs, "period", p.Period.String(),
+				"jitter_pct", p.JitterPct, "cooldown", p.Cooldown.String(),
+				"recycle_seconds", p.RecycleMinInterval.String())
+		case state.HopModeReactive:
+			attrs = append(attrs, "cooldown", p.Cooldown.String(),
+				"recycle_seconds", p.RecycleMinInterval.String())
+		}
+		n.Log.Info("port hop policy applied", attrs...)
+	}
 }
 
 func (n *Nylon) hasPortFactory(peer state.NodeId) bool {
@@ -1173,19 +1396,19 @@ func (n *Nylon) hopProbeReady(peer state.NodeId, addr string) bool {
 }
 
 // hopSpecResolveTargets returns one resolvable endpoint string per configured
-// range spec ("host:firstport"), so the shared resolver refresh loop keeps
-// their DNS entries warm. Range specs never appear as links, which is the only
+// candidate ("host:firstport"), so the shared resolver refresh loop keeps
+// their DNS entries warm. Candidates never appear as links, which is the only
 // thing the refresh loop would otherwise visit.
 func (n *Nylon) hopSpecResolveTargets() []string {
 	n.portHopping.mu.Lock()
 	defer n.portHopping.mu.Unlock()
 	var out []string
 	for _, f := range n.portHopping.factories {
-		for _, spec := range f.specStrings() {
-			if _, err := netip.ParseAddr(spec.Host); err == nil {
+		for _, target := range f.candidateHosts() {
+			if _, err := netip.ParseAddr(target); err == nil {
 				continue // literal addresses need no resolver entry
 			}
-			out = append(out, net.JoinHostPort(spec.Host, strconv.Itoa(int(spec.Ports.First))))
+			out = append(out, target)
 		}
 	}
 	return out

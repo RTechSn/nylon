@@ -46,9 +46,12 @@ type Nylon struct {
 	// endpoints from the port pool and materialise them as regular nylon
 	// links, so runtime state stays O(active window) instead of O(range).
 	portHopping struct {
-		mu            sync.Mutex
-		factories     map[state.NodeId]*portFactory
-		appliedPolicy string // signature of the last applied hop policy (change detection for the "port hop policy applied" log)
+		mu        sync.Mutex
+		factories map[state.NodeId]*portFactory
+		// appliedPolicies carries the last-journalled rotation-policy
+		// signature per obf strategy (change detection for the
+		// "port hop policy applied" lines — one per strategy)
+		appliedPolicies map[string]string
 
 		// hintSigs carries the per-peer data-arrival adoption slot (see
 		// hopAdoptDataArrival): a lock-free sync.Map read on the TC hot path
@@ -69,9 +72,16 @@ type Nylon struct {
 	// only on the dispatch loop.
 	priorityRulesSig string
 
+	// obfAppliedSig/listenAppliedSig are change-detection signatures for
+	// the "obf strategies applied" / listen-union journal lines and the
+	// live re-apply decisions in SyncWireGuard; touched only on the
+	// dispatch loop.
+	obfAppliedSig    string
+	listenAppliedSig string
+
 	// port hopping (server half, listen_mode: nftables): the daemon-owned
-	// netfilter redirect serving the listen range on the primary port. nil
-	// unless the mode is active; removed again on shutdown.
+	// netfilter redirect serving the strategy listen union on the primary
+	// port. nil unless the mode is active; removed again on shutdown.
 	nftRedirect *nftRangeRedirect
 
 	router struct {

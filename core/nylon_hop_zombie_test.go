@@ -21,9 +21,7 @@ func newZombieTestFactory(t *testing.T, n *Nylon) (*portFactory, netip.AddrPort)
 	ip := netip.MustParseAddr("192.168.1.2")
 	pool := state.NewPortPool([]state.PortGroup{{Addr: ip, Ports: state.PortRange{First: 30000, Last: 30099}}},
 		state.PortPoolConfig{Recent: 16, Cooldown: time.Hour, Samples: 4})
-	f := &portFactory{n: n, node: "b", pool: pool, bind: conn.NewStdNetBind(), specs: []state.EndpointSpec{
-		{Host: ip.String(), Ports: state.PortRange{First: 30000, Last: 30099}},
-	}}
+	f := hopTestFactory(n, ip.String(), 30000, 30099, pool)
 	n.portHopping.factories = map[state.NodeId]*portFactory{"b": f}
 	f.drawAndMaterialize()
 	f.mu.Lock()
@@ -178,7 +176,8 @@ func flipZombieFactorySpec(t *testing.T, f *portFactory, first, last uint16) {
 	t.Helper()
 	flip := netip.MustParseAddr("192.168.9.9")
 	f.mu.Lock()
-	f.specs = []state.EndpointSpec{{Host: flip.String(), Ports: state.PortRange{First: first, Last: last}}}
+	f.candidates = hopTestCandidates(flip.String(), first, last)
+	f.policies = candidatePolicies(f.candidates)
 	f.mu.Unlock()
 	f.pool.SetGroups([]state.PortGroup{{Addr: flip, Ports: state.PortRange{First: first, Last: last}}})
 }
@@ -208,10 +207,6 @@ func TestReconcileTombstonesDrawnPortsUnderSpecFlip(t *testing.T) {
 	// control: after the flip the resolver-based check no longer owns the
 	// first port (this is the regression the registry exists for)
 	flipZombieFactorySpec(t, f, 30000, 30099)
-	f.mu.Lock()
-	specs := slices.Clone(f.specs)
-	f.mu.Unlock()
-	_ = specs
 	ap, err := netip.ParseAddrPort(first.String())
 	if err != nil {
 		t.Fatalf("parse: %v", err)

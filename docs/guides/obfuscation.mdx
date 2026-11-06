@@ -22,13 +22,13 @@ Obfuscation is configured at two levels in `central.yaml` (see [Configuration Re
 
 | Level | Fields | Scope |
 | --- | --- | --- |
-| Central `obf` profile | `jc`, `jmin`, `jmax`, `s1`–`s4`, `h1`–`h4` | One shared profile for the whole mesh |
-| Per-node `obf` (`routers[].obf`, `clients[].obf`) | `protocol`, `i1`–`i5` | Sender-local, may differ per node |
+| Central `awg_profile` | `jc`, `jmin`, `jmax`, `s1`–`s4`, `h1`–`h4` | One shared dialect for the whole mesh |
+| Named obf strategies (top-level `obf:` map) | `ports`, `protocol`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; endpoints select by name |
 
-A minimal central profile with a per-node QUIC-style template:
+A minimal dialect with a QUIC-template strategy:
 
 ```yaml title="central.yaml"
-obf:
+awg_profile:
   jc: 5
   jmin: 250
   jmax: 800
@@ -48,10 +48,10 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
-routers:
-- id: node1
-  obf:
+obf:
+  quic:
     protocol: quic
+    ports: "51820"
     i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
     i2: <b 0xc0ff><b 0x00000001><b 0x08><d><b 0x00><b 0x00><b 0x0020><b 0x01><t><r 20>
     i3: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0010><b 0x01><t><r 10>
@@ -65,18 +65,20 @@ The `s1`–`s4` and `h1`–`h4` values are a wire contract between every pair of
 - A **sender** picks each outgoing message's type word from its own `h` ranges and pads the message by its own `s` values.
 - A **receiver** classifies incoming packets using **its own** `s`/`h` values.
 
-If two nodes carry different `s`/`h` values, the receiver fails to classify the sender's packets and drops them silently. The junk-packet knobs `jc`, `jmin`, `jmax` are not part of that wire contract — junk datagrams are sender-local camouflage that receivers discard unclassified — but they cannot diverge either: they exist only in the single central `obf` profile, which is distributed identically to every node. [nylon-genesis](/guides/genesis) enforces this by construction.
+If two nodes carry different `s`/`h` values, the receiver fails to classify the sender's packets and drops them silently. The junk-packet knobs `jc`, `jmin`, `jmax` are not part of that wire contract — junk datagrams are sender-local camouflage that receivers discard unclassified — but they cannot diverge either: they exist only in the single central `awg_profile`, which is distributed identically to every node. [nylon-genesis](/guides/genesis) enforces this by construction.
 
-### I-Patterns Are Sender-Local
+### I-Patterns Ride the Strategy
 
-The `i1`–`i5` patterns (and the informational `protocol` label) describe only what **this node sends**. You never configure another node's I values anywhere, and receivers do not validate your patterns against their own. This is why two nodes can use different I-patterns — for example, different templates per site — while staying fully interoperable, as long as their central `s`/`h` profiles match.
+The `i1`–`i5` patterns (and the informational `protocol` label) describe only what the nodes using the strategy **send**. Receivers do not validate your patterns against their own, so two nodes may draw from strategies with different I-patterns — for example, different templates per site — while staying fully interoperable, as long as the central `s`/`h` dialect matches.
+
+One wire reality remains: the AWG 2.0 device emits its I-packets on **every handshake toward every peer**, from one device-global set. The strategies a single node draws from (its own and its peers' advertised endpoints) must therefore agree on one non-empty `i1`–`i5` set — the config validator rejects conflicting sets by name. A node whose strategies define no `i`-params simply sends no junk.
 
 ## The Default Profile Is Vanilla-Compatible
 
-If you omit the `obf` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
+If you omit the `awg_profile` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
 
 ::::caution
-This is deliberately **not** the AmneziaWG "all zeros" default, which would produce a type word of 0 and break interoperability with vanilla WireGuard. The converse also holds: any profile that deviates from these vanilla-pinned values breaks stock-client handshakes. To pin the vanilla-compatible values explicitly — for example across a version-skew window during a rollout — [nylon-genesis](/guides/genesis) `--compat` emits a profile with exactly these ranges (and zero padding, no junk packets, no I-patterns). The vanilla-compatible profile is the **only** mode in which a stock WireGuard client (iOS, Android, Windows, …) can complete a handshake with a nylon peer. See [WireGuard Clients](/guides/wg-clients).
+This is deliberately **not** the AmneziaWG "all zeros" default, which would produce a type word of 0 and break interoperability with vanilla WireGuard. The converse also holds: any dialect that deviates from these vanilla-pinned values breaks stock-client handshakes. To pin the vanilla-compatible values explicitly — for example across a version-skew window during a rollout — [nylon-genesis](/guides/genesis) `--compat` emits a dialect with exactly these ranges (and zero padding, no junk packets, no I-patterns). The vanilla-compatible dialect is the **only** mode in which a stock WireGuard client (iOS, Android, Windows, …) can complete a handshake with a nylon peer. See [WireGuard Clients](/guides/wg-clients).
 ::::
 
 In practice:

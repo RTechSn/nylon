@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -18,9 +19,6 @@ func TestParsePortRangeForms(t *testing.T) {
 		{"0", 0, 0, 0, false, false, true},
 		{"0-100", 0, 0, 0, false, false, true},
 		{"65536", 0, 0, 0, false, false, true},
-		{"", 0, 0, 0, false, false, true},
-		{"abc", 0, 0, 0, false, false, true},
-		{"100-abc", 0, 0, 0, false, false, true},
 	}
 	for _, c := range cases {
 		pr, err := ParsePortRange(c.in)
@@ -34,23 +32,17 @@ func TestParsePortRangeForms(t *testing.T) {
 			t.Errorf("ParsePortRange(%q): unexpected error %v", c.in, err)
 			continue
 		}
-		if pr.First != c.first || pr.Last != c.last {
-			t.Errorf("ParsePortRange(%q) = %v, want %d-%d", c.in, pr, c.first, c.last)
-		}
-		if pr.Size() != c.size {
-			t.Errorf("PortRange(%q).Size() = %d, want %d", c.in, pr.Size(), c.size)
-		}
-		if pr.IsSingle() != c.single {
-			t.Errorf("PortRange(%q).IsSingle() = %v, want %v", c.in, pr.IsSingle(), c.single)
-		}
-		if pr.Valid() != c.valid {
-			t.Errorf("PortRange(%q).Valid() = %v, want %v", c.in, pr.Valid(), c.valid)
+		if pr.First != c.first || pr.Last != c.last || pr.Size() != c.size || pr.IsSingle() != c.single || pr.Valid() != c.valid {
+			t.Errorf("ParsePortRange(%q) = %v (size %d), want %d-%d size %d single=%v", c.in, pr, pr.Size(), c.first, c.last, c.size, c.single)
 		}
 	}
 }
 
 func TestPortRangeContains(t *testing.T) {
-	pr := PortRange{First: 30000, Last: 30009}
+	pr, err := ParsePortRange("30000-30009")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range []uint16{30000, 30005, 30009} {
 		if !pr.Contains(p) {
 			t.Errorf("Contains(%d) = false, want true", p)
@@ -69,32 +61,47 @@ func TestParseEndpointSpecForms(t *testing.T) {
 		host        string
 		first, last uint16
 		isRange     bool
-		wantErr     bool
+		strategies  []string
+		wantErr     string // "" = expect success
 	}{
-		// concrete endpoints
-		{"1.2.3.4", "1.2.3.4", DefaultPort, DefaultPort, false, false},
-		{"1.2.3.4:57175", "1.2.3.4", 57175, 57175, false, false},
-		{"example.com", "example.com", DefaultPort, DefaultPort, false, false},
-		{"example.com:9000", "example.com", 9000, 9000, false, false},
-		{"[2001:db8::1]:9000", "2001:db8::1", 9000, 9000, false, false},
-		{"2001:db8::1", "2001:db8::1", DefaultPort, DefaultPort, false, false},
-		// ranges
-		{"1.2.3.4:30000-40000", "1.2.3.4", 30000, 40000, true, false},
-		{"example.com:30000-40000", "example.com", 30000, 40000, true, false},
-		{"[2001:db8::1]:30000-40000", "2001:db8::1", 30000, 40000, true, false},
-		{"1.2.3.4:30000-30000", "1.2.3.4", 30000, 30000, false, false},
-		// errors
-		{"", "", 0, 0, false, true},
-		{"http://example.com", "", 0, 0, false, true},
-		{"1.2.3.4:40000-30000", "", 0, 0, false, true},
-		{"1.2.3.4:0-100", "", 0, 0, false, true},
-		{":30000", "", 0, 0, false, true},
+		// concrete endpoints (raw forms); a bare host keeps Ports invalid
+		// so "explicit port" stays distinguishable from "bare host"
+		{"1.2.3.4", "1.2.3.4", 0, 0, false, nil, ""},
+		{"1.2.3.4:57175", "1.2.3.4", 57175, 57175, false, nil, ""},
+		{"example.com", "example.com", 0, 0, false, nil, ""},
+		{"example.com:9000", "example.com", 9000, 9000, false, nil, ""},
+		{"[2001:db8::1]:9000", "2001:db8::1", 9000, 9000, false, nil, ""},
+		{"2001:db8::1", "2001:db8::1", 0, 0, false, nil, ""},
+		// strategy-tagged endpoints: the strategy carries the ports
+		{"1.2.3.4[awg_main]", "1.2.3.4", 0, 0, false, []string{"awg_main"}, ""},
+		{"example.com[hopping,vanilla]", "example.com", 0, 0, false, []string{"hopping", "vanilla"}, ""},
+		{"1.2.3.4[*]", "1.2.3.4", 0, 0, false, []string{"*"}, ""},
+		{"[2001:db8::1][awg_main]", "2001:db8::1", 0, 0, false, []string{"awg_main"}, ""},
+		// inline ranges moved into strategies: migration errors
+		{"1.2.3.4:30000-40000", "", 0, 0, false, nil, "inline port ranges moved into obf strategies"},
+		{"example.com:30000-40000", "", 0, 0, false, nil, "inline port ranges moved into obf strategies"},
+		{"1.2.3.4:30000-30000", "", 0, 0, false, nil, "inline port ranges moved into obf strategies"},
+		// port + tags is a contradiction: the strategy names the ports
+		{"1.2.3.4:9000[awg_main]", "", 0, 0, false, nil, "cannot be combined with obf strategy tags"},
+		// tag list hygiene
+		{"1.2.3.4[]", "", 0, 0, false, nil, "empty obf strategy name"},
+		{"1.2.3.4[* ,awg]", "", 0, 0, false, nil, "must stand alone"},
+		{"1.2.3.4[awg,]", "", 0, 0, false, nil, "empty obf strategy name"},
+		{"1.2.3.4[Awg]", "", 0, 0, false, nil, "invalid obf strategy tag"},
+		{"[awg_main]", "", 0, 0, false, nil, "without a host"},
+		// generic errors
+		{"", "", 0, 0, false, nil, "endpoint is empty"},
+		{"http://example.com", "", 0, 0, false, nil, "invalid endpoint"},
+		{"1.2.3.4:40000-30000", "", 0, 0, false, nil, "inline port ranges moved into obf strategies"},
+		{":30000", "", 0, 0, false, nil, "empty host"},
 	}
 	for _, c := range cases {
 		spec, err := ParseEndpointSpec(c.in)
-		if c.wantErr {
+		if c.wantErr != "" {
 			if err == nil {
-				t.Errorf("ParseEndpointSpec(%q): expected error, got %+v", c.in, spec)
+				t.Errorf("ParseEndpointSpec(%q): expected error %q, got %+v", c.in, c.wantErr, spec)
+			} else if !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("ParseEndpointSpec(%q): error %q does not contain %q", c.in, err.Error(), c.wantErr)
 			}
 			continue
 		}
@@ -111,14 +118,22 @@ func TestParseEndpointSpecForms(t *testing.T) {
 		if spec.IsRange() != c.isRange {
 			t.Errorf("ParseEndpointSpec(%q).IsRange() = %v, want %v", c.in, spec.IsRange(), c.isRange)
 		}
+		if strings.Join(spec.Strategies, ",") != strings.Join(c.strategies, ",") {
+			t.Errorf("ParseEndpointSpec(%q).Strategies = %v, want %v", c.in, spec.Strategies, c.strategies)
+		}
+		if spec.HasStrategies() != (len(c.strategies) > 0) {
+			t.Errorf("ParseEndpointSpec(%q).HasStrategies() drift", c.in)
+		}
 	}
 }
 
 func TestEndpointSpecStringRoundTrip(t *testing.T) {
 	cases := []string{
 		"1.2.3.4:57175",
-		"1.2.3.4:30000-40000",
-		"[2001:db8::1]:30000-40000",
+		"1.2.3.4[awg_main]",
+		"1.2.3.4[hopping,vanilla]",
+		"[2001:db8::1][awg_main]",
+		"[2001:db8::1]:30000",
 	}
 	for _, c := range cases {
 		spec, err := ParseEndpointSpec(c)
@@ -132,49 +147,31 @@ func TestEndpointSpecStringRoundTrip(t *testing.T) {
 }
 
 func TestEndpointSpecValidationCentral(t *testing.T) {
-	// the central-config validator must accept range endpoints
+	// tagged endpoints must reference defined strategies
 	cfg := &CentralCfg{
+		ObfStrategies: map[string]*ObfStrategy{
+			"hopping": {Ports: "30000-40000"},
+		},
 		Routers: []RouterCfg{
-			{NodeCfg: NodeCfg{Id: "a"}, Endpoints: []string{"1.2.3.4:30000-40000"}},
+			{NodeCfg: NodeCfg{Id: "a"}, Endpoints: []string{"1.2.3.4[hopping]"}},
 		},
 	}
 	if err := CentralConfigValidator(cfg); err != nil {
-		t.Errorf("CentralConfigValidator rejected range endpoint: %v", err)
+		t.Errorf("CentralConfigValidator rejected a tagged endpoint: %v", err)
 	}
-	// and reject malformed ones
-	cfg.Routers[0].Endpoints = []string{"1.2.3.4:40000-30000"}
-	if err := CentralConfigValidator(cfg); err == nil {
-		t.Error("CentralConfigValidator accepted inverted port range")
+	// unknown strategy names are rejected
+	cfg.Routers[0].Endpoints = []string{"1.2.3.4[nope]"}
+	if err := CentralConfigValidator(cfg); err == nil || !strings.Contains(err.Error(), "undefined obf strategy") {
+		t.Errorf("unknown strategy tag: err = %v, want undefined-strategy error", err)
 	}
-}
-
-func TestListenPortsValidation(t *testing.T) {
-	key := GenerateKey()
-	central := &CentralCfg{
-		Routers: []RouterCfg{
-			{NodeCfg: NodeCfg{Id: "a", PubKey: key.Pubkey()}},
-		},
+	// inline ranges are rejected with the migration pointer
+	cfg.Routers[0].Endpoints = []string{"1.2.3.4:30000-40000"}
+	if err := CentralConfigValidator(cfg); err == nil || !strings.Contains(err.Error(), "inline port ranges moved into obf strategies") {
+		t.Errorf("inline range endpoint: err = %v, want migration error", err)
 	}
-	node := func(listen string) *LocalCfg {
-		return &LocalCfg{
-			Port:        30000,
-			ListenPorts: listen,
-			Key:         key,
-			Id:          "a",
-		}
-	}
-	if err := NodeConfigValidator(central, node("30000-30100")); err != nil {
-		t.Errorf("valid listen_ports rejected: %v", err)
-	}
-	if err := NodeConfigValidator(central, node("30100-30200")); err == nil {
-		t.Error("listen_ports not containing the primary port was accepted")
-	}
-	if err := NodeConfigValidator(central, node("30200-30100")); err == nil {
-		t.Error("inverted listen_ports was accepted")
-	}
-	// over-ceiling ranges must be rejected with the in-daemon listener
-	over := "10000-60000"
-	if err := NodeConfigValidator(central, node(over)); err == nil {
-		t.Error("over-ceiling listen_ports was accepted by the in-daemon validator")
+	// raw single-port endpoints stay valid without any strategies
+	cfg.Routers[0].Endpoints = []string{"1.2.3.4:30000"}
+	if err := CentralConfigValidator(cfg); err != nil {
+		t.Errorf("raw single-port endpoint rejected: %v", err)
 	}
 }

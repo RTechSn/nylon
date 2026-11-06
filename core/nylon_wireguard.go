@@ -42,9 +42,12 @@ func resolveTunOptions(cfg *state.LocalCfg) tun.CreateOptions {
 // every parameter unset picks message type 0 (PickOne over a zero range),
 // which is NOT vanilla WireGuard — pinning H1..H4 to the WG message types
 // preserves byte-level vanilla behavior for existing meshes and the
-// version-skew window (design §2.4). I-packets are sender-local: only this
-// node's own ObfPeerParams apply.
-func obfDeviceIPC(obf *state.ObfProfile, local *state.ObfPeerParams) string {
+// version-skew window (design §2.4). The I-packet set is device-global — the
+// AWG 2.0 device prepends it to every handshake toward every peer — so the
+// strategies the node uses must agree on one i-set (state.
+// EffectiveStrategyIPackets); the winning set's provider names itself in the
+// journal.
+func obfDeviceIPC(obf *state.ObfProfile, iSet [5]string) string {
 	var b strings.Builder
 	if obf == nil {
 		b.WriteString("h1=1-1\nh2=2-2\nh3=3-3\nh4=4-4\n")
@@ -56,44 +59,135 @@ func obfDeviceIPC(obf *state.ObfProfile, local *state.ObfPeerParams) string {
 		fmt.Fprintf(&b, "h3=%d-%d\n", obf.H3.Min, obf.H3.Max)
 		fmt.Fprintf(&b, "h4=%d-%d\n", obf.H4.Min, obf.H4.Max)
 	}
-	if local != nil {
-		for i, spec := range [5]string{local.I1, local.I2, local.I3, local.I4, local.I5} {
-			if spec != "" {
-				fmt.Fprintf(&b, "i%d=%s\n", i+1, spec)
-			}
+	for i, spec := range iSet {
+		if spec != "" {
+			fmt.Fprintf(&b, "i%d=%s\n", i+1, spec)
 		}
 	}
 	return b.String()
 }
 
-func (n *Nylon) obfDeviceIPC() string {
-	return obfDeviceIPC(n.Obf, n.GetNode(n.LocalCfg.Id).Obf)
+// strategyIPacketSet resolves this node's effective junk-packet set from the
+// obf strategies it uses (own + peers' advertised endpoints): at most one
+// non-empty i-set may be in effect, since the device prepends it to every
+// handshake toward every peer.
+func (n *Nylon) strategyIPacketSet() ([5]string, []string, string, error) {
+	used := state.NodeUsedStrategies(&n.CentralCfg, n.LocalCfg.Id)
+	iSet, source, err := state.EffectiveStrategyIPackets(n.CentralCfg.ObfStrategies, used)
+	if err != nil {
+		return [5]string{}, nil, "", fmt.Errorf("obf strategies: %w", err)
+	}
+	return iSet, used, source, nil
+}
+
+// applyObfDeviceIPC (re-)applies the device-level AWG dialect and junk
+// packets, journalling the effective state whenever it changes (startup,
+// config update): the S/H/J profile, the strategy count and the i-set
+// provider.
+func (n *Nylon) applyObfDeviceIPC() error {
+	iSet, used, source, err := n.strategyIPacketSet()
+	if err != nil {
+		return err
+	}
+	sig := fmt.Sprintf("%p|%v|%s", n.AwgProfile, used, source)
+	if err := n.Device.IpcSet(obfDeviceIPC(n.AwgProfile, iSet)); err != nil {
+		return fmt.Errorf("failed to apply obf profile: %v", err)
+	}
+	if sig != n.obfAppliedSig {
+		n.obfAppliedSig = sig
+		n.Log.Info("obf strategies applied",
+			"strategies", len(n.CentralCfg.ObfStrategies),
+			"used", len(used),
+			"i-set", source)
+	}
+	return nil
 }
 
 // hopDeviceIPC renders the device-level port-hopping UAPI knob: the listen
-// range (server half). The client half (rotation budget) is applied per-peer
-// through the hop controller, not through device UAPI. In listen_mode:
-// nftables the range is served by the kernel redirect instead of per-port
-// sockets, so the device is deliberately left unaware of it.
-func (n *Nylon) hopDeviceIPC() string {
-	var b strings.Builder
-	if n.LocalCfg.ListenPorts != "" && !n.LocalCfg.UsesNftListenMode() {
-		if _, err := state.ParsePortRange(n.LocalCfg.ListenPorts); err == nil {
-			fmt.Fprintf(&b, "listen_ports=%s\n", n.LocalCfg.ListenPorts)
-		}
+// ranges (server half) derived from the obf strategies this node's own
+// advertised endpoints name (merged, disjoint — see state.ListenUnionRanges).
+// The client half (rotation budget) is applied per-peer through the hop
+// controller, not through device UAPI. In listen_mode: nftables the ranges
+// are served by the kernel redirect instead of per-port sockets, so the
+// device is deliberately left unaware of them.
+func (n *Nylon) hopDeviceIPC() (string, []state.PortRange, error) {
+	ranges, err := n.listenUnionRanges()
+	if err != nil {
+		return "", nil, err
 	}
-	return b.String()
+	var b strings.Builder
+	if len(ranges) > 0 && !n.LocalCfg.UsesNftListenMode() {
+		fmt.Fprintf(&b, "listen_ports=%s\n", state.RangesString(ranges))
+	}
+	return b.String(), ranges, nil
+}
+
+// listenUnionRanges derives this node's server-side listen union from the
+// obf strategies its own advertised endpoints name (untagged = all).
+func (n *Nylon) listenUnionRanges() ([]state.PortRange, error) {
+	if len(n.CentralCfg.ObfStrategies) == 0 {
+		return nil, nil
+	}
+	var mine *state.RouterCfg
+	if n.CentralCfg.IsRouter(n.LocalCfg.Id) {
+		r := n.CentralCfg.GetRouter(n.LocalCfg.Id)
+		mine = &r
+	}
+	return state.ListenUnionRanges(mine, n.CentralCfg.ObfStrategies)
 }
 
 // installNftRedirect installs the daemon-owned netfilter redirect serving the
 // listen range on the primary port and remembers it for shutdown removal.
 // Callers make a failure here fatal (see initWireGuard).
-func (n *Nylon) installNftRedirect(pr state.PortRange) error {
-	r := newNftRangeRedirect(n.Port, pr)
+func (n *Nylon) installNftRedirect(prs []state.PortRange) error {
+	r := newNftRangeRedirects(n.Port, prs)
 	if err := r.Install(); err != nil {
 		return err
 	}
 	n.nftRedirect = r
+	return nil
+}
+
+// applyListenIPC applies the strategy-derived listen union live when it
+// changed since the last apply (initWireGuard seeds the first one through
+// hopDeviceIPC): sockets mode re-renders the device UAPI knob, nftables mode
+// reinstalls the redirect table wholesale. Idempotent when nothing moved.
+func (n *Nylon) applyListenIPC() error {
+	if n.Device == nil {
+		return nil
+	}
+	ranges, err := n.listenUnionRanges()
+	if err != nil {
+		return err
+	}
+	sig := n.LocalCfg.EffectiveListenMode() + "|" + state.RangesString(ranges)
+	if sig == n.listenAppliedSig {
+		return nil
+	}
+	n.listenAppliedSig = sig
+	if n.LocalCfg.UsesNftListenMode() {
+		if len(ranges) == 0 {
+			// the union emptied (all strategy endpoints removed):
+			// drop the redirect so the table stops shadowing
+			if n.nftRedirect != nil {
+				if err := n.nftRedirect.Remove(); err != nil {
+					n.Log.Warn("failed to remove the nftables redirect for an empty listen union", "error", err)
+				}
+				n.nftRedirect = nil
+			}
+			return nil
+		}
+		if err := n.installNftRedirect(ranges); err != nil {
+			return fmt.Errorf("listen_mode: nftables failed to serve the strategy listen union %s: %v", state.RangesString(ranges), err)
+		}
+		return nil
+	}
+	if len(ranges) == 0 {
+		return nil // nothing to bind beyond the primary port
+	}
+	if err := n.Device.IpcSet(fmt.Sprintf("listen_ports=%s\n", state.RangesString(ranges))); err != nil {
+		return fmt.Errorf("failed to apply the listen union: %v", err)
+	}
 	return nil
 }
 
@@ -119,6 +213,11 @@ func (n *Nylon) initWireGuard() error {
 		return HandleNylonIPC(n, writer)
 	}
 
+	hopIPC, listenRanges, err := n.hopDeviceIPC()
+	if err != nil {
+		return err
+	}
+
 	// TODO: fully convert to code-based api
 	err = dev.IpcSet(
 		fmt.Sprintf(
@@ -127,48 +226,50 @@ listen_port=%d
 `,
 			hex.EncodeToString(n.Key[:]),
 			n.Port,
-		) + n.obfDeviceIPC() + n.hopDeviceIPC(),
+		) + hopIPC,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to configure wg device: %v", err)
 	}
+	if err := n.applyObfDeviceIPC(); err != nil {
+		return err
+	}
 
-	// Surface the range-listener state at the default log level. A hopping
-	// server that silently lost its range (a binary built before this feature,
-	// an overwritten node.yaml) is otherwise indistinguishable from a healthy
-	// single-port node: the daemon starts fine and the client just rotates
-	// through dead ports forever.
-	if n.LocalCfg.ListenPorts != "" {
-		if pr, perr := state.ParsePortRange(n.LocalCfg.ListenPorts); perr == nil {
-			if n.LocalCfg.UsesNftListenMode() {
-				// daemon-managed netfilter redirect: single socket, the kernel
-				// rewrites the range onto the primary port. A failure here is
-				// fatal by design — same contract as the socket range listener,
-				// the daemon refuses to run with a half-served range.
-				if err := n.installNftRedirect(pr); err != nil {
-					return fmt.Errorf("listen_mode: nftables failed to serve listen_ports %s: %v", pr, err)
-				}
-				n.Log.Info("port hopping nftables redirect active",
-					"listen_ports", pr.String(),
-					"ports", pr.Size(),
-					"primary_port", n.Port,
-					"table", "inet "+NftTableName,
-				)
-			} else {
-				n.Log.Info("port hopping range listener active",
-					"listen_ports", pr.String(),
-					"ports", pr.Size(),
-					"primary_port", n.Port,
-				)
+	// Surface the strategy-derived listen union at the default log level.
+	// A hopping server that silently lost its ranges (a binary built
+	// before this feature, an overwritten central config) is otherwise
+	// indistinguishable from a healthy single-port node: the daemon
+	// starts fine and the client just rotates through dead ports forever.
+	if len(listenRanges) > 0 {
+		ports := 0
+		for _, pr := range listenRanges {
+			ports += pr.Size()
+		}
+		if n.LocalCfg.UsesNftListenMode() {
+			// daemon-managed netfilter redirect: single socket, the kernel
+			// rewrites the union onto the primary port. A failure here is
+			// fatal by design — same contract as the socket range listener,
+			// the daemon refuses to run with a half-served union.
+			if err := n.installNftRedirect(listenRanges); err != nil {
+				return fmt.Errorf("listen_mode: nftables failed to serve the strategy listen union %s: %v", state.RangesString(listenRanges), err)
 			}
+			n.Log.Info("obf strategy listen union served by nftables redirect",
+				"listen_ports", state.RangesString(listenRanges),
+				"ports", ports,
+				"primary_port", n.Port,
+				"table", "inet "+NftTableName,
+			)
 		} else {
-			// unreachable via Bootstrap (the config validator rejects a
-			// malformed range), kept as a tripwire for embedders
-			n.Log.Warn("listen_ports is configured but unparseable; the range listener is NOT active", "listen_ports", n.LocalCfg.ListenPorts, "err", perr)
+			n.Log.Info("obf strategy range listener active",
+				"listen_ports", state.RangesString(listenRanges),
+				"ports", ports,
+				"primary_port", n.Port,
+			)
 		}
 	}
 
 	// add peers
+	n.listenAppliedSig = n.LocalCfg.EffectiveListenMode() + "|" + state.RangesString(listenRanges)
 	err = n.SyncWireGuard()
 	if err != nil {
 		return err
@@ -267,10 +368,16 @@ func (n *Nylon) SyncWireGuard() error {
 	}
 
 	// (re-)apply the AWG 2.0 obfuscation knobs; a config reload may switch the
-	// S/H profile live. In-flight handshakes can fail for one rekey window —
-	// maintenance-action semantics (design §2.4).
-	if err := n.Device.IpcSet(n.obfDeviceIPC()); err != nil {
-		return fmt.Errorf("failed to apply obf profile: %v", err)
+	// S/H profile or the effective i-set live. In-flight handshakes can fail
+	// for one rekey window — maintenance-action semantics (design §2.4).
+	if err := n.applyObfDeviceIPC(); err != nil {
+		return err
+	}
+	// a config reload may also move the strategy-derived listen union
+	// (endpoints/strategies are central-side): apply it live when it
+	// changed, the same maintenance-action semantics as the dialect.
+	if err := n.applyListenIPC(); err != nil {
+		return err
 	}
 	desired := make(map[state.NodeId]state.NyPublicKey)
 	for _, peer := range n.GetPeers(n.Id) {

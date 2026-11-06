@@ -100,7 +100,7 @@ Under the hood, nylon implements the machinery of the [Babel routing protocol (R
 
 - **Multi-hop Routing**: Traffic flows through the lowest-latency path across your mesh. Unlike Tailscale, Nebula, or ZeroTier, nodes don't need to be directly reachable from each other. Nylon forwards through intermediate hops automatically.
 - **No Coordination Server**: No SaaS dependency, no single control-plane. Nodes exchange routes directly over the same WireGuard tunnel that carries your data.
-- **Single Daemon Binary, Single Port**: One statically-linked daemon binary, one UDP port (set `port` in node.yaml — there is no code default; `57175` is the convention and the fallback for endpoints without a port), one YAML config per node (node.yaml), plus the shared central.yaml, which the daemon can bootstrap from node.yaml's `dist` block on first start. That's all a node runs. Optional companion tools: `nylon-genesis` as a raw binary in the same release (generates the mesh-wide `obf` profile and per-node I1-I5 obfuscation parameters) and `nylon-lb` as a container image only (anycast LoadBalancer VIPs).
+- **Single Daemon Binary, Single Port**: One statically-linked daemon binary, one UDP port (set `port` in node.yaml — there is no code default; `57175` is the convention and the fallback for endpoints without a port), one YAML config per node (node.yaml), plus the shared central.yaml, which the daemon can bootstrap from node.yaml's `dist` block on first start. That's all a node runs. Optional companion tools: `nylon-genesis` as a raw binary in the same release (generates the mesh-wide AWG dialect and obf strategy parameters) and `nylon-lb` as a container image only (anycast LoadBalancer VIPs).
 - **WireGuard Client Compatibility**: On meshes running the vanilla compatibility profile, stock WireGuard clients (iOS, Android, Windows) join with zero extra software, and mobile clients roam between gateways seamlessly. Obfuscated (AmneziaWG) profiles change the handshake format, so stock clients cannot connect to obfuscated nodes — see [Traffic Obfuscation](/guides/obfuscation).
 - **Native WireGuard Speeds**: Data-plane runs entirely in `wireguard-go` (polyamide), so forwarded traffic stays on the WireGuard data path with no extra proxy hop.
 
@@ -246,7 +246,7 @@ url: /guides/wg-clients
 One of nylon's key features is compatibility with standard WireGuard clients (iOS, Android, Windows, etc.). These are called **Passive Nodes/Clients**.
 
 :::caution
-Stock WireGuard clients interoperate with a nylon mesh **only** when it uses a vanilla-compatible obfuscation profile (the default). Without an `obf` section in `central.yaml`, nylon pins the handshake headers to `h1=1-1` through `h4=4-4` — the vanilla WireGuard message types — so the mesh speaks byte-compatible vanilla WireGuard. The same byte-compatibility can be pinned explicitly with `nylon-genesis --compat`. If your mesh enables a profile that deviates from these vanilla-pinned values, stock WireGuard clients cannot complete handshakes with nylon peers. See [Obfuscation](/guides/obfuscation) for how profiles work.
+Stock WireGuard clients interoperate with a nylon mesh **only** when it uses a vanilla-compatible obfuscation profile (the default). Without an `awg_profile` section in `central.yaml`, nylon pins the handshake headers to `h1=1-1` through `h4=4-4` — the vanilla WireGuard message types — so the mesh speaks byte-compatible vanilla WireGuard. The same byte-compatibility can be pinned explicitly with `nylon-genesis --compat`. If your mesh enables a dialect that deviates from these vanilla-pinned values, stock WireGuard clients cannot complete handshakes with nylon peers. See [Obfuscation](/guides/obfuscation) for how profiles work.
 :::
 
 ## How it Works
@@ -782,7 +782,6 @@ The load balancer uses the same log controls (`--log-level`, `NYLON_LOG_LEVEL`, 
 url: /guides/obfuscation
 ---
 # Traffic Obfuscation
-
 Vanilla WireGuard is easy to recognize on the wire. Every handshake packet starts with a fixed 4-byte message type (1 through 4) and has fixed sizes, so deep packet inspection (DPI) can identify and block WireGuard connections even though their content is encrypted. Nylon's obfuscation layer — wire-compatible with the AmneziaWG 2.0 format — lets you reshape that traffic so the mesh no longer looks like WireGuard.
 
 Obfuscation changes the shape of handshake packets:
@@ -800,13 +799,13 @@ Obfuscation is configured at two levels in `central.yaml` (see [Configuration Re
 
 | Level | Fields | Scope |
 | --- | --- | --- |
-| Central `obf` profile | `jc`, `jmin`, `jmax`, `s1`–`s4`, `h1`–`h4` | One shared profile for the whole mesh |
-| Per-node `obf` (`routers[].obf`, `clients[].obf`) | `protocol`, `i1`–`i5` | Sender-local, may differ per node |
+| Central `awg_profile` | `jc`, `jmin`, `jmax`, `s1`–`s4`, `h1`–`h4` | One shared dialect for the whole mesh |
+| Named obf strategies (top-level `obf:` map) | `ports`, `protocol`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; endpoints select by name |
 
-A minimal central profile with a per-node QUIC-style template:
+A minimal dialect with a QUIC-template strategy:
 
-```yaml
-obf:
+```yaml title="central.yaml"
+awg_profile:
   jc: 5
   jmin: 250
   jmax: 800
@@ -826,10 +825,10 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
-routers:
-- id: node1
-  obf:
+obf:
+  quic:
     protocol: quic
+    ports: "51820"
     i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
     i2: <b 0xc0ff><b 0x00000001><b 0x08><d><b 0x00><b 0x00><b 0x0020><b 0x01><t><r 20>
     i3: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0010><b 0x01><t><r 10>
@@ -843,19 +842,21 @@ The `s1`–`s4` and `h1`–`h4` values are a wire contract between every pair of
 - A **sender** picks each outgoing message's type word from its own `h` ranges and pads the message by its own `s` values.
 - A **receiver** classifies incoming packets using **its own** `s`/`h` values.
 
-If two nodes carry different `s`/`h` values, the receiver fails to classify the sender's packets and drops them silently. The junk-packet knobs `jc`, `jmin`, `jmax` are not part of that wire contract — junk datagrams are sender-local camouflage that receivers discard unclassified — but they cannot diverge either: they exist only in the single central `obf` profile, which is distributed identically to every node. [nylon-genesis](/guides/genesis) enforces this by construction.
+If two nodes carry different `s`/`h` values, the receiver fails to classify the sender's packets and drops them silently. The junk-packet knobs `jc`, `jmin`, `jmax` are not part of that wire contract — junk datagrams are sender-local camouflage that receivers discard unclassified — but they cannot diverge either: they exist only in the single central `awg_profile`, which is distributed identically to every node. [nylon-genesis](/guides/genesis) enforces this by construction.
 
-### I-Patterns Are Sender-Local
+### I-Patterns Ride the Strategy
 
-The `i1`–`i5` patterns (and the informational `protocol` label) describe only what **this node sends**. You never configure another node's I values anywhere, and receivers do not validate your patterns against their own. This is why two nodes can use different I-patterns — for example, different templates per site — while staying fully interoperable, as long as their central `s`/`h` profiles match.
+The `i1`–`i5` patterns (and the informational `protocol` label) describe only what the nodes using the strategy **send**. Receivers do not validate your patterns against their own, so two nodes may draw from strategies with different I-patterns — for example, different templates per site — while staying fully interoperable, as long as the central `s`/`h` dialect matches.
+
+One wire reality remains: the AWG 2.0 device emits its I-packets on **every handshake toward every peer**, from one device-global set. The strategies a single node draws from (its own and its peers' advertised endpoints) must therefore agree on one non-empty `i1`–`i5` set — the config validator rejects conflicting sets by name. A node whose strategies define no `i`-params simply sends no junk.
 
 ## The Default Profile Is Vanilla-Compatible
 
-If you omit the `obf` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
+If you omit the `awg_profile` section entirely, nylon does **not** disable the obfuscation machinery. It pins the header ranges to the exact vanilla WireGuard message types — `h1=1-1` through `h4=4-4` — with zero padding, no junk packets, and no I-patterns. The mesh speaks byte-compatible vanilla WireGuard.
 
-:::caution
-This is deliberately **not** the AmneziaWG "all zeros" default, which would produce a type word of 0 and break interoperability with vanilla WireGuard. The converse also holds: any profile that deviates from these vanilla-pinned values breaks stock-client handshakes. To pin the vanilla-compatible values explicitly — for example across a version-skew window during a rollout — [nylon-genesis](/guides/genesis) `--compat` emits a profile with exactly these ranges (and zero padding, no junk packets, no I-patterns). The vanilla-compatible profile is the **only** mode in which a stock WireGuard client (iOS, Android, Windows, …) can complete a handshake with a nylon peer. See [WireGuard Clients](/guides/wg-clients).
-:::
+::::caution
+This is deliberately **not** the AmneziaWG "all zeros" default, which would produce a type word of 0 and break interoperability with vanilla WireGuard. The converse also holds: any dialect that deviates from these vanilla-pinned values breaks stock-client handshakes. To pin the vanilla-compatible values explicitly — for example across a version-skew window during a rollout — [nylon-genesis](/guides/genesis) `--compat` emits a dialect with exactly these ranges (and zero padding, no junk packets, no I-patterns). The vanilla-compatible dialect is the **only** mode in which a stock WireGuard client (iOS, Android, Windows, …) can complete a handshake with a nylon peer. See [WireGuard Clients](/guides/wg-clients).
+::::
 
 In practice:
 
@@ -881,15 +882,15 @@ In nylon, chains are rendered only for I-packet camouflage, and there the data s
 
 Each pattern renders one pre-handshake camouflage datagram: `i1`–`i5` are sent in order ahead of every handshake initiation, followed by the `jc` junk datagrams and only then the real initiation message — none of them replaces or shapes an actual handshake message. Reading the `i1` example above: it opens with fixed bytes that imitate the target protocol's header, injects random bytes, carries a timestamp, and ends with trailing random bytes — so each camouflage datagram has the length and layout of the chosen template rather than of WireGuard.
 
-:::note
+::::note
 No I-pattern content is verified when a packet is received: the live receive path classifies packets purely by size and by the `h` ranges of the mesh-uniform central profile, matching upstream AmneziaWG 2.0 behavior. The patterns shape what a node sends; the cryptography — not the pattern — provides authenticity.
-:::
+::::
 
 ### Validation Limits
 
 Nylon rejects invalid profiles at apply time rather than producing a broken mesh:
 
-- Header ranges (`h1`–`h4`) must not overlap each other; an overlapping set fails at apply with the error `headers must not overlap`.
+- Header ranges (`h1`–`h4`) must not overlap each other; an overlapping set fails with an `overlap` error.
 - Genesis-generated header ranges must stay clear of the vanilla WireGuard type ids 1–4. This clearance is enforced at generation time by [nylon-genesis](/guides/genesis); a hand-written `central.yaml` overlapping 1–4 is not rejected at apply.
 - AmneziaWG 3.x-only parameters (`header_protection_key`, `content_padding_addition`, `random_trailers`, `disable_cookies`, `rekey_after_time`, `rekey_timeout`, `reject_after_time`, `keepalive_timeout`, and `max_handshake_attempts`) are rejected only at the device UAPI boundary, where the parser fails them with `UAPI knob %q is AWG 3.x-only and unsupported by this AWG 2.0 build`. They are not `central.yaml` fields — the config decoder silently ignores unknown YAML keys, so a hand-written 3.x parameter under `obf:` is ignored, not rejected. No non-2.0 wire format can be activated.
 
@@ -914,12 +915,12 @@ go test -tags awg_ref_interop ./interop/awgref/
 ```
 
 See [Development](/guides/development) for the harness tags and how to run the interop suite.
+
 ---
 url: /guides/genesis
 ---
 # Config Genesis
-
-`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared profile, generates per-node handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: a top-level `obf:` block plus `routers:` entries that carry only `id` and `obf`.
+`nylon-genesis` is the internal companion tool that generates obfuscation parameters for a nylon mesh. It asks the [amnezigo](/guides/development) parameter oracle for a validated shared dialect, generates the handshake camouflage, and writes the result as a paste-ready YAML fragment for your `central.yaml`: a top-level `awg_profile:` block plus ONE named entry of the top-level `obf:` strategy map.
 
 The tool generates obfuscation parameters only. WireGuard keys are a separate concern handled by `nylon key` — see [Getting started](/guides/getting-started).
 
@@ -927,15 +928,15 @@ The tool generates obfuscation parameters only. WireGuard keys are a separate co
 
 Every run emits one fragment with two parts:
 
-- A mesh-wide shared profile under `obf:` — the junk (`jc`, `jmin`, `jmax`), padding sizes (`s1`–`s4`), and message-type header ranges (`h1`–`h4`) that every node in the mesh must share.
-- One `routers:` entry per node you list, each carrying only that node's `id` and its sender-local `obf` block with `i1`–`i5` CPS strings.
+- A mesh-wide shared dialect under `awg_profile:` — the junk (`jc`, `jmin`, `jmax`), padding sizes (`s1`–`s4`), and message-type header ranges (`h1`–`h4`) that every node in the mesh must share.
+- One named obf **strategy** under `obf:` carrying the sender-local `i1`–`i5` CPS strings, the informational `protocol` label, and the strategy's `ports` (adjust them to your deployment; the default is a single port).
 
-The fragment unmarshals cleanly into the central config structure, but it does not merge itself — you paste it into `central.yaml` by hand (see [Generate a profile](#generate-a-profile)). The shared profile is mesh-uniform by construction: one oracle call fixes S/H/J for the whole mesh, and every node receives every peer's `i1`–`i5` spec through the central config while sending only with its own.
+The fragment unmarshals cleanly into the central config structure, but it does not merge itself — you paste it into `central.yaml` by hand (see [Generate a profile](#generate-a-profile)). The dialect is mesh-uniform by construction: one oracle call fixes S/H/J for the whole mesh. The strategy's `i1`–`i5` ride on every handshake the nodes that use the strategy send (the AWG 2.0 device emits one junk set toward every peer — see [Obfuscation](/guides/obfuscation) for the wire reality).
 
-The following output is the real committed fixture from this repository, generated with the command shown in Step 5. Each additional id you pass to `--peers` appends another entry with the same shape:
+The following output shape is what the command shown in [Step 5](#step-5-run-the-tool) produces:
 
-```yaml
-obf:
+```yaml title="nylon-genesis output fragment"
+awg_profile:
   jc: 5
   jmin: 250
   jmax: 800
@@ -955,17 +956,19 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
-routers:
-- id: node1
-  obf:
+obf:
+  quic:
     protocol: quic
+    ports: "51820"
     i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
     i2: <b 0xc0ff><b 0x00000001><b 0x08><d><b 0x00><b 0x00><b 0x0020><b 0x01><t><r 20>
     i3: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0010><b 0x01><t><r 10>
     i4: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0005><b 0x01><t><r 5>
 ```
 
-For the meaning of each field, see [Obfuscation](/guides/obfuscation).
+The strategy is named after the protocol template by default (`--strategy` overrides the name), and the name is what endpoints reference: `hub.example.com[quic]`.
+
+For the meaning of each field, see [Obfuscation](/guides/obfuscation) and the [Obf strategies reference](/reference/config#obf-strategies).
 
 ## Build the tool first
 
@@ -979,91 +982,93 @@ make build
 
 ## Generate a profile
 
-1. **Choose the shared profile source**
+### Step 1. Choose the shared dialect source
 
-   Decide where the mesh-wide S/H/J parameters come from:
+Decide where the mesh-wide S/H/J parameters come from:
 
-   - **Preset** (default): a named amnezigo preset, `standard-1420` by default. The preset supplies the junk and padding profile and the default MTU.
-   - **Random**: pass `--random` to have the oracle generate a random profile instead. The preset still provides the default MTU and contributes `s1` and `jc`; `s2`–`s4`, `h1`–`h4`, and the `jmin`/`jmax` junk range are drawn fresh. A draw can collide a peer's `i1`–`i5` packet length with one of the profile's padded handshake sizes, which the AWG 2.0 size invariant forbids; the generator redraws a whole random profile when that is what is random, and always redraws a peer's `i`-set, until it validates (64 attempts, then an error) — with the default `--protocol random` that combination failed about half the time before the redraw.
+- **Preset** (default): a named amnezigo preset, `standard-1420` by default. The preset supplies the junk and padding profile and the default MTU.
+- **Random**: pass `--random` to have the oracle generate a random dialect instead. The preset still provides the default MTU and contributes `s1` and `jc`; `s2`–`s4`, `h1`–`h4`, and the `jmin`/`jmax` junk range are drawn fresh. A draw can collide the strategy's `i1`–`i5` packet length with one of the profile's padded handshake sizes, which the AWG 2.0 size invariant forbids; the generator redraws the whole random profile, or just the strategy's `i`-set, until it validates (64 attempts, then an error).
 
-2. **Choose a protocol template**
+### Step 2. Choose a protocol template
 
-   `--protocol` selects the camouflage template for the per-node handshake packets: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random` (the default). Named protocols use that protocol's template shape and fill `i1`–`i4`; `i5` is intentionally left empty. `random` does not pick a template — it generates randomized simple CPS patterns across all of `i1`–`i5`, including `i5`.
+`--protocol` selects the camouflage template for the strategy's handshake packets: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random` (the default). Named protocols use that protocol's template shape and fill `i1`–`i4`; `i5` is intentionally left empty. `random` does not pick a template — it generates randomized simple CPS patterns across all of `i1`–`i5`, including `i5`.
 
-3. **Choose an MTU clamp (optional)**
+### Step 3. Choose an MTU clamp (optional)
 
-   `--mtu` bounds only the generated per-node I-packet sizes to your underlay MTU (the oracle caps each I-packet at `mtu - 49 - 149 - s1`). Junk sizes are not clamped — they come from the preset, or from a fresh 64–1024 byte draw under `--random` — so a small `--mtu` can still emit junk datagrams large enough to fragment. Leave it at the default `0` to use the preset's default MTU — `standard-1420` targets a 1420-byte underlay, and the fixture output above was generated with `--mtu 1420`.
+`--mtu` bounds only the generated I-packet sizes to your underlay MTU (the oracle caps each I-packet at `mtu - 49 - 149 - s1`). Junk sizes are not clamped — they come from the preset, or from a fresh 64–1024 byte draw under `--random` — so a small `--mtu` can still emit junk datagrams large enough to fragment. Leave it at the default `0` to use the preset's default MTU — `standard-1420` targets a 1420-byte underlay, and the example above was generated with `--mtu 1420`.
 
-4. **List your nodes**
+### Step 4. Name the strategy and set its ports
 
-   `--peers` takes a comma-separated list of node ids. Use the same ids your routers carry in `central.yaml`, because you will merge each generated block into the matching router entry.
+`--strategy` names the generated obf strategy (default: the protocol template name) — this is the name your endpoints will reference. `--strategy-ports` sets its `ports` (default `51820`; a single port or an inclusive range like `40000-50000`). Adjust the ports to your deployment: they control where a node serving the strategy listens and which ports a node connecting through it targets.
 
-5. **Run the tool**
+### Step 5. Run the tool
 
-   ```bash
-   bin/nylon-genesis --preset standard-1420 --protocol quic --mtu 1420 --peers node1,node2
-   ```
+```bash
+bin/nylon-genesis --preset standard-1420 --protocol quic --mtu 1420
+```
 
-   The fragment goes to stdout. Pass `--out obf-fragment.yaml` to write it to a file instead (mode `0644`), and `-v`/`--verbose` for debug logging on stderr:
+The fragment goes to stdout. Pass `--out obf-fragment.yaml` to write it to a file instead (mode `0644`), and `-v`/`--verbose` for debug logging on stderr:
 
-   ```bash
-   bin/nylon-genesis --protocol quic --peers node1,node2 --out obf-fragment.yaml -v
-   ```
+```bash
+bin/nylon-genesis --protocol quic --strategy awg_main --strategy-ports 40000-50000 --out obf-fragment.yaml -v
+```
 
-6. **Merge the fragment into central.yaml**
+### Step 6. Merge the fragment into central.yaml
 
-   Paste the `obf:` block at the top level of `central.yaml`, then merge each `routers:` entry into your existing `routers:` list:
+Paste the `awg_profile:` block and the `obf:` entry at the top level of `central.yaml` (merge into your existing `obf:` map if you already have strategies), then tag the endpoints that should use the strategy:
 
-   ```yaml
-   # Top level: paste the generated obf block verbatim.
-   obf:
-     jc: 5
-     # ... rest of the generated obf block ...
+```yaml title="central.yaml (excerpt after merging)"
+# Top level: paste the generated blocks verbatim.
+awg_profile:
+  jc: 5
+  # ... rest of the generated dialect ...
+obf:
+  quic:
+    ports: "40000" # adjusted to your deployment
+    # ... protocol + i1..i4 from the generated fragment ...
 
-   routers:
-     - id: node1
-       # Keep every existing key of this router and add obf alongside them.
-       obf:
-         protocol: quic
-         i1: <b 0xc0ff><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x0040><b 0x00><b 0x01><t><r 40>
-         # ... i2, i3, i4 from the generated fragment ...
-   ```
+routers:
+  - id: hub
+    endpoints:
+      - "hub.example.com[quic]" # the strategy tag names the ports
+```
 
-   The full field semantics — what S/H/J do on receive, why S/H must match mesh-wide, and how sender-local `i1`–`i5` are used — are covered in [Obfuscation](/guides/obfuscation), and the complete field reference lives in [Configuration reference](/reference/config).
+The full field semantics — what S/H/J do on receive, why they must match mesh-wide, and the one-i-set-per-device wire reality — are covered in [Obfuscation](/guides/obfuscation), and the complete field reference lives in [Configuration reference](/reference/config).
 
-   :::caution
-   The fragment does not merge itself. Each `routers:` entry contains only `id` and `obf`, so never paste the fragment's `routers:` list over your existing one — merge each `obf` block into the matching node's entry and keep that node's other keys intact.
-   :::
+::::caution
+The fragment does not merge itself. If your `central.yaml` already defines strategies, merge the generated entry into the existing `obf:` map instead of pasting over it, and remember that the strategies a node uses must share one `i1`–`i5` set.
+::::
 
-7. **Distribute and reload**
+### Step 7. Distribute and reload
 
-   Ship the updated `central.yaml` to your mesh the same way you distribute any config change — via [config distribution](/guides/config-distribution) or a direct reload. Nodes pick up the new profile on their next config sync.
+Ship the updated `central.yaml` to your mesh the same way you distribute any config change — via [config distribution](/guides/config-distribution) or a direct reload. Nodes pick up the new dialect on their next config sync.
 
-   :::caution
-   Treat an obfuscation profile rollout as a maintenance action. The new parameters apply live when each node syncs, but in-flight handshakes can fail for one rekey window during the transition.
-   :::
+::::caution
+Treat an obfuscation profile rollout as a maintenance action. The new parameters apply live when each node syncs, but in-flight handshakes can fail for one rekey window during the transition.
+::::
 
 ## Flag reference
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--preset` | `standard-1420` | amnezigo preset name for the shared profile. |
-| `--random` | `false` | Generate a random shared profile via amnezigo's `GenerateConfig` instead of the preset; the draw is redrawn until it satisfies the size-classification invariant (64 attempts, then an error). |
-| `--protocol` | `random` | Per-peer I1–I5 template: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`. |
+| `--preset` | `standard-1420` | amnezigo preset name for the shared dialect. |
+| `--random` | `false` | Generate a random shared dialect via amnezigo's `GenerateConfig` instead of the preset; the draw is redrawn until it satisfies the size-classification invariant (64 attempts, then an error). |
+| `--protocol` | `random` | I1–I5 template: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`. |
 | `--mtu` | `0` | Underlay MTU clamp for I-packet sizes only; `0` uses the preset default. |
-| `--peers` | empty | Comma-separated node ids to generate per-node I1–I5 for. |
-| `--compat` | `false` | Emit the fixed vanilla-compat profile; the output does not depend on `--preset` or `--protocol`, but they are still validated. |
+| `--strategy` | protocol name | Name of the generated obf strategy (the name endpoints reference). |
+| `--strategy-ports` | `51820` | The strategy's `ports`: a single port or an inclusive range. |
+| `--compat` | `false` | Emit the fixed vanilla-compat dialect; the output does not depend on `--preset` or `--protocol`, but they are still validated. |
 | `--out` | stdout | Write to `FILE` instead of stdout (file mode `0644`). |
 | `-v`, `--verbose` | `false` | Log debug detail to stderr. |
 
-Print the stamped build version with the `--version` flag: `nylon-genesis --version` outputs `nylon-genesis version dev` (`dev` for local builds without version ldflags). There is no `version` subcommand — an unknown positional word is not an error, so `nylon-genesis version` silently generates a full obfuscation profile on stdout.
+Print the stamped build version with the `--version` flag: `nylon-genesis --version` outputs `nylon-genesis version dev` (`dev` for local builds without version ldflags). There is no `version` subcommand — an unknown positional word is not an error, so `nylon-genesis version` silently generates a full obfuscation fragment on stdout.
 
 ## Vanilla compatibility (--compat)
 
-Pass `--compat` to generate the vanilla-compat profile instead of an obfuscated one. It pins `h1`–`h4` to the exact vanilla WireGuard message types and leaves everything else at zero — no junk, no padding, and no per-node `obf` blocks. This is the profile that keeps stock WireGuard clients working against your mesh during a version-skew window:
+Pass `--compat` to generate the vanilla-compat dialect instead of an obfuscated one. It pins `h1`–`h4` to the exact vanilla WireGuard message types and leaves everything else at zero — no junk, no padding, and no `i`-params on the strategy. This is the dialect that keeps stock WireGuard clients working against your mesh during a version-skew window:
 
-```yaml
-obf:
+```yaml title="nylon-genesis --compat output"
+awg_profile:
   h1:
     min: 1
     max: 1
@@ -1076,9 +1081,9 @@ obf:
   h4:
     min: 4
     max: 4
-routers:
-- id: node1
-- id: node2
+obf:
+  compat:
+    ports: "51820"
 ```
 
 Two things to know about this mode:
@@ -1086,24 +1091,25 @@ Two things to know about this mode:
 - The compat output does not depend on `--preset` or `--protocol`, but they are still validated: an unknown value fails before any output is produced.
 - It deliberately skips the header-range viability checks that normal generation runs, because pinning headers to 1–4 is exactly what those checks reject: obfuscated ranges must stay clear of the vanilla message types.
 
-If your whole mesh speaks vanilla WireGuard anyway, you can also omit the `obf` key from `central.yaml` altogether — a mesh with no profile pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the profile semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
+If your whole mesh speaks vanilla WireGuard anyway, you can also omit `awg_profile` from `central.yaml` altogether — a mesh with no dialect pins the same 1–4 header types. See [Obfuscation](/guides/obfuscation) for the dialect semantics, and [WireGuard clients](/guides/wg-clients) for attaching stock clients to a mesh.
 
 ## Validation and failure behavior
 
 Before writing anything, the tool validates its own output:
 
-1. Structural checks on the profile: `jmin` must not exceed `jmax`, and every `h1`–`h4` range must have `min` no greater than `max`.
+1. Structural checks on the dialect: `jmin` must not exceed `jmax`, and every `h1`–`h4` range must have `min` no greater than `max`.
 2. Per-header range viability via the amnezigo validator.
 3. The packet-size classification invariant for the S-padded handshake sizes and the junk range.
-4. A re-check of the freshly generated per-peer `i1`–`i5` lengths.
+4. A re-check of the freshly generated strategy `i1`–`i5` lengths.
 
-An unknown `--protocol` or `--preset` name fails before any output is produced, so a failed run never leaves a half-written `--out` file behind.
+An unknown `--protocol`, `--preset` or `--strategy` name, or an invalid `--strategy-ports`, fails before any output is produced, so a failed run never leaves a half-written `--out` file behind.
 
 ## Provenance and licensing
 
 `nylon-genesis` links the GPL-3.0 [`amnezigo`](https://github.com/Arsolitt/amnezigo) parameter oracle, so a `nylon-genesis` binary is a GPL-3.0 combined work: if you distribute it, you must pass on the GPL-3.0 terms and the corresponding source — this repository plus amnezigo, both of which are public. The repository's own source files keep their source licenses (Apache-2.0 at the root, MIT for `polyamide/`), and the nylon daemon links only MIT-licensed device code and Apache-2.0 nylon code — it carries no copyleft obligations.
 
 For build requirements, see [Building and testing](/guides/development).
+
 ---
 url: /guides/nylon-lb
 ---
@@ -1466,12 +1472,11 @@ The recorder is the gate: a green run proves the reroute happened and leaves the
 url: /reference/config
 ---
 # Configuration Reference
-
 ## node.yaml
 
 Each node has its own `node.yaml` with local settings. Generate a keypair with `nylon key`. Stdout is the private key, stderr is the public key.
 
-```yaml
+```yaml title="node.yaml"
 key: 0NcrMcaS1tORCTA88L5ZPE+H6yUMV4e5vRp6iypnPW8= # private key (from `nylon key`)
 id: alice # must match this node's id in central.yaml
 port: 57175 # UDP port nylon listens on
@@ -1491,10 +1496,41 @@ tun_txqueuelen: 10000 # kernel tx queue length per TUN queue (default: 10000; 0 
 tun_backpressure: false # request IFF_BACKPRESSURE (default: false; requires kernel >= 6.15)
 dynamic_prefixes_dir: "" # directory watched for dynamic prefix JSON files, e.g. /etc/nylon/prefixes.d (empty = disabled)
 
+# Obf strategy listen mode: how the listen ranges DERIVED from the obf
+# strategies your own advertised endpoints name (central.yaml) are served:
+# "sockets" (default) binds one extra UDP socket per port, limited to 4096
+# ports total; "nftables" keeps the single primary-port socket and installs a
+# daemon-managed netfilter redirect per range (Linux, CAP_NET_ADMIN; no
+# width ceiling). Ports themselves live on the strategies (central.yaml `obf:`)
+# — the retired node-level listen_ports moved there.
+listen_mode: "" # "sockets" | "nftables"; empty = sockets
+
+# In-tunnel QoS: classify inner packets by protocol/port and keep small
+# flows alive under bulk load. Matched flows ride ahead of bulk within
+# in-device batches AND their outer (encrypted) datagrams are stamped with
+# the rule's DSCP so a DSCP-aware WAN bottleneck can carry them past the
+# bulk queue. medium/high/max map to in-device levels + default outer DSCP
+# AF41/EF/CS7; dscp (0-63, optional) overrides the outer codepoint. The port
+# matches either side of the flow (dport of requests, sport of replies);
+# tcp/udp rules require a port, icmp rules match all ICMP/ICMPv6 and must
+# not set one. Overlapping rules match in order (first wins), exact
+# duplicates are config errors, at most 64 rules. The central config's lists
+# win wholesale over these — first the router's own central entry, then the
+# central top-level (mesh-wide) list. See guides/qos-priority.
+priority_rules:
+  - protocol: udp
+    port: 5405 # or "5000-5100" for an inclusive range
+    priority: high
+  - protocol: tcp
+    port: 22
+    priority: high
+    dscp: 46 # optional override of high's default EF
+
 # Bootstrap: fetch central.yaml from a remote bundle on first start
 dist:
   url: https://static.example.com/network1.nybundle
   key: 7PaN6DmAayz4KnDnsXSXJH+Oy0TFGeoM4FEbQfLriVY= # distribution public key
+  interval: 1h # optional: fallback polling cadence (used while central.yaml's dist sets no interval)
 
 # Split tunneling (per-node overrides)
 exclude_ips: # add to the central exclude list
@@ -1519,16 +1555,29 @@ When you set `dynamic_prefixes_dir`, the nylon daemon watches that directory and
 
 The central config defines the entire network topology. It is shared across all nodes (either copied manually or via config distribution).
 
-```yaml
+```yaml title="central.yaml"
 # --- Config Distribution (optional) ---
 dist:
   # The distribution key is used to verify and decrypt sealed bundles.
   # Despite being called "public", treat it as a shared secret. It can decrypt your topology.
   key: 7PaN6DmAayz4KnDnsXSXJH+Oy0TFGeoM4FEbQfLriVY=
-  # Nylon polls these URLs every 10 seconds for config updates
+  # Nylon polls these URLs for config updates; the cadence defaults to 10s
+  # and can be changed with `interval` (re-read live from config updates).
   repos:
     - file:central.nybundle          # local file
     - https://static.example.com/network1.nybundle # remote URL (HTTP GET)
+  interval: 1h # optional: polling cadence; takes precedence over node.yaml's dist.interval
+
+# --- In-tunnel QoS (optional, mesh-wide default) ---
+# priority_rules at the TOP LEVEL is the mesh-wide default: every node
+# (routers and clients alike) receives it through the distributed config.
+# A router's own list (below) wins wholesale over this one, which wins
+# wholesale over node.yaml. Same rule semantics as node.yaml's
+# priority_rules (see node.yaml above and guides/qos-priority).
+# priority_rules:
+#   - protocol: udp
+#     port: 5405
+#     priority: high
 
 # --- Routers ---
 # Active nylon nodes that participate in routing and can forward traffic.
@@ -1539,6 +1588,21 @@ routers:
     endpoints:
       - "alice.example.com:57175" # domain name (re-resolved periodically)
       - "192.168.1.2:57175"       # LAN IP
+      # Obf strategy tags: the ports come from the named strategies defined
+      # in the top-level `obf:` map; untagged hosts default to ALL strategies
+      # when the mesh defines any. Inline port ranges moved into strategies.
+      # - "203.0.113.7[awg_main,hopping]"
+      # - "198.51.100.9[*]"
+
+    # In-tunnel QoS rules for THIS router: a non-empty list here wins
+    # wholesale over the mesh-wide top-level priority_rules and over the
+    # node's node.yaml priority_rules (an empty list is indistinguishable
+    # from an absent one — configs roundtrip through yaml, which drops
+    # empty lists). Same rule semantics as node.yaml.
+    # priority_rules:
+    #   - protocol: udp
+    #     port: 5405
+    #     priority: high
     prefixes:
       # Static: always advertised at the given metric
       - type: static
@@ -1567,12 +1631,6 @@ routers:
     endpoints:
       - "192.168.1.1:57175"
       - "nylon.example.org" # port defaults to 57175 (the nylon default port)
-    # Optional per-node obfuscation params. They apply only to this node's
-    # sender path (receivers ignore them) and are normally generated by
-    # `nylon genesis`.
-    # obf:
-    #   protocol: quic # informational template name (quic|dns|dtls|stun|sip|rtp|random)
-    #   i1: <b 0xc0ff><r 8><t><r 40> # CPS spec; i2-i5 are optional, empty ones are omitted
 
   - id: eve
     pubkey: 2mXTTD+FYdtJm/v1vSHz8qimvCucjW9vY+nLYacXJFE=
@@ -1626,11 +1684,11 @@ dynamic_prefix_ranges:
   - 10.0.0.0/8
 
 # --- Obfuscation ---
-# Mesh-wide AmneziaWG 2.0 profile. Central placement keeps the S and H
+# Mesh-wide AmneziaWG 2.0 dialect (S/H/J). Central placement keeps the
 # parameters identical on every node by construction, which the wire format
 # requires. Omit the whole block for vanilla WireGuard-compatible behavior.
-# The values below are examples; generate a profile with `nylon genesis`.
-obf:
+# The values below are examples; generate one with `nylon genesis`.
+awg_profile:
   jc: 5
   jmin: 250 # must not exceed jmax
   jmax: 800
@@ -1650,6 +1708,26 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+
+# Named obf strategies: each entry bundles the ports a node listens on /
+# connects through, the client-side rotation policy for those ports, and the
+# sender junk packets (i1-i5). Endpoints reference strategies by name:
+#   endpoints:
+#     - "hub.example.com[hopping,vanilla]"
+# Untagged endpoints (or "[*]") mean "every defined strategy".
+obf:
+  awg_main:
+    protocol: quic      # informational: amnezigo template the i-params came from
+    ports: "40000"      # required: one port or an inclusive range "40000-50000"
+    i1: <b 0xc0ff><r 8><t><r 40> # optional CPS specs; empty ones are omitted
+  hopping:
+    ports: "40000-50000"
+    port_hopping_mode: timed   # static (default) | reactive | proactive | timed
+    port_hopping:              # knobs; which matter depends on the mode
+      period_seconds: 30
+      period_jitter_pct: 1
+  vanilla:
+    ports: "51820"
 
 # --- Graph ---
 # Defines which nodes will peer with each other. Only nodes connected in the graph
@@ -1671,34 +1749,43 @@ timestamp: 1740832962209309000
 
 A `metric` override behaves differently per check type. On a `ping` entry the value is advertised unconditionally from startup and suppresses failure retraction, so the prefix stays announced even when the probe target is down; leave it unset if you want health-driven withdrawal. On an `http` entry the override replaces only the healthy request-duration metric, and failures still retract. See [Dynamic Prefixes](/reference/dynamic-prefixes) for the full behavior.
 
-The `obf` profile and the per-node `i1`-`i5` specs are normally produced by `nylon genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
+The `awg_profile` dialect and the strategies' `i1`-`i5` specs are normally produced by `nylon-genesis`, which picks viable header ranges automatically. See [Obfuscation](/guides/obfuscation) for the wire-format background and [Genesis](/guides/genesis) for the generation workflow.
 
 ---
 
-## Obfuscation Fields
+## Obf Strategies
 
-Two independent `obf` blocks exist. The mesh-wide profile sits at the top level of `central.yaml`; per-node params sit under each `routers[]` entry (and are also accepted under `clients[]`, although `nylon genesis` emits them for routers only).
+Strategies are the multi-level named list at the top level of `central.yaml` (`obf:`). They are mesh-wide definitions; endpoints select among them per-host.
 
-### central.yaml `obf` (mesh-wide profile)
+| Field               | Type   | Default    | Notes                                                                                                                      |
+| ------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `ports`             | string | required   | one port (`"40000"`) or an inclusive range (`"40000-50000"`)                                                                 |
+| `protocol`          | string | omitted    | informational AmneziaWG template name (`quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, `random`); no runtime effect — the strategy's own name is the identifier, this field only records provenance from `nylon-genesis` |
+| `i1`-`i5`           | string | omitted    | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted to the device                        |
+| `port_hopping_mode` | string | `static`   | rotation strategy for the strategy's ports: `static` \| `reactive` \| `proactive` \| `timed`                                 |
+| `port_hopping`       | map    | omitted    | rotation knobs (`budget_packets`, `period_seconds`, `period_jitter_pct`, `recent_ports`, `cooldown_seconds`, `candidate_samples`, `recycle_seconds`) — same semantics as the pre-reform node-level block |
 
-| Field   | Type                            | Default             | Constraints                                                                                                        |
-| ------- | ------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `jc`    | uint32                          | `0`                 | —                                                                                                                  |
-| `jmin`  | uint32                          | `0`                 | must not exceed `jmax`                                                                                             |
-| `jmax`  | uint32                          | `0`                 | —                                                                                                                  |
-| `s1`-`s4` | uint32                        | `0`                 | —                                                                                                                  |
-| `h1`-`h4` | map with `min`/`max` (uint32) | `min: 0`, `max: 0`  | `min` must not exceed `max` within a range; ranges must not overlap (the device rejects overlaps at UAPI apply time with `headers must not overlap`) |
+**Listen half**: a node binds the union of `ports` over every strategy its OWN advertised endpoints name (untagged = all strategies), served per `listen_mode`. The primary port (`node.yaml`'s `port`) is always bound.
 
-Each `h1`-`h4` range maps to the AmneziaWG UAPI `min-max` form. Omitting the entire `obf` block keeps vanilla WireGuard-compatible header values (`h1` through `h4` pinned to `1-1`, `2-2`, `3-3`, and `4-4`). Ranges that `nylon genesis` generates avoid WireGuard message type ids 1-4.
+**Connect half**: every tagged endpoint of a peer expands into one candidate set per named strategy; the carrying endpoint's strategy supplies the rotation policy.
 
-### routers[].obf (per-node, sender-local)
+**Wire reality**: the AWG 2.0 device speaks exactly ONE dialect and emits ONE I-packet set, prepended to every handshake toward EVERY peer. The strategies a node uses (its own and its peers' advertised endpoints) must therefore share a single non-empty `i1`-`i5` set — validation rejects conflicting sets with the strategies named. A strategy without `i`-params simply emits no junk.
 
-| Field      | Type   | Default             | Notes                                                                                                          |
-| ---------- | ------ | ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `protocol` | string | omitted             | Informational AmneziaWG template name: `quic`, `dns`, `dtls`, `stun`, `sip`, `rtp`, or `random`                 |
-| `i1`-`i5`  | string | omitted when empty  | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted                           |
+**Migration** (config reform): `listen_ports`, `port_hopping_mode` and `port_hopping` at node/router level, per-node `obf:` blocks, and inline endpoint port ranges moved into strategies; the old keys still PARSE but fail validation with pointers, and inline ranges in endpoints are rejected at parse time with the same migration message.
 
-Receivers ignore `protocol` and `i1`-`i5`: these params shape only how this node's outgoing packets look, while the mesh-wide profile governs the receiving side.
+---
+
+## Endpoints
+
+Three forms exist (IPv6 hosts bracketed as usual: `[2001:db8::1]:51820`, `[2001:db8::1][strats]`):
+
+| Form                  | Meaning                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| `host:port`           | raw fixed-port endpoint, no strategy; a stock configured link                                     |
+| `host`                | bare host: every strategy's ports when the mesh defines any, else the default port (57175)          |
+| `host[s1,s2]`         | strategy-tagged: the ports come from the named strategies; `host[*]` is the same as untagged        |
+
+Inline port ranges (`host:30000-40000`) moved into strategies and are rejected with a migration error; combining an explicit port with tags (`host:9000[s1]`) is a contradiction and is rejected too.
 
 ---
 
@@ -1706,7 +1793,7 @@ Receivers ignore `protocol` and `i1`-`i5`: these params shape only how this node
 
 Setting `dynamic_prefixes_dir` in `node.yaml` (recommended: `/etc/nylon/prefixes.d`) enables a watcher that announces prefixes from JSON files in that directory:
 
-```json
+```json title="/etc/nylon/prefixes.d/10-vip.json"
 {
   "version": 1,
   "prefixes": [
@@ -1736,6 +1823,7 @@ Node IDs (`routers[].id`, `clients[].id`) must:
 - Be unique across all routers and clients
 
 Group names used in `graph` are folded to lowercase, must not equal a node name, and must be unique. The strict node-ID pattern above is not applied to them.
+
 ---
 url: /reference/dynamic-prefixes
 ---
