@@ -389,7 +389,7 @@ Despite being called a "public" key, the distribution key also acts as the share
 
 3. **Publish the Bundle**
 
-   Host `central.nybundle` on any HTTP/HTTPS server (e.g., GitHub Pages, S3, or Nginx).
+   Host `central.nybundle` on any HTTP/HTTPS server (e.g., GitHub Pages, S3, or Nginx). A `file:`-scheme repo serves the bundle from the local filesystem — both the relative historical form (`file:central.nybundle`, resolved against the daemon's working directory) and the absolute form (`file:///srv/nylon/central.nybundle`) work.
 
 4. **Configure Nodes**
 
@@ -404,7 +404,16 @@ Despite being called a "public" key, the distribution key also acts as the share
      interval: "1h" # optional
    ```
 
-   The `url` and `key` in the `dist` block of `node.yaml` are bootstrap-only: they are consulted only when `central.yaml` does not exist yet. The optional `interval` outlives bootstrap — it acts as the fallback polling cadence while the active central config's `dist` block sets no `interval` of its own.
+   The `url` and `key` in the `dist` block of `node.yaml` are the bootstrap **links**. Startup reads them leniently — only the `dist` block and the DNS resolvers are extracted, so a legacy-shaped `node.yaml` can still bootstrap — fetches the latest published bundle over them, and only then decides whether the configuration is valid to run. The local `central.yaml` is a **cache**, not the source of truth:
+
+   - a strictly newer published bundle wins, and the cache is refreshed (comment-preserving);
+   - a cache that no longer parses under this binary (a stale shape left by a version update, while the fresh central is already published) is **bypassed**, not fatal — the fetch replaces it;
+   - the cache still serves when the links are absent (a `file:`-mounted stand), unreachable (offline start) or the published bundle is not newer;
+   - when nothing can run, startup fails with ONE error naming both causes — the stale cache and the failed fetch.
+
+   The winning source is journalled on every start: `starting nylon ... central_config_source=dist (file:/srv/nylon/central.nybundle)` (or `central_config_source=local cache (dist fetch failed: ...)`), so a bypassed stale cache is visible in the logs.
+
+   The optional `interval` outlives bootstrap — it acts as the fallback polling cadence while the active central config's `dist` block sets no `interval` of its own.
 
    **Automatic Updates (`central.yaml`)**
 
@@ -418,7 +427,7 @@ Despite being called a "public" key, the distribution key also acts as the share
      interval: "6h" # optional
    ```
 
-   Nylon polls for updates on the resolved cadence — the `interval` from `central.yaml` takes precedence, then the `interval` from `node.yaml`, then the built-in default of 10 seconds — and applies a bundle only when its timestamp is strictly newer than the active config. Interval changes distributed inside a config update take effect live, without a restart. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout. Comments in the sealed `central.yaml` survive the seal: they are captured on the way in and reattached to the sealed text, so `nylon open` prints the bundle exactly as it was documented.
+   Nylon polls for updates on the resolved cadence — the `interval` from `central.yaml` takes precedence, then the `interval` from `node.yaml`, then the built-in default of 10 seconds — and applies a bundle only when its timestamp is strictly newer than the active config. Interval changes distributed inside a config update take effect live, without a restart. `nylon seal` rewrites that timestamp to the sealing host's wall clock, so each seal is newer by construction; re-uploading an older bundle is ignored, and clock skew on the sealing host can block rollout. Comments are STRIPPED from the bundle; the raw `central.yaml` keeps them: `nylon seal` re-renders the config without comments (`nylon open` prints the plain text the nodes run), and when the daemon refreshes its local `central.yaml` — at startup after a fetch, or on every applied poll update — it carries over the comments of the file it overwrites, so a documented central.yaml stays documented even on the node that runs `file:`-scheme repos next to it. Comments map by YAML path: a comment survives while its path does.
 
    **Observing the poll loop**
 
@@ -799,7 +808,7 @@ Obfuscation is configured at two levels in `central.yaml` (see [Configuration Re
 
 | Level | Fields | Scope |
 | --- | --- | --- |
-| Central `obf` block (S/H inline) | `s1`–`s4`, `h1`–`h4`, `strategy_mode` | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node — plus the strategy selection principle for new connections (`fixed` \| `random` \| `trial`; see [Configuration Reference](/reference/config)) |
+| Central `obf` block (S/H inline) | `s1`–`s4`, `h1`–`h4`, `strategy_mode`, obf-level defaults (`ports`, `jc`/`jmin`/`jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping`) | One shared handshake dialect for the whole mesh — a wire contract, so it cannot vary from node to node — the strategy selection principle for new connections (`fixed` \| `random` \| `trial`), and the mesh-wide DEFAULTS the strategies inherit per field (a strategy's own value always wins; see [Configuration Reference](/reference/config)) |
 | Named strategies (the `obf.strategy` map) | `ports`, `jc`, `jmin`, `jmax`, `i1`–`i5`, `port_hopping_mode`, `port_hopping` | One entry per wire-reachability profile; the junk is sender-local, endpoints select by name |
 
 The naming follows the upstream convention: the **central** `obf` block holds the parameters for the whole network (the mesh-wide S/H dialect, inline), while an `obf` block **on a node** (node.yaml) holds per-node parameters. In this fork the per-node block is retired — everything that used to be per-node lives in the named strategies and is selected per endpoint. A minimal dialect with a QUIC-template strategy:
@@ -1708,6 +1717,14 @@ obf:
   h4:
     min: 1000000000
     max: 2100000000
+  # obf-level DEFAULTS for the strategy parameters: every parameter a
+  # strategy may set can also be set here, and a strategy that leaves it
+  # unset inherits this value (per parameter — a strategy that sets only
+  # `jc` still inherits the default `jmin`/`jmax`; a set value always wins).
+  ports: "40000-50000"   # default port spec for strategies that set no ports
+  jc: 5                  # default junk trio
+  jmin: 250
+  jmax: 800
   # Strategy selection for new connections (which obf strategy carries each
   # connection): fixed (the first strategy of the endpoint's list) | random
   # (a random strategy per connection) | trial (iterate randomly until a
@@ -1774,6 +1791,8 @@ Strategies are the multi-level named list inside the global `obf:` block (`obf.s
 | `i1`-`i5`           | string | omitted    | CPS packet specs such as `<b 0xc0ff><r 8><t><r 40>`; only non-empty specs are emitted to the device                        |
 | `port_hopping_mode` | string | `static`   | rotation strategy for the strategy's ports: `static` \| `reactive` \| `proactive` \| `timed`                                 |
 | `port_hopping`       | map    | omitted    | rotation knobs (`budget_packets`, `period_seconds`, `period_jitter_pct`, `recent_ports`, `cooldown_seconds`, `candidate_samples`, `recycle_seconds`) — same semantics as the pre-reform node-level block |
+
+**Obf-level defaults**: every strategy parameter can also be set directly under `obf:` (sibling of `s1`-`s4`/`h1`-`h4` and `strategy:`) as a mesh-wide default. A strategy that leaves the parameter unset inherits the obf-level value; a strategy that sets it wins — per parameter, so a strategy that sets only `jc` still inherits the default `jmin`/`jmax`, and a strategy that sets only `i1` inherits the default `i2`-`i5` slot by slot. The defaults resolve everywhere strategy VALUES are consumed (validation, the listen union, the junk resolution, the connect-half candidates); the file keeps the operator's shape — the seal, the distributed bundle and the daemon's local cache serialize the defaults at the obf level and the strategies exactly as written. Validation holds the defaults block to the same contracts as a strategy: a bogus default fails loudly even when every strategy overrides it.
 
 **Listen half**: a node binds the union of `ports` over every strategy its OWN advertised endpoints name (untagged = all strategies), served per `listen_mode`. The primary port (`node.yaml`'s `port`) is always bound.
 
